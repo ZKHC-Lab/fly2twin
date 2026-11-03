@@ -1,0 +1,7 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Fly2Twin: Fly Once, Get a Trainable Digital Twin"
+authors:
+  - name: "ZKHC"
+repository-code: "https://github.com/ZKHC-Lab/fly2twin"
+license: "Apache-2.0"

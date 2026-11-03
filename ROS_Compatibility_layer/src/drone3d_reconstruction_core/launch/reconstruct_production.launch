@@ -1,0 +1,28 @@
+<?xml version="1.0"?>
+<!--
+  Production reconstruction supervisor launch entry.
+
+  profile_yaml must be an absolute path to an explicit profile file whose
+  values are loaded into the node's private parameter namespace.  Every
+  production value is mandatory: there are intentionally no embedded defaults.
+  A missing/malformed value or device-SKU/profile/checkpoint mismatch keeps the
+  node alive in a not-ready state and reports the error on /diagnostics; the
+  Action server is never constructed for a permanent deployment error.
+-->
+<launch>
+  <arg name="profile_yaml"
+       doc="Absolute path to the explicit production profile YAML (all values required)" />
+  <arg name="required" default="true"
+       doc="Let roslaunch terminate the session if the supervisor exits" />
+  <arg name="node_name" default="reconstruct_production_node" />
+
+  <group ns="reconstruct">
+    <rosparam command="load" file="$(arg profile_yaml)"
+              ns="$(arg node_name)" />
+    <node name="$(arg node_name)"
+          pkg="drone3d_reconstruction_core"
+          type="reconstruct_production_node.py"
+          output="screen"
+          required="$(arg required)" />
+  </group>
+</launch>

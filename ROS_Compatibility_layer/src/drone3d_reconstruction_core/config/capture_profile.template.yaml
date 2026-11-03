@@ -1,0 +1,63 @@
+# Capture profile template. Every value is required; placeholders fail preflight.
+# Copy to an explicit profile and replace every /REPLACE_ME path before launch.
+snapshot_root: "/REPLACE_ME/snapshots"
+image_topic: "/REPLACE_ME/image_raw"
+camera_name: "REPLACE_ME_CAMERA"
+camera_role: "REPLACE_ME_ROLE"
+camera_frame_id: "REPLACE_ME_FRAME_ID"
+image_encoding: "bgr8"
+odometry_topic: ""
+camera_info_topic: ""
+depth_topic: ""
+tf_topic: ""
+tf_static_topic: ""
+save_sensor_depth: false
+body_frame_id: ""
+tf_relevant_frames: []
+camera_info_max_delta_ms: 100.0
+depth_max_delta_ms: 100.0
+max_auxiliary_samples: 128
+max_tf_samples: 4096
+max_tf_bytes: 2097152
+min_sample_fps: 0.5
+max_sample_fps: 5.0
+max_goal_frames: 512
+max_goal_duration_sec: 260.0
+min_captured_frames: 1
+max_image_width: 640
+max_image_height: 480
+pose_max_delta_ms: 50.0
+odometry_association: "interpolate"
+pose_interpolation_wait_ms: 500.0
+# Opt-in dense-LIO offset. Onboard v1 uses +40 with the continuous profile's
+# pose_time_offset_stage: capture; 0 preserves old snapshot behavior.
+pose_time_offset_ms: 0.0
+# Motion keyframes (needs interpolate): a sampled frame is written only after the
+# body moved keyframe_min_translation_m or turned keyframe_min_rotation_deg since
+# the last written frame, or after keyframe_max_interval_sec (hover). Both
+# thresholds 0 disables the gate. Used with g4_placement frame_pose so every
+# window spans enough motion for its depth scale. Indoor 0.3 m / 12 deg / 2 s;
+# outdoor (faster flight) 0.5 m / 12 deg / 2 s.
+keyframe_min_translation_m: 0.0
+keyframe_min_rotation_deg: 0.0
+keyframe_max_interval_sec: 2.0
+# Images arriving between two consecutive continuous capture goals are buffered
+# and replayed into the next goal, so window handoffs do not drop frames
+# (needs interpolate). Decimated to the goal sample period; 0 disables.
+handoff_buffer_frames: 150
+handoff_buffer_max_bytes: 134217728
+pose_gap_max_ms: 500.0
+source_timeout_sec: 5.0
+max_window_gap_sec: 30.0
+max_sample_interval_overshoot_ms: 500.0
+snapshot_limits:
+  max_frame_count: 512
+  max_manifest_entries: 2048
+  max_metadata_bytes: 8388608
+  max_file_bytes: 2097152
+  max_total_bytes: 1073741824
+  max_scene_id_bytes: 128
+  max_relative_path_bytes: 1024
+action_name: "/REPLACE_ME_NS/capture_segment"
+diagnostics_topic: "/diagnostics"
+diagnostics_period_sec: 1.0

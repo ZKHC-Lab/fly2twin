@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>空间漫游</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="src/style.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "./vendor/three/build/three.module.js",
+          "@sparkjsdev/spark": "./vendor/spark/dist/spark.module.js"
+        }
+      }
+    </script>
+  <style>header label {font-size:12px;color:#bcd0d4} select {background:#17242b;color:#e9f3f5;border:1px solid #41616a;border-radius:6px;padding:7px} #loading progress {width:240px;accent-color:#81ffe2} #load-status {display:block;margin-top:10px} #error {max-width:640px;line-height:1.8}</style></head>
+  <body>
+    <main id="viewport"></main>
+    <div id="shade"></div>
+    <header class="hud">
+      <div class="brand"><i></i> SPATIAL <span> / </span> EXPLORER</div>
+      <nav id="scenes" aria-label="场景选择"></nav>
+      <label>画质 <select id="quality"><option value="low">节能</option><option value="medium">均衡</option><option value="high">高质量</option></select></label>
+      <button id="hide" title="隐藏界面 H">隐藏界面 ↗</button>
+    </header>
+    <section id="identity" class="hud">
+      <div class="eyebrow">INTERACTIVE DIGITAL TWIN</div>
+      <h1 id="title">空间漫游</h1>
+      <p id="subtitle">真实空间 · 自由探索</p>
+      <div class="status">
+        <span class="dot"></span><span id="mode">自由漫游</span
+        ><span class="divider">/</span><span id="boundary">采集范围内</span>
+      </div>
+    </section>
+    <footer class="hud">
+      <div id="controls">
+        <b>W A S D</b> 移动 <b>Q E</b> 转向 <b>R F</b> 升降 <b>⇧</b> 加速
+      </div>
+      <div class="secondary">
+        <b>Tab</b> 飞行 <b>1–5</b> 机位 <b>P</b> 巡航 <b>T</b> 轨迹
+        <b>C</b> 色彩 <b>V</b> 表示 <b>G</b> 引导 <b>H</b> 隐藏
+      </div>
+    </footer>
+    <div id="loading">
+      <div class="orbit"></div>
+      <p>正在进入空间</p>
+      <progress id="load-progress" max="100" value="0"></progress><small id="load-status">下载场景</small>
+    </div>
+    <div id="error" hidden>场景暂时无法打开，请检查资源配置后刷新。</div>
+    <script type="module" src="src/main.js"></script>
+  </body>
+</html>

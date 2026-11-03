@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<launch>
+  <arg name="profile_yaml"
+       doc="Absolute path to the explicit capture profile YAML (all values required)" />
+  <arg name="required" default="true" />
+  <arg name="node_name" default="capture_production_node" />
+  <arg name="ns" default="capture"
+       doc="Namespace of the capture node group; set front/down for independent camera roles" />
+
+  <group ns="$(arg ns)">
+    <rosparam command="load" file="$(arg profile_yaml)"
+              ns="$(arg node_name)" />
+    <node name="$(arg node_name)"
+          pkg="drone3d_reconstruction_core"
+          type="capture_production_node.py"
+          output="screen"
+          required="$(arg required)" />
+  </group>
+</launch>

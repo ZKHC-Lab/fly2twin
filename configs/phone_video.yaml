@@ -1,0 +1,52 @@
+# B0: drone depth/fusion method, GLOMAP poses, assumed camera height 1.4 m.
+protocol: phone
+video: scene/video.MOV
+output: ../../outputs/phone_b0
+extract:
+  target_frames: 400
+  min_frames: 200
+  sfm_multiple: 3
+  train_subset: all
+  long_edge: 1920
+  scan_width: 640
+  quality: 2
+  hdr: auto
+sfm:
+  sfm_mode: global
+  camera_model: SIMPLE_RADIAL
+  focal_factor: 1.2
+  overlap: 20
+  loop_keyframes: 60
+  loop_max_pairs: 600
+  max_features: 8192
+  threads: 8
+pose:
+  provider: glomap
+  refine: none
+  metric:
+    camera_height_m: 1.4
+split:
+  mode: holdout
+  exclude_blur: false
+depth:
+  weights: models/vggt_omega_1b_512.pt
+  resolution: [512, 288]
+  first_window: 40
+  new_frames: 30
+  overlap: 10
+fusion:
+  max_points: 1000000
+train:
+  aniso_lambda: 0.1
+  depth_lambda: 0.1
+  discard_initial_permutation: true
+  exact_steps: true
+  image_cache_frames: 1200
+  max_width: 1600
+  reset_at_zero: true
+  scale_densification: true
+  schedule_rounding: round
+  seed: 42
+eval:
+  aligned_width: 960
+  alignment_steps: 200

@@ -1,0 +1,119 @@
+# Continuous session scheduler profile.
+#
+# `roles` is loaded by continuous_session.launch from the front/down capture
+# profiles, not from this file.
+reconstruct_action: "/reconstruct/reconstruct_segment"
+service_name: "/continuous_session/command"
+diagnostics_topic: "/diagnostics"
+diagnostics_period_sec: 1.0
+journal_root: "/REPLACE_ME/session_journal"
+result_root: "/REPLACE_ME/results"
+min_free_disk_gb: 2.0
+# Completed-session retention. The active session is always protected.
+retention_max_sessions: 3
+# frame_pool is a full global rebuild, so only the newest heavy predictions
+# are needed for the Web view; the journal keeps the lightweight history.
+retention_frame_pool_revisions: 2
+# Unreferenced worker/staging directories younger than this remain available
+# for failure diagnosis.
+retention_orphan_grace_sec: 86400.0
+action_connect_timeout_sec: 10.0
+capture_wait_margin_sec: 30.0
+reconstruct_wait_timeout_sec: 3600.0
+stop_timeout_sec: 120.0
+# Single-command production start: nodes report ready first, then the
+# scheduler automatically selects initial_role and starts the session.
+auto_start_session: true
+initial_role: "front"
+auto_start_delay_sec: 2.0
+# Must equal the reconstruct profile frame_group_size. window_frames above
+# this value is rejected: no silent frame subsampling.
+alignment_backend: "global_g4"
+reconstruct_frame_group_size: 16
+initial_sample_fps: 5.0
+# Capture count and frame-pool reconstruction target; changes apply to the next window.
+initial_window_frames: 16
+# Number of trailing frames reused in the next window; 0 disables overlap.
+# Frame reuse does not perform visual registration or require a backend.
+initial_overlap_frames: 5
+# Frame-count semantics for window_frames on the global placement backend:
+#   total_frames - window_frames already includes the shared frames (default);
+#   new_frames   - window_frames counts only new frames, so the model receives
+#                  window_frames + overlap_frames inputs. The ported long-window
+#                  grouping uses new_frames and requires
+#                  frame_group_size >= window_frames + overlap_frames; anything
+#                  smaller is rejected instead of being silently subsampled.
+window_frame_semantics: "total_frames"
+# Only read under new_frames: a deliberately short window keeps at least this
+# many model inputs by borrowing extra shared frames.
+minimum_total_frames: 100
+# Registered grouping plan (candidate-list schema). Empty derives the grouping
+# rule instead; only a registered plan reproduces a short final window exactly.
+window_plan_path: ""
+# Retained non-fit observation table (frame id -> model pixels) and the recorded
+# per-edge threshold table. Empty means "not enabled" and the backend records
+# that as none rather than silently omitting the input.
+fit_exclusion_source: ""
+threshold_table_path: ""
+# A threshold table that carries several groups (the frozen seams file has G0
+# and G1 with the same edge keys) must name the group explicitly; leaving it
+# empty only works when the table has a single group.
+threshold_group: ""
+# Placement on the global_g4 backend:
+#   graph      - original G4 graph solve, one Sim(3) per window (default);
+#   frame_pose - each frame is placed with its localization camera pose; VGGT
+#                supplies depth and one depth scale per window. Recommended with
+#                40-70 frame windows. See docs/G4_INTEGRATION.md.
+g4_placement: "graph"
+# frame_pose only: localization pose is taken at RGB time + this offset (ms).
+# Measured on the D435i + FAST-LIO rig: +40 ms (capture drops FAST-LIO's repeated
+# poses since 2026-10-19; before that +70 ms indoor, +80 ms outdoor).
+pose_time_offset_ms: 0.0
+# capture: require matching offset marker in retained snapshots, do not shift twice.
+# backend: legacy keyframe-time interpolation. See docs/ONBOARD_V1.md.
+pose_time_offset_stage: backend
+# Opt-in reference multiview filtering + adaptive voxel fusion for frame_pose Web.
+frame_pose_fusion: false
+# frame_pose only: calibrated pinhole of the source RGB image. Unset uses the
+# snapshot CameraInfo; without either the backend falls back to VGGT's own K,
+# which was clearly worse outdoors.
+# camera_intrinsics: {width: 640, height: 480, fx: 604.195618, fy: 604.016418, cx: 318.986664, cy: 247.538086}
+initial_queue_mode: "lossless_fifo"
+# Pending high-water mark: lossless pauses new captures at this threshold.
+# In-flight captures/retries are retained; latest drops oldest pending inputs
+# and rebuilds overlap against the last accepted window before inference.
+initial_queue_capacity: 8
+initial_max_retries: 0
+initial_keep_snapshot_on_success: true
+# 0 = inherit the reconstruct profile value for every window. Set a nonzero
+# value to use a different default; runtime changes apply to the next window.
+initial_inference_resolution: 384
+initial_worker_timeout_sec: 0.0
+# Fixed for each session: per_window (G4 global placement) or frame_pool (fresh global selection).
+# frame_pool forces zero overlap, waits for window_frames eligible inputs, and displays only its latest result.
+initial_reconstruction_mode: "per_window"
+# ODOM_LOCAL_APPROX: odometry alignment, independent of frame overlap.
+odom_local_enabled: true
+odom_min_correspondences: 4
+# Pose-constrained Sim(3) quality gates; tune from recorded flight data.
+odom_min_baseline_m: 0.1
+odom_max_orientation_residual_deg: 15.0
+odom_max_normalized_residual_rms: 0.25
+odom_reset_jump_m: 5.0
+# Target Web (WP8). The production Web node reuses this same profile.
+# web_host: keep 127.0.0.1 unless the NX is on a trusted intranet; set
+# 0.0.0.0 ONLY to allow other hosts on that intranet to connect. The Web
+# has no authentication by design and must never be exposed publicly.
+web_host: "127.0.0.1"
+web_port: 8080
+# Web preview frame rate; independent from and hot-tunable separately from
+# the reconstruction sample_fps. The Web UI can adjust this at runtime.
+web_preview_fps: 5.0
+# Optional Web tuning (the node falls back to these defaults if omitted):
+max_point_cloud_points: 1000000
+max_session_windows: 64
+conf_percentile: 50.0
+# Upper bound for a single predictions.npz read. 2 GiB is generous for the
+# real multi-frame Omega arrays (typically tens of MB) while keeping the
+# trusted-intranet Web from being asked to read an unreasonable file.
+max_predictions_bytes: "2147483648"

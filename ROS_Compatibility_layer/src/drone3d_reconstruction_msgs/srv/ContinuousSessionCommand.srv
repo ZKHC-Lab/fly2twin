@@ -1,0 +1,76 @@
+# Continuous session scheduler control.
+#
+# The scheduler reuses the existing CaptureSegment and ReconstructSegment
+# Actions; this service only controls the continuous session that owns them.
+
+uint8 SELECT_SOURCE=0
+uint8 START_SESSION=1
+uint8 PAUSE=2
+uint8 RESUME=3
+uint8 STOP_ALL=4
+uint8 GET_STATUS=5
+uint8 SET_PARAMS=6
+
+uint8 command
+
+# SELECT_SOURCE/START_SESSION: selected camera role.
+string role
+
+# START_SESSION: reconstruction mode. Empty string means the profile default.
+string reconstruction_mode
+
+# SET_PARAMS fields. Unset numeric values (<=0) keep the current value.
+float32 sample_fps
+uint32 window_frames
+uint32 overlap_frames
+string queue_mode
+uint32 queue_capacity
+uint32 max_retries
+bool keep_snapshot_on_success
+bool save_sensor_depth
+uint32 inference_resolution
+float32 worker_timeout_sec
+# These flags make 0/false settable and make optional overrides explicit.
+bool set_max_retries
+bool set_keep_snapshot
+bool set_save_sensor_depth
+bool set_inference_resolution
+bool set_worker_timeout
+bool set_overlap_frames
+---
+int32 OK=0
+int32 INVALID_COMMAND=1
+int32 UNKNOWN_ROLE=2
+int32 BUSY=3
+int32 NOT_RUNNING=4
+int32 INVALID_ARGUMENT=5
+int32 INTERNAL_ERROR=6
+
+int32 error_code
+string message
+string state
+string session_id
+string role
+uint32 window_index
+uint32 captured_frames
+uint32 capture_target_frames
+uint32 pending_windows
+uint32 running_window
+uint32 succeeded_windows
+uint32 failed_windows
+uint32 dropped_windows
+
+float32 effective_sample_fps
+uint32 effective_window_frames
+uint32 effective_overlap_frames
+string effective_queue_mode
+uint32 effective_queue_capacity
+uint32 effective_max_retries
+bool effective_keep_snapshot_on_success
+bool effective_save_sensor_depth
+uint32 effective_inference_resolution
+float32 effective_worker_timeout_sec
+string effective_reconstruction_mode
+
+string last_error
+float32 min_free_disk_gb

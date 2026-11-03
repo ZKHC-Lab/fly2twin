@@ -1,0 +1,14 @@
+manifest: scene/manifest.json
+output: ../../outputs/image_only
+pose:
+  provider: colmap
+  refine: none
+  partial_policy: reject
+depth:
+  weights: models/vggt_omega_1b_512.pt
+  resolution: [512, 288]
+train:
+  seed: 42
+  resolution: [640, 360]
+  depth_lambda: 0.1
+  aniso_lambda: 0.1

@@ -1,0 +1,7 @@
+<launch>
+  <test
+    test-name="reconstruct_production_action_server"
+    pkg="drone3d_reconstruction_core"
+    type="test_production_action_server_rostest.py"
+    time-limit="60.0" />
+</launch>

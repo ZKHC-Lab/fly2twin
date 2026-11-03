@@ -1,0 +1,48 @@
+<?xml version="1.0"?>
+<!--
+  Target Web launch entry (WP8).
+
+  Loads the same front/down capture profiles as continuous_session.launch
+  (so the Web node knows each role's image_topic / depth_topic / camera
+  identity), plus the continuous profile (which carries web_host, web_port
+  and web_preview_fps). The node never starts roscore, never reads bags and
+  never starts workers.
+
+  Bind safely: the profile default is 127.0.0.1. Set web_host: "0.0.0.0"
+  ONLY on a trusted intranet; there is no authentication by design (C37).
+-->
+<launch>
+  <arg name="front_capture_profile"
+       doc="Absolute path to the front camera capture profile YAML" />
+  <arg name="down_capture_profile"
+       doc="Absolute path to the down camera capture profile YAML" />
+  <arg name="continuous_profile"
+       doc="Absolute path to the continuous session profile YAML" />
+  <arg name="reconstruct_profile"
+       doc="Absolute path to the reconstruct profile YAML" />
+  <!-- A Web crash must not terminate capture/reconstruction.  Readiness is
+       reported separately at /readyz. -->
+  <arg name="required" default="false" />
+  <arg name="node_name" default="continuous_web_node" />
+  <arg name="ns" default="continuous_web" />
+  <arg name="session_command_service" default="/continuous_session/command"
+       doc="ContinuousSessionCommand service name to control and query" />
+
+  <group ns="$(arg ns)">
+    <rosparam command="load" file="$(arg front_capture_profile)"
+              ns="/$(arg ns)/$(arg node_name)/roles/front" />
+    <rosparam command="load" file="$(arg down_capture_profile)"
+              ns="/$(arg ns)/$(arg node_name)/roles/down" />
+    <rosparam command="load" file="$(arg continuous_profile)"
+              ns="/$(arg ns)/$(arg node_name)" />
+    <rosparam command="load" file="$(arg reconstruct_profile)"
+              ns="/$(arg ns)/$(arg node_name)/expected_reconstruction" />
+    <node name="$(arg node_name)"
+          pkg="drone3d_reconstruction_core"
+          type="continuous_web_node.py"
+          output="screen"
+          required="$(arg required)">
+      <param name="session_command_service" value="$(arg session_command_service)" />
+    </node>
+  </group>
+</launch>

@@ -1,0 +1,32 @@
+# Reconstruct a previously finalized CaptureSegment snapshot.
+string snapshot_uri
+string manifest_sha256
+# Per-goal runtime overrides. When the set flag is true the corresponding
+# value overrides the reconstruct profile for THIS window only.
+uint32 image_resolution
+bool set_image_resolution
+float32 worker_timeout_sec
+bool set_worker_timeout
+---
+uint8 OK=0
+uint8 INVALID_GOAL=1
+uint8 INPUT_NOT_FOUND=2
+uint8 BUSY=3
+uint8 ALGORITHM_FAILED=4
+uint8 IO_ERROR=5
+uint8 CANCELLED=6
+uint8 INTERNAL_ERROR=7
+uint8 error_code
+string message
+string scene_id
+string result_manifest_uri
+string result_manifest_sha256
+string scene_glb_uri
+uint32 frame_count
+duration wall_time
+---
+# stage is a stable phase label. progress is best effort in [0, 1], not an ETA.
+string stage
+float32 progress
+duration elapsed
+string message

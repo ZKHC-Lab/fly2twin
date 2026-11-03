@@ -1,0 +1,15 @@
+# Observed environment, not a clean-environment compatibility guarantee.
+# Python 3.10.20; Linux x86_64; Torch CUDA build cu128.
+numpy==1.26.4
+scipy==1.15.3
+PyYAML==6.0.3
+opencv-python==4.11.0.86
+pycolmap==4.2.0
+torch==2.7.1+cu128
+torchvision==0.22.1+cu128
+# Public distribution installed locally for the final CPU tests and GPU reproduction.
+gsplat==1.5.3
+torchmetrics==1.9.0
+fused-ssim==0.0.0
+pytest==9.1.1
+rosbags==0.11.3

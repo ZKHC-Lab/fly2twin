@@ -1,0 +1,22 @@
+# Merge these settings with scene manifest/cameras/depth paths.
+protocol: drone
+pose:
+  provider: external
+  refine: none
+  units: meters
+normalization_cast_first: true
+train:
+  resolution: [1280, 720]
+  exact_steps: true
+  scale_densification: false
+  sh_interval: 1000
+  reset_at_zero: false
+  depth_lambda: 0.1
+  aniso_lambda: 0.1
+  seed: 42
+fusion:
+  max_points: 1000000
+split:
+  mode: all_clear
+export:
+  reference_drone: true

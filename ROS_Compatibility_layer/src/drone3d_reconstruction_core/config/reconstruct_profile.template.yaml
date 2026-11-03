@@ -1,0 +1,53 @@
+# Reconstruct profile template. Every value is required; placeholders fail
+# preflight. Replace every /REPLACE_ME path and the digest before launch.
+supervisor_python: "/REPLACE_ME/python"
+worker_python: "/REPLACE_ME/python"
+reconstruct_script: "/REPLACE_ME/third_party/vggt-omega/reconstruct_omega.py"
+validator_script: "/REPLACE_ME/third_party/vggt-omega/result_validator.py"
+checkpoint_path: "/REPLACE_ME/vggt_omega_1b_512.pt"
+checkpoint_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+result_root: "/REPLACE_ME/results"
+allowed_snapshot_roots: ["/REPLACE_ME/snapshots"]
+snapshot_limits:
+  max_frame_count: 512
+  max_manifest_entries: 1024
+  max_metadata_bytes: 8388608
+  max_file_bytes: 2097152
+  max_total_bytes: 1073741824
+  max_scene_id_bytes: 128
+  max_relative_path_bytes: 1024
+resource_limits:
+  min_mem_available_bytes: 1073741824
+  max_swap_used_bytes: 268435456
+  max_swap_growth_bytes: 268435456
+  min_snapshot_free_bytes: 1073741824
+  min_result_free_bytes: 1073741824
+  swap_sample_window_sec: 1.0
+# Model input long side (multiple of 16). Orin NX per 40-frame window with flash_attn_v1:
+# 4:3 384 29 s / 448 44 s / 512 64 s; 16:9 384 22 s / 512 42 s. Outdoor 16:9 512 cut
+# reference-surface error 4.1 -> 3.1 cm; indoor 384 -> 512 only 4.9 -> 4.7 cm.
+image_resolution: 384
+aggregator_frame_chunk_size: 10
+# Omega attention: auto = torch SDPA (query-blocked when no fused kernel);
+# flash_attn_v1 = FlashAttention 1.0.9 built for the worker (Orin NX torch 2.1:
+# ~2x faster). See third_party/vggt-omega/docs/ATTENTION_BACKENDS.md.
+attention_backend: "auto"
+frame_group_size: 16
+max_result_pixels: 294912
+# ROS1 XML-RPC integers are signed 32-bit; quote larger byte counts.
+max_result_file_bytes: "8589934592"
+max_result_total_bytes: "17179869184"
+max_log_bytes: 16777216
+verifier_timeout_sec: 600.0
+worker_timeout_sec: 1200.0
+term_grace_sec: 10.0
+load_mode: "max_size"
+require_glb: false
+show_cameras: false
+conf_thres: 50.0
+max_points_k: 5
+profile_name: "REPLACE_ME_PROFILE"
+required_device_sku: "REPLACE_ME_SKU"
+device_sku: "REPLACE_ME_SKU"
+algorithm_revision: "REPLACE_ME_ALGORITHM_REVISION"
+ros_revision: "REPLACE_ME_ROS_REVISION"

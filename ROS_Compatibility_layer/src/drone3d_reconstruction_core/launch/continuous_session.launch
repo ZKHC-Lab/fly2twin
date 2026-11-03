@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<!--
+  Continuous session scheduler launch entry.
+
+  front_capture_profile / down_capture_profile must be the SAME capture
+  profile files passed to capture_production.launch. The scheduler only
+  submits existing Capture/Reconstruct Action goals and never starts a
+  roscore, subscribes to images, reads bags, or starts a worker.
+-->
+<launch>
+  <arg name="front_capture_profile"
+       doc="Absolute path to the front camera capture profile YAML" />
+  <arg name="down_capture_profile"
+       doc="Absolute path to the down camera capture profile YAML" />
+  <arg name="continuous_profile"
+       doc="Absolute path to the continuous session profile YAML" />
+  <arg name="reconstruct_profile"
+       doc="Absolute path to the reconstruct profile YAML; loaded as expected_reconstruction for the formal-result authenticity gate" />
+  <arg name="required" default="true" />
+  <arg name="node_name" default="continuous_session_node" />
+  <arg name="ns" default="continuous_session" />
+
+  <group ns="$(arg ns)">
+    <rosparam command="load" file="$(arg front_capture_profile)"
+              ns="/$(arg ns)/$(arg node_name)/roles/front" />
+    <rosparam command="load" file="$(arg down_capture_profile)"
+              ns="/$(arg ns)/$(arg node_name)/roles/down" />
+    <rosparam command="load" file="$(arg continuous_profile)"
+              ns="/$(arg ns)/$(arg node_name)" />
+    <rosparam command="load" file="$(arg reconstruct_profile)"
+              ns="/$(arg ns)/$(arg node_name)/expected_reconstruction" />
+    <node name="$(arg node_name)"
+          pkg="drone3d_reconstruction_core"
+          type="continuous_session_node.py"
+          output="screen"
+          required="$(arg required)" />
+  </group>
+</launch>

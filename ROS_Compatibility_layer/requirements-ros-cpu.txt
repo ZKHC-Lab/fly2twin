@@ -1,0 +1,3 @@
+# Validated together in ROS Noetic / CPython 3.8 on the local x86_64 test host.
+numpy==1.24.4
+scipy==1.10.1

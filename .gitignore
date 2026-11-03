@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+# ROS catkin workspace outputs
+/ROS_Compatibility_layer/build/
+/ROS_Compatibility_layer/devel/
+/ROS_Compatibility_layer/install/
+/ROS_Compatibility_layer/run/
+# Pipeline outputs, weights and data stay local
+/outputs/
+/models/
+/data/
+*.pt
+*.pth
+*.bag
+/third_party/vggt-omega/.native/
+/viewer/tools/node_modules/

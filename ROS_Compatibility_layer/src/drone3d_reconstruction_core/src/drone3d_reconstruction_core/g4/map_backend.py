@@ -1,0 +1,940 @@
+"""Incremental file ingestion and atomic, complete map revisions.
+
+This module has no rospy dependency. Optimization consumes immutable local
+geometry. Old placements are never fed back as model predictions. Each revision
+re-solves the complete available graph from its deterministic spanning forest.
+
+Algorithm inputs are injected explicitly: registration, graph, localization,
+the per-edge threshold table and the fit-exclusion pool. A long-window grouping
+plan may be supplied to check the incoming windows against a registered frame
+list instead of trusting whatever arrived.
+
+``placement="frame_pose"`` replaces the graph solve with per-frame external
+poses and one VGGT depth scale per window (g4_backend.frame_pose); caching,
+E1 edges, revision files and the display pointer are shared with the graph path.
+"""
+from collections import Counter
+from dataclasses import asdict
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import tempfile
+from types import SimpleNamespace
+
+import numpy as np
+import scipy
+import g4_backend
+from g4_backend import (METHOD_ID, FRAME_POSE_METHOD_ID, Sim3, RelativeEdge, LocalizationAnchor,
+                        ThresholdPolicy, RegistrationConfig, GraphConfig, LocalizationConfig,
+                        FramePoseConfig, WindowPlan, build_shared_pairs, estimate_adjacent,
+                        build_initial_states, select_localization_anchors, solve_g4, sim3,
+                        interpolate_poses, resize_intrinsics, rotation_mean, shared_depth_ratio,
+                        solve_window_scales, trajectory_prior, window_translation)
+from .input_adapter import WindowInputReader, sha256
+
+
+def _plain(value):
+    if isinstance(value, np.ndarray):
+        return _plain(value.tolist())
+    if isinstance(value, np.generic):
+        return _plain(value.item())
+    if isinstance(value, dict):
+        return {str(k): _plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    return value
+
+
+def _write(path, value):
+    with open(path, "x") as stream:
+        json.dump(_plain(value), stream, sort_keys=True, indent=2, allow_nan=False)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _digest(value):
+    return hashlib.sha256(json.dumps(_plain(value), sort_keys=True).encode()).hexdigest()
+
+
+def _read(path):
+    return json.loads(Path(path).read_text())
+
+
+def _sync_dir(path):
+    fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _commit_directory(staging, final):
+    for path in staging.iterdir():
+        with path.open("rb") as stream:
+            os.fsync(stream.fileno())
+    _sync_dir(staging)
+    os.rename(staging, final)
+    _sync_dir(final.parent)
+
+
+def _binding(record):
+    return _digest({key: record.get(key) for key in (
+        "window_index", "result_manifest_sha256", "snapshot_manifest_sha256",
+        "capture_generation", "model_frame_ids", "overlap_frame_count",
+    )})
+
+
+def _input_policy(threshold_policy, exclusions, exclusion_label, plan):
+    """输入策略的内容绑定。
+
+    条目数与标签不足以识别一份策略：同路径、同条目数而数值不同（阈值 0.03→3.0、
+    排除点 [10,20]→[110,120]）必须得到不同的摘要，否则旧边缓存会与新策略混用。
+    """
+    return {"threshold_policy_source": threshold_policy.source,
+            "recorded_threshold_count": len(threshold_policy),
+            # 按**规范**边键做摘要：同一策略的两种拼写必须得到同一摘要，
+            # 冲突拼写在构造策略时就已被拒绝。
+            "recorded_threshold_digest": _digest(
+                {key: threshold_policy.canonical[key] for key in sorted(threshold_policy.canonical)}),
+            "exclusion_label": exclusion_label,
+            "exclusion_frame_count": len(exclusions),
+            "exclusion_digest": _digest(
+                {str(frame): np.asarray(pixels).tolist() for frame, pixels in sorted(exclusions.items())}),
+            "plan_digest": None if plan is None else plan.digest(),
+            "plan_source": None if plan is None else plan.source}
+
+
+def _default_input_policy():
+    from g4_backend import ThresholdPolicy
+    return _input_policy(ThresholdPolicy(), {}, "none", None)
+
+
+def _run_config_matches(stored, config):
+    """Compare a stored run file with the requested configuration.
+
+    Writers that predate the explicit input policy stored no ``input_policy``
+    block. Such a file still describes the same run when every key it does store
+    agrees and the requested input policy is the documented default. Any other
+    policy is a different configuration and needs its own output directory: the
+    file is never rewritten to make a mismatch disappear.
+    """
+    if not isinstance(stored, dict):
+        return False
+    if stored == config:
+        return True
+    if "input_policy" in stored or config["input_policy"] != _default_input_policy():
+        return False
+    if config["method_id"] != METHOD_ID:
+        return False
+    return all(config.get(key) == value for key, value in stored.items())
+
+
+def _pack_edge(edge):
+    return None if edge is None else {
+        "i": edge.i, "j": edge.j, "measurement": edge.measurement.to_dict(),
+        "covariance": edge.covariance.tolist(), "length_source": edge.length_source,
+        "point_count": edge.point_count,
+    }
+
+
+def _edge(data):
+    return RelativeEdge(data["i"], data["j"], Sim3.from_dict(data["measurement"]),
+                        data["covariance"], data["length_source"], data["point_count"])
+
+
+def _stats(values):
+    values = np.asarray(values, float)
+    if not len(values):
+        return {"count": 0, "rms": None, "p50": None, "p95": None, "max": None}
+    return {"count": len(values), "rms": float(np.sqrt(np.mean(values**2))),
+            "p50": float(np.percentile(values, 50)), "p95": float(np.percentile(values, 95)),
+            "max": float(np.max(values))}
+
+
+def _blank(value):
+    """True for "no input given": None, an empty string or whitespace."""
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def load_exclusions(source):
+    """Normalize a retained report/audit observation table.
+
+    Accepts a mapping or a JSON object of ``frame id -> [[u, v], ...]`` in model
+    pixels. These are observations kept aside from fitting; they are never taken
+    from the edge currently being estimated. An empty path means "not enabled".
+    """
+    if _blank(source):
+        return {}, "none"
+    if isinstance(source, (str, Path)):
+        path = Path(source)
+        source = json.loads(path.read_text())
+        label = str(path)
+    else:
+        label = "inline_mapping"
+    if not isinstance(source, dict):
+        raise ValueError("exclusions must be a frame-id mapping")
+    out = {}
+    for frame, pixels in source.items():
+        values = np.asarray(pixels, float)
+        if values.size == 0:
+            continue
+        if values.ndim != 2 or values.shape[1] != 2 or not np.isfinite(values).all():
+            raise ValueError("exclusions must contain finite Nx2 model pixels")
+        out[str(frame)] = values
+    return out, label
+
+
+def exclusions_from_committed_pairs(root, window_ids):
+    """Collect report-split observations already committed for earlier windows.
+
+    Only windows written after the sampled pixels were retained carry the frame
+    identity of each sample; older cache entries contribute nothing and say so
+    through the returned label rather than silently changing the fit pool.
+    """
+    out, contributing, skipped = {}, 0, 0
+    for index in window_ids:
+        path = Path(root) / "windows" / ("window-%06d" % index) / "pairs.npz"
+        if not path.exists():
+            continue
+        with np.load(path, allow_pickle=False) as data:
+            if not {"model_pixels", "frame_ids", "split"}.issubset(data.files):
+                skipped += 1
+                continue
+            pixels, frames, split = data["model_pixels"], data["frame_ids"], data["split"]
+        report = split == 2
+        if not report.any():
+            continue
+        contributing += 1
+        for frame in np.unique(frames[report]):
+            out.setdefault(str(frame), []).append(pixels[report & (frames == frame)])
+    merged = {frame: np.concatenate(chunks) for frame, chunks in out.items()}
+    label = ("committed_report_observations:" + str(contributing) + "_windows"
+             + ("" if not skipped else f":{skipped}_windows_without_sample_identity"))
+    return merged, label
+
+
+def load_threshold_table(source, group=None):
+    """Read a recorded per-edge threshold table.
+
+    Accepts a plain ``{"i|j": value}`` object, an ``{"edges": [...]}`` wrapper or
+    a list of edge records. The frozen seams schema
+    (``from``/``to``/``threshold_previous_local_units``) is recognised
+    explicitly rather than guessed from whatever keys happen to be present.
+
+    Two properties are deliberate:
+
+    * a record without a recorded threshold is *skipped* (the frozen code
+      recomputed exactly those edges), never interpreted as zero;
+    * a table that carries several groups (the frozen file has G0 and G1 with the
+      same ``from``/``to`` pairs) must be narrowed with ``group`` instead of
+      letting the last record win silently.
+
+    An empty path means "no recorded table": every edge is recomputed and
+    labelled as recomputed.
+    """
+    if _blank(source):
+        return ThresholdPolicy()
+    if isinstance(source, (str, Path)):
+        path = Path(source)
+        payload = json.loads(path.read_text())
+        label = str(path)
+    else:
+        payload, label = source, "inline_mapping"
+    if isinstance(payload, dict) and "edges" in payload:
+        payload = payload["edges"]
+    if isinstance(payload, dict):
+        if group is not None:
+            raise ValueError("group selection requires a record list, not a plain mapping")
+        return ThresholdPolicy(payload, label)
+    if not isinstance(payload, (list, tuple)):
+        raise ValueError("threshold table must be an edge mapping or a record list")
+    for i_field, j_field, value_field in (("i", "j", "threshold"),
+                                          ("from", "to", "threshold_previous_local_units")):
+        if all(isinstance(r, dict) and i_field in r and j_field in r for r in payload):
+            records = payload
+            groups = {str(r["group"]) for r in records if r.get("group") is not None}
+            if len(groups) > 1 and group is None:
+                raise ValueError(
+                    "threshold table contains several groups "
+                    f"({', '.join(sorted(groups))}); select one explicitly"
+                )
+            if group is not None:
+                records = [r for r in records if str(r.get("group", group)) == str(group)]
+                if not records:
+                    raise ValueError(f"no threshold records for group {group!r}")
+            skipped = sum(1 for r in records if r.get(value_field) is None)
+            policy = ThresholdPolicy.from_records(records, i_field=i_field, j_field=j_field,
+                                                  value_field=value_field, source=label)
+            object.__setattr__(policy, "skipped_records", skipped)
+            return policy
+    raise ValueError("unrecognised threshold table schema")
+
+
+def check_plan_shape(plan, profile):
+    """Validate a registered grouping against the session's declared window shape.
+
+    The runtime derives steady windows (``window_frames`` new frames plus
+    ``overlap_frames`` shared); only a registered list can declare a short final
+    window. That check is the one place the tail guarantee is enforceable, so a
+    plan whose short window would drop below ``minimum_total_frames``, or whose
+    steady windows disagree with the session, is rejected instead of being
+    accepted as a differently-shaped run under the same identity.
+    """
+    semantics = profile.get("window_frame_semantics")
+    if plan is None or semantics != "new_frames":
+        return
+    window_frames, overlap_frames = profile.get("window_frames"), profile.get("overlap_frames")
+    minimum_total = profile.get("minimum_total_frames")
+    if not all(isinstance(v, int) and not isinstance(v, bool) for v in (window_frames, overlap_frames, minimum_total)):
+        raise ValueError("new_frames profile must declare window_frames, overlap_frames and minimum_total_frames")
+    for spec in plan:
+        if spec.index == 0:
+            if spec.shared_prefix:
+                raise ValueError("a registered plan must start with an unshared window")
+            continue
+        if spec.new_frames == window_frames:
+            if spec.shared_prefix != overlap_frames:
+                raise ValueError(
+                    f"registered plan window {spec.id} shares {spec.shared_prefix} frames "
+                    f"but the session declares {overlap_frames}"
+                )
+        elif spec.new_frames < window_frames:
+            if spec.shared_prefix < overlap_frames:
+                raise ValueError(f"registered plan window {spec.id} drops below the declared shared prefix")
+            if spec.input_frames < minimum_total:
+                raise ValueError(
+                    f"registered plan window {spec.id} has {spec.input_frames} model frames "
+                    f"below minimum_total_frames={minimum_total}"
+                )
+        else:
+            raise ValueError(f"registered plan window {spec.id} exceeds the declared new-frame count")
+
+
+PLACEMENTS = ("graph", "frame_pose")
+
+
+def _check_intrinsics(value):
+    """Calibrated source-image pinhole: {width, height, fx, fy, cx, cy}."""
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"width", "height", "fx", "fy", "cx", "cy"}:
+        raise ValueError("camera_intrinsics needs exactly width, height, fx, fy, cx, cy")
+    out = {k: float(value[k]) for k in ("fx", "fy", "cx", "cy")}
+    out.update(width=int(value["width"]), height=int(value["height"]))
+    if (not all(np.isfinite(v) for v in out.values()) or min(out["fx"], out["fy"]) <= 0
+            or min(out["width"], out["height"]) <= 0):
+        raise ValueError("camera_intrinsics must be finite with positive focal lengths and size")
+    return out
+
+
+def build_backend(records_root, session_id, output_root, profile=None):
+    """Construct the map backend from one explicit profile mapping.
+
+    The profile is the single place where the method identity, the grouping
+    plan, the recorded threshold table and the retained-observation exclusion
+    source are declared. Nothing is re-derived from the environment.
+    """
+    from g4_backend import GraphConfig, LocalizationConfig, RegistrationConfig, load_plan
+    profile = dict(profile or {})
+    plan = load_plan(profile["window_plan_path"]) if not _blank(profile.get("window_plan_path")) else None
+    check_plan_shape(plan, profile)
+    placement = profile.get("placement") or "graph"
+    return G4MapBackend(
+        records_root, session_id, output_root,
+        registration_config=RegistrationConfig(**profile.get("registration", {})),
+        graph_config=GraphConfig(**profile.get("graph", {})),
+        localization_config=LocalizationConfig(**profile.get("localization", {})),
+        threshold_policy=load_threshold_table(profile.get("threshold_table_path"),
+                                              group=profile.get("threshold_group") or None),
+        exclusion_source=profile.get("fit_exclusion_source") or None,
+        plan=plan, method_id=profile.get("method_id") or None, placement=placement,
+        frame_pose_config=FramePoseConfig(**profile.get("frame_pose", {})),
+        camera_intrinsics=profile.get("camera_intrinsics") or None)
+
+
+class G4MapBackend:
+    def __init__(self, records_root, session_id, output_root, frame_id="g4_map",
+                 *, reader=None, scanner=None, registration_config=None, graph_config=None,
+                 localization_config=None, threshold_policy=None, exclusion_source=None,
+                 plan=None, method_id=None, placement="graph", frame_pose_config=None,
+                 camera_intrinsics=None):
+        if not re.fullmatch(r"s[0-9a-f]{16}", session_id):
+            raise ValueError("expected a formal session ID")
+        if not frame_id or frame_id.startswith("/") or any(c.isspace() for c in frame_id):
+            raise ValueError("invalid output frame_id")
+        if method_id is None:
+            # A different placement is a different method; never inherit G4's identity.
+            method_id = FRAME_POSE_METHOD_ID if placement == "frame_pose" else METHOD_ID
+        if not isinstance(method_id, str) or not method_id:
+            raise ValueError("method_id must be a nonempty string")
+        if plan is not None and not isinstance(plan, WindowPlan):
+            raise ValueError("plan must be a WindowPlan")
+        if threshold_policy is not None and not isinstance(threshold_policy, ThresholdPolicy):
+            raise ValueError("threshold_policy must be a ThresholdPolicy")
+        if placement not in PLACEMENTS:
+            raise ValueError("placement must be one of %r" % (PLACEMENTS,))
+        self.placement = placement
+        self.frame_pose_config = frame_pose_config or FramePoseConfig()
+        self.camera_intrinsics = _check_intrinsics(camera_intrinsics)
+        self.records_root = Path(records_root).resolve()
+        self.output_root = Path(output_root).resolve()
+        if (self.output_root == self.records_root or self.records_root in self.output_root.parents
+                or self.output_root in self.records_root.parents):
+            raise ValueError("G4 output must be separate from immutable formal records")
+        self.session_id, self.frame_id = session_id, frame_id
+        self.method_id, self.plan = method_id, plan
+        if scanner is None:
+            from drone3d_reconstruction_core.formal_result import scan_session_windows
+            scanner = scan_session_windows
+        self.reader, self.scanner = reader or WindowInputReader(), scanner
+        if (self.output_root.exists() and any(p.name not in {"runtime.log", "backend_profile.json"}
+                                              for p in self.output_root.iterdir())
+                and not (self.output_root / "run.json").exists()):
+            raise ValueError("output directory is nonempty and is not an owned G4 run")
+        self.output_root.mkdir(parents=True, exist_ok=True)
+        self._lock = open(self.output_root / ".writer.lock", "a+")
+        try:
+            fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            self._lock.close()
+            raise RuntimeError("another G4 writer owns this output directory")
+        self.reg_config = registration_config or RegistrationConfig()
+        self.graph_config = graph_config or GraphConfig()
+        self.loc_config = localization_config or LocalizationConfig()
+        self.threshold_policy = threshold_policy or ThresholdPolicy()
+        self.exclusions, self.exclusion_label = load_exclusions(exclusion_source)
+        config = {"schema": "drone3d.g4.run.v1", "method_id": self.method_id,
+                  "records_root": str(self.records_root), "session_id": session_id,
+                  "frame_id": frame_id,
+                  "registration": asdict(self.reg_config), "graph": asdict(self.graph_config),
+                  "localization": asdict(self.loc_config),
+                  "input_policy": _input_policy(self.threshold_policy, self.exclusions,
+                                                self.exclusion_label, self.plan),
+                  "formal_geometry_acceptance": False,
+                  "runtime": {"numpy": np.__version__, "scipy": scipy.__version__},
+                  "core_sources": {p.name: sha256(p) for p in sorted(Path(g4_backend.__file__).parent.glob("*.py"))},
+                  "adapter_sources": {name: sha256(Path(__file__).parent / name)
+                                      for name in ("map_backend.py", "input_adapter.py")}}
+        if placement != "graph":
+            # Graph runs keep their historical run.json; only new placements add keys.
+            config.update(placement=placement, frame_pose=asdict(self.frame_pose_config),
+                          camera_intrinsics=self.camera_intrinsics)
+        config_path = self.output_root / "run.json"
+        if config_path.exists():
+            if not _run_config_matches(_read(config_path), config):
+                self.close()
+                raise ValueError("output directory belongs to another session/configuration")
+        else:
+            _write(config_path, config)
+        self.config_digest = _digest(config)
+        (self.output_root / "windows").mkdir(exist_ok=True)
+        (self.output_root / "revisions").mkdir(exist_ok=True)
+        self._announced = None
+        self._status = {"state": "waiting", "method_id": self.method_id, "session_id": session_id}
+
+    def close(self):
+        if not self._lock.closed:
+            fcntl.flock(self._lock, fcntl.LOCK_UN)
+            self._lock.close()
+
+    def status(self):
+        return dict(self._status)
+
+    def _window_path(self, index):
+        return self.output_root / "windows" / ("window-%06d" % index)
+
+    def _read_window(self, index):
+        root = self._window_path(index)
+        meta = _read(root / "window.json")
+        if sha256(root / "window.json") != (root / "window.sha256").read_text().strip():
+            raise ValueError("cached window metadata changed")
+        for name, digest in meta["artifacts"].items():
+            if sha256(root / name) != digest:
+                raise ValueError("cached G4 window artifact changed: " + name)
+        return meta
+
+    def _check_plan(self, record, window, meta):
+        """Fail loudly when an incoming window contradicts a registered grouping.
+
+        ``meta`` records the plan identity; the model input length and the shared
+        prefix are checked here. Frame identity of the shared prefix - that these
+        are the trailing new frames of the previous window - needs both windows
+        and is checked by ``_check_shared_identity``.
+        """
+        if self.plan is None:
+            return
+        index = int(record["window_index"])
+        if not 0 <= index < len(self.plan):
+            raise ValueError("window index outside the registered grouping plan")
+        spec = self.plan.spec(index)
+        if len(window.frame_ids) != spec.input_frames:
+            raise ValueError("window model input length does not match the registered grouping plan")
+        if window.shared_prefix != spec.shared_prefix:
+            raise ValueError("window shared prefix does not match the registered grouping plan")
+        meta["plan"] = {"source": self.plan.source, "digest": self.plan.digest(),
+                        "semantics": self.plan.semantics, "window_index": index,
+                        "spec": spec.to_record()}
+
+    def _check_shared_identity(self, window, previous):
+        """The shared prefix must be the previous window's trailing new frames."""
+        if self.plan is None or not window.shared_prefix:
+            return
+        prefix = int(window.shared_prefix)
+        previous_new = list(previous.geometry.frame_ids[previous.geometry.shared_prefix:])
+        if list(window.frame_ids[:prefix]) != previous_new[-prefix:]:
+            raise ValueError("shared prefix frames are not the previous window's trailing new frames")
+
+    def _fit_exclusions(self, window, before_index):
+        """Retained observations excluded from this edge's fit pool.
+
+        Two labelled sources are merged: the registered exclusion table and the
+        report-split samples already committed by earlier windows. The edge
+        currently being estimated never contributes to its own exclusion pool,
+        and an empty pool is reported as empty instead of being left implicit.
+        """
+        shared = {str(frame) for frame in window.frame_ids[:window.shared_prefix]}
+        pool, labels = {}, []
+        registered = {str(frame): pixels for frame, pixels in self.exclusions.items() if str(frame) in shared}
+        if registered:
+            pool, labels = dict(registered), [self.exclusion_label]
+        committed, committed_label = exclusions_from_committed_pairs(
+            self.output_root, range(max(0, int(before_index))))
+        committed = {frame: pixels for frame, pixels in committed.items() if frame in shared}
+        for frame, pixels in committed.items():
+            pool[frame] = np.concatenate([pool[frame], pixels]) if frame in pool else pixels
+        if committed:
+            labels.append(committed_label)
+        return pool, ("+".join(labels) if labels else "none")
+
+    def _cache_window(self, record, previous_record):
+        loaded = self.reader.load(record)
+        w, meta = loaded.geometry, dict(loaded.metadata)
+        pair_data = {}
+        meta["edge"] = None
+        self._check_plan(record, w, meta)
+        if previous_record is None:
+            # A preceding inference may have failed. These images have no
+            # committed owner, so the first verified root owns its full input.
+            meta["declared_shared_prefix"] = w.shared_prefix
+            meta["shared_prefix"] = 0
+            meta["registration"] = {"admitted": False, "reason":
+                "root_after_missing_predecessor" if w.shared_prefix else "root_window"}
+        else:
+            previous = self.reader.load(previous_record)
+            self._check_shared_identity(w, previous)
+            for key in ("capture_generation", "camera_topic", "camera_frame_id"):
+                if previous.metadata[key] != meta[key]:
+                    raise ValueError("camera/session identity changed: " + key)
+            if previous.metadata.get("attention_backend", "auto") != meta.get("attention_backend", "auto"):
+                raise ValueError("attention backend changed across windows; start a new session")
+            old_ext, new_ext = previous.metadata.get("body_from_camera"), meta.get("body_from_camera")
+            if old_ext is not None and new_ext is not None and any(
+                    not np.allclose(old_ext[k], new_ext[k], atol=1e-8, rtol=0)
+                    for k in ("rotation", "translation")):
+                raise ValueError("fixed body-camera extrinsic changed across windows")
+            if self.placement == "frame_pose" and w.shared_prefix and all(
+                    f in previous.geometry.frame_ids for f in w.frame_ids[:w.shared_prefix]):
+                # Only a relative depth scale is needed; E1 Sim(3) registration is skipped.
+                ratio, used = shared_depth_ratio(previous.geometry, w)
+                meta["scale_edge"] = None if ratio is None else {
+                    "i": previous.geometry.window_id, "j": w.window_id, "scale": ratio, "frames": used}
+                meta["registration"] = {"admitted": False, "reason": "frame_pose_uses_shared_depth_ratio"}
+            elif w.shared_prefix and all(f in previous.geometry.frame_ids for f in w.frame_ids[:w.shared_prefix]):
+                exclusions, label = self._fit_exclusions(w, record["window_index"])
+                pairs = build_shared_pairs(previous.geometry, w, self.reg_config,
+                                           exclude_fit_pixels=exclusions, threshold_policy=self.threshold_policy,
+                                           exclusion_source=label)
+                registration = estimate_adjacent(pairs, config=self.reg_config)
+                meta["edge"] = _pack_edge(registration.edge)
+                meta["registration"] = registration.diagnostics
+                pair_data = {"source": pairs.source, "target": pairs.target, "split": pairs.split,
+                             "model_pixels": pairs.model_pixels,
+                             "frame_ids": np.asarray([str(f) for f in pairs.frame_ids], dtype="U256")}
+                meta["pair_windows"] = [pairs.i, pairs.j]
+                meta["threshold"] = {"value": float(pairs.threshold), "source": pairs.threshold_source}
+            else:
+                meta["registration"] = {"admitted": False, "reason": "no_complete_shared_predecessor"}
+                if w.shared_prefix and not any(
+                        f in previous.geometry.frame_ids for f in w.frame_ids[:w.shared_prefix]):
+                    # A failed middle window has no committed display ownership.
+                    # Keep the unowned prefix while leaving its missing edge absent.
+                    meta["declared_shared_prefix"] = w.shared_prefix
+                    meta["shared_prefix"] = 0
+            del previous
+        meta.update(input_binding=_binding(record), geometry_accepted=False,
+                    method_id=self.method_id)
+        extra = {}
+        if self.placement == "frame_pose":
+            if loaded.reference_rotations is None:
+                raise ValueError("frame_pose placement needs localization camera rotations")
+            extra["reference_rotations"] = np.where(loaded.reference_valid[:, None, None],
+                                                    loaded.reference_rotations, 0.)
+            meta["intrinsics"] = self._model_intrinsics(w, meta)
+        target = self._window_path(w.window_id)
+        staging = Path(tempfile.mkdtemp(prefix=".window-", dir=target.parent))
+        try:
+            np.savez_compressed(staging / "cameras.npz", centers=w.centers, rotations=w.rotations,
+                                timestamps_ns=w.timestamps_ns, reference_centers=loaded.reference_centers,
+                                reference_valid=loaded.reference_valid, **extra)
+            if pair_data:
+                np.savez_compressed(staging / "pairs.npz", **pair_data)
+            meta["artifacts"] = {p.name: sha256(p) for p in staging.iterdir()}
+            _write(staging / "window.json", meta)
+            (staging / "window.sha256").write_text(sha256(staging / "window.json") + "\n")
+            _commit_directory(staging, target)
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging)
+        return meta
+
+    def _model_intrinsics(self, window, meta):
+        """Calibrated K at model resolution: profile > snapshot CameraInfo > VGGT median.
+
+        Back-projecting VGGT depth with the calibrated K mattered outdoors
+        (flight-out2, 40-frame windows: accuracy median 4.1 vs 7.6 cm).
+        """
+        h, w = window.depth.shape[1:]
+        model_size = tuple(meta.get("model_image_size") or (w, h))
+        if model_size != (w, h):
+            raise ValueError("model image size differs from prediction depth")
+        if self.camera_intrinsics is not None:
+            c = self.camera_intrinsics
+            K = np.array([[c["fx"], 0, c["cx"]], [0, c["fy"], c["cy"]], [0, 0, 1.]])
+            return {"K": resize_intrinsics(K, (c["width"], c["height"]), (w, h)).tolist(), "source": "profile"}
+        info = meta.get("camera_info")
+        if info:
+            K = resize_intrinsics(np.asarray(info["K"]), (info["width"], info["height"]), (w, h))
+            return {"K": K.tolist(), "source": "snapshot_camera_info"}
+        return {"K": np.median(np.asarray(window.intrinsics), axis=0).tolist(), "source": "vggt_window_median"}
+
+    def _anchors(self, metadata):
+        cameras, references, reference_by_id, frames = {}, {}, {}, set()
+        for meta in metadata:
+            i = meta["window_id"]
+            with np.load(self._window_path(i) / "cameras.npz", allow_pickle=False) as a:
+                cameras[i] = SimpleNamespace(window_id=i, frame_ids=meta["frame_ids"],
+                    timestamps_ns=a["timestamps_ns"], centers=a["centers"], rotations=a["rotations"],
+                    shared_prefix=meta["shared_prefix"])
+                valid = a["reference_valid"]
+                if valid.any():
+                    frames.add(meta["reference_frame_id"])
+                for k in np.flatnonzero(valid):
+                    stamp = int(a["timestamps_ns"][k])
+                    value = a["reference_centers"][k]
+                    if stamp in references and not np.allclose(references[stamp], value, atol=1e-8, rtol=0):
+                        raise ValueError("same RGB stamp has conflicting localization")
+                    references[stamp] = value
+                    reference_by_id[meta["frame_ids"][k]] = value
+        if len(frames) > 1:
+            raise ValueError("localization reference frame changed across windows")
+        if len(references) < 2:
+            return [], cameras, None, reference_by_id, next(iter(frames), "")
+        timestamps = np.array(sorted(references), np.int64)
+        selection = select_localization_anchors(cameras.values(), timestamps,
+                    np.array([references[int(t)] for t in timestamps]), config=self.loc_config)
+        # Missing exact RGB-time interpolation must never be filled across a gap.
+        exact = np.array([frame in reference_by_id for frame in selection.frame_ids])
+        selection.fit &= exact
+        selection.valid &= exact
+        selection.heldout &= exact
+        chosen = [a for a in selection.anchors if a.frame_id in reference_by_id]
+        counts = Counter(a.block for a in chosen)
+        anchors = [LocalizationAnchor(a.window_id, a.local_center, reference_by_id[a.frame_id],
+                    1/np.sqrt(counts[a.block]), a.frame_id, a.block) for a in chosen]
+        return anchors, cameras, selection, reference_by_id, next(iter(frames), "")
+
+    def _publish_revision(self, metadata, signature):
+        if self.placement == "frame_pose":
+            return self._publish_frame_pose(metadata, signature)
+        attempt = self.output_root / ("failed-solve-" + signature[:16] + ".json")
+        if attempt.exists():
+            raise RuntimeError("G4 solve previously failed for these immutable inputs; waiting for new input")
+        edges = [_edge(m["edge"]) for m in metadata if m["edge"]]
+        ids = [m["window_id"] for m in metadata]
+        anchors, cameras, selection, refs, reference_frame = self._anchors(metadata)
+        initial, components = build_initial_states(edges, ids)
+        result = solve_g4(initial, edges, anchors, self.graph_config, method_id=self.method_id)
+        info, states = result.diagnostics, result.states
+        if info["status"] <= 0:
+            if not attempt.exists():
+                _write(attempt, {"input_signature": signature, "graph": info,
+                                 "states": {i: t.to_dict() for i, t in states.items()}})
+            raise RuntimeError("G4 solve did not converge; previous revision retained")
+        # Numerical component validity is distinct from independent geometry acceptance.
+        component_checks = {c["component"]: c for c in info["component_diagnostics"]}
+        usable = [i for i in ids if component_checks[components[i]]["publishable_numerical"]]
+        number, final, staging = self._next_revision()
+        try:
+            centers, rotations, stamps, owners = [], [], [], []
+            windows, seams = [], []
+            for meta in metadata:
+                i, cam = meta["window_id"], cameras[meta["window_id"]]
+                T = states[i]
+                windows.append({"window_id": i, "component": components[i],
+                    "global_frame_status": info["global_frame_status"][components[i]],
+                    "included_in_global_preview": i in usable, "local_to_map": T.to_dict(),
+                    "prediction_to_map": sim3.compose(T, Sim3.from_dict(meta["prediction_to_local"])).to_dict(),
+                    "source": meta, "geometry_accepted": False})
+                if i in usable:
+                    sl = slice(cam.shared_prefix, None)
+                    centers.append(sim3.apply(T, cam.centers[sl]))
+                    rotations.append(T.rotation @ cam.rotations[sl])
+                    stamps.append(cam.timestamps_ns[sl])
+                    owners.append(np.full(len(cam.timestamps_ns[sl]), i, np.int64))
+                if meta.get("pair_windows"):
+                    a, b = meta["pair_windows"]
+                    if a in usable and b in usable:
+                        with np.load(self._window_path(i) / "pairs.npz", allow_pickle=False) as p:
+                            dist = np.linalg.norm(sim3.apply(states[b], p["source"])-sim3.apply(states[a], p["target"]), axis=1)
+                            seams.append({"i": a, "j": b, "interpretation": "shared prediction consistency in localization units",
+                                          "splits": {name: _stats(dist[p["split"] == split]) for split, name in enumerate(("fit", "accept", "report"))}})
+            np.savez_compressed(staging / "trajectory.npz",
+                centers=np.concatenate(centers) if centers else np.empty((0, 3)),
+                rotations=np.concatenate(rotations) if rotations else np.empty((0, 3, 3)),
+                timestamps_ns=np.concatenate(stamps) if stamps else np.empty(0, np.int64),
+                window_ids=np.concatenate(owners) if owners else np.empty(0, np.int64))
+            loc_metrics = {}
+            if selection is not None:
+                for name in ("fit", "heldout"):
+                    errors = []
+                    for n in np.flatnonzero(getattr(selection, name)):
+                        i, fid = selection.owner[n], selection.frame_ids[n]
+                        if i in usable:
+                            k = cameras[i].frame_ids.index(fid)
+                            errors.append(np.linalg.norm(sim3.apply(states[i], cameras[i].centers[k])-refs[fid]))
+                    loc_metrics[name] = _stats(errors)
+            revision = {"schema": "drone3d.g4.map_revision.v1", "revision": number,
+                "method_id": self.method_id, "session_id": self.session_id, "frame_id": self.frame_id,
+                "reference_frame_id": reference_frame, "input_signature": signature,
+                "config_digest": self.config_digest, "replacement": "complete_map",
+                "window_count": len(ids), "published_windows": usable,
+                "pending_windows": [i for i in ids if i not in usable], "windows": windows,
+                "graph": info, "loop_edges": 0, "orientation_factors": 0,
+                "formal_geometry_acceptance": False, "baseline_promoted": False,
+                "localization_consistency": loc_metrics,
+                "localization_metric_interpretation": "constraint compliance, not surface ground truth",
+                "seam_diagnostics": seams,
+                "edge_thresholds": [{"i": m["edge"]["i"], "j": m["edge"]["j"],
+                                     "value": (m.get("threshold") or {}).get("value"),
+                                     "source": (m.get("threshold") or {}).get("source")}
+                                    for m in metadata if m["edge"]],
+                "input_policy": {"exclusion_label": self.exclusion_label,
+                                 "registered_exclusion_frames": len(self.exclusions),
+                                 "threshold_policy_source": self.threshold_policy.source,
+                                 "recorded_threshold_count": len(self.threshold_policy),
+                                 "plan_digest": None if self.plan is None else self.plan.digest(),
+                                 "plan_source": None if self.plan is None else self.plan.source},
+                "artifacts": {p.name: sha256(p) for p in staging.iterdir()}}
+            _write(staging / "revision.json", revision)
+            return self._commit_revision(staging, final, usable)
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging)
+
+    def _next_revision(self):
+        directories = sorted((self.output_root / "revisions").glob("revision-[0-9]*"))
+        number = 1 + max([int(p.name.split("-")[1]) for p in directories] or [0])
+        final = self.output_root / "revisions" / ("revision-%06d" % number)
+        return number, final, Path(tempfile.mkdtemp(prefix=".revision-", dir=final.parent))
+
+    def _commit_revision(self, staging, final, usable):
+        _commit_directory(staging, final)
+        # Commit the latest computation and the displayed complete map in
+        # one pointer. A rejected update must not erase accepted history or
+        # mix transforms from different graph solves.
+        current = {"path": str(final), "sha256": sha256(final / "revision.json")}
+        display = current
+        latest = self.output_root / "latest.json"
+        if latest.exists():
+            previous = _read(latest)
+            previous = previous.get("display", previous)
+            previous_path = Path(previous["path"])
+            if (previous_path.parent != self.output_root / "revisions"
+                    or sha256(previous_path / "revision.json") != previous["sha256"]):
+                raise ValueError("display revision integrity failed")
+            previous_data = _read(previous_path / "revision.json")
+            if not set(previous_data["published_windows"]).issubset(usable):
+                display = previous
+        pointer = self.output_root / ".latest.tmp"
+        if pointer.exists():
+            pointer.unlink()
+        _write(pointer, {**current, "display": display})
+        os.replace(pointer, self.output_root / "latest.json")
+        _sync_dir(self.output_root)
+        return final
+
+    def _publish_frame_pose(self, metadata, signature):
+        """Per-frame localization poses + one VGGT depth scale per window."""
+        cfg = self.frame_pose_config
+        ids = [m["window_id"] for m in metadata]
+        cams, priors = {}, {}
+        ref_by_stamp, frames = {}, set()
+        for meta in metadata:
+            i = meta["window_id"]
+            with np.load(self._window_path(i) / "cameras.npz", allow_pickle=False) as a:
+                cam = {k: a[k] for k in a.files}
+            if "reference_rotations" not in cam:
+                raise ValueError("cached window lacks reference rotations; use a new output directory")
+            cams[i] = cam
+            valid = cam["reference_valid"]
+            if valid.any():
+                frames.add(meta["reference_frame_id"])
+            priors[i] = trajectory_prior(cam["centers"], cam["rotations"], cam["reference_centers"],
+                                         cam["reference_rotations"], valid)
+            for k in np.flatnonzero(valid):
+                stamp = int(cam["timestamps_ns"][k])
+                pose = (cam["reference_centers"][k], cam["reference_rotations"][k])
+                if stamp in ref_by_stamp and not np.allclose(ref_by_stamp[stamp][0], pose[0], atol=1e-8, rtol=0):
+                    raise ValueError("same RGB stamp has conflicting localization")
+                ref_by_stamp[stamp] = pose
+        if len(frames) > 1:
+            raise ValueError("localization reference frame changed across windows")
+        edges = [(m["scale_edge"]["i"], m["scale_edge"]["j"], float(m["scale_edge"]["scale"]))
+                 for m in metadata if m.get("scale_edge")]
+        scales, constrained, scale_diag = solve_window_scales(ids, priors, edges, cfg)
+        stamps = np.array(sorted(ref_by_stamp), np.int64)
+        ref_c = np.array([ref_by_stamp[int(t)][0] for t in stamps]).reshape(-1, 3)
+        ref_R = np.array([ref_by_stamp[int(t)][1] for t in stamps]).reshape(-1, 3, 3)
+        offset = int(round(cfg.pose_time_offset_ms * 1e6))
+        number, final, staging = self._next_revision()
+        try:
+            windows, usable, centers, rotations, owners, frame_stamps = [], [], [], [], [], []
+            for meta in metadata:
+                i, cam = meta["window_id"], cams[meta["window_id"]]
+                applied = meta.get('capture_pose_time_offset_ms')
+                if cfg.pose_time_offset_stage == 'capture':
+                    if applied != cfg.pose_time_offset_ms:
+                        raise ValueError('Capture pose offset marker differs from session profile')
+                    c, R = cam['reference_centers'].copy(), cam['reference_rotations'].copy()
+                    ok = cam['reference_valid'].astype(bool).copy()
+                else:
+                    if applied is not None:
+                        raise ValueError('Capture already applied pose offset; refusing double shift')
+                    c, R, ok = interpolate_poses(cam["timestamps_ns"] + offset, stamps, ref_c, ref_R,
+                                                 int(cfg.max_pose_gap_ms * 1e6))
+                # The time offset is a refinement: where no bracket exists (sparse
+                # keyframes, session ends) keep the frame's own RGB-time pose.
+                own = ~ok & cam["reference_valid"].astype(bool)
+                c[own], R[own], ok = cam["reference_centers"][own], cam["reference_rotations"][own], ok | own
+                shifted = int((ok & ~own).sum())
+                s = scales.get(i)
+                prior = priors[i]
+                T = None
+                if s is not None and ok.any():
+                    # Window Sim(3) for frames without a pose and for consumers of
+                    # prediction_to_map; frames with a pose use it directly.
+                    Rw = prior["rotation"] if prior is not None else rotation_mean(
+                        np.einsum("nij,nkj->nik", R[ok], cam["rotations"][ok]))
+                    tw = window_translation(cam["centers"], s, Rw, c, ok)
+                    T = Sim3(s, Rw, tw)
+                is_usable = T is not None
+                reason = "localized" if is_usable else (
+                    "no_metric_scale" if s is None else "no_localization_pose")
+                frame_poses = [{"rotation": R[k].tolist(), "center": c[k].tolist()} if ok[k] else None
+                               for k in range(len(ok))]
+                entry = {"window_id": i, "component": 0, "global_frame_status": reason,
+                         "included_in_global_preview": is_usable, "source": meta, "geometry_accepted": False,
+                         "placement": "frame_pose", "scale_diagnostics": scale_diag[i],
+                         "frame_pose_valid": int(ok.sum()), "frame_pose_time_shifted": shifted,
+                         # Pending windows keep their model-local gauge, as in the graph path.
+                         "prediction_to_map": meta["prediction_to_local"]}
+                if is_usable:
+                    usable.append(i)
+                    entry.update(local_to_map=T.to_dict(),
+                                 prediction_to_map=sim3.compose(T, Sim3.from_dict(meta["prediction_to_local"])).to_dict(),
+                                 depth_scale=float(s / meta["gauge"]), intrinsics=meta["intrinsics"]["K"],
+                                 intrinsics_source=meta["intrinsics"]["source"], frame_poses=frame_poses)
+                    sl = slice(meta["shared_prefix"], None)
+                    placed = ok[sl]
+                    centers.append(c[sl][placed]); rotations.append(R[sl][placed])
+                    frame_stamps.append(cam["timestamps_ns"][sl][placed])
+                    owners.append(np.full(int(placed.sum()), i, np.int64))
+                windows.append(entry)
+            np.savez_compressed(staging / "trajectory.npz",
+                centers=np.concatenate(centers) if centers else np.empty((0, 3)),
+                rotations=np.concatenate(rotations) if rotations else np.empty((0, 3, 3)),
+                timestamps_ns=np.concatenate(frame_stamps) if frame_stamps else np.empty(0, np.int64),
+                window_ids=np.concatenate(owners) if owners else np.empty(0, np.int64))
+            revision = {"schema": "drone3d.g4.map_revision.v1", "revision": number,
+                "method_id": self.method_id, "placement": "frame_pose", "session_id": self.session_id,
+                "frame_id": self.frame_id, "reference_frame_id": next(iter(frames), ""),
+                "input_signature": signature, "config_digest": self.config_digest,
+                "replacement": "complete_map", "window_count": len(ids), "published_windows": usable,
+                "pending_windows": [i for i in ids if i not in usable], "windows": windows,
+                "graph": {"placement": "frame_pose", "constrained_windows": sorted(constrained),
+                          "edges": len(edges), "pose_time_offset_ms": cfg.pose_time_offset_ms},
+                "loop_edges": 0, "orientation_factors": 0,
+                "formal_geometry_acceptance": False, "baseline_promoted": False,
+                "localization_metric_interpretation": "frames placed by localization; not surface ground truth",
+                "artifacts": {p.name: sha256(p) for p in staging.iterdir()}}
+            _write(staging / "revision.json", revision)
+            return self._commit_revision(staging, final, usable)
+        finally:
+            if staging.exists():
+                shutil.rmtree(staging)
+
+    def update(self):
+        """Return a new complete revision, or replay latest once after restart."""
+        try:
+            records = list(self.scanner(self.records_root, self.session_id))
+            records.sort(key=lambda r: r["window_index"])
+            ids = [r["window_index"] for r in records]
+            if len(set(ids)) != len(ids):
+                raise ValueError("duplicate formal window index")
+            # The formal scanner excludes damaged records. Surface that exclusion.
+            session = self.records_root / self.session_id
+            disk_ids = {int(p.name[7:]) for p in session.glob("window-*") if re.fullmatch(r"window-[0-9]+", p.name)}
+            if disk_ids and disk_ids != set(ids):
+                raise ValueError("formal session contains missing/unverified windows")
+            cached_ids = {int(p.name[7:]) for p in (self.output_root / "windows").glob("window-*")}
+            if not cached_ids.issubset(ids):
+                raise ValueError("previously committed source window disappeared")
+            if sorted(cached_ids) != ids[:len(cached_ids)]:
+                raise ValueError("historical window inserted before cached inputs; use a new output directory")
+            if not records:
+                self._status.update(state="waiting", window_count=0)
+                return None
+            metadata = []
+            previous = None
+            for record in records:
+                path = self._window_path(record["window_index"])
+                meta = self._read_window(record["window_index"]) if path.exists() else self._cache_window(record, previous)
+                if meta["input_binding"] != _binding(record):
+                    raise ValueError("committed input changed; use a new output directory")
+                metadata.append(meta)
+                previous = record
+            signature = _digest([self.config_digest, [m["input_binding"] for m in metadata]])
+            latest = self.output_root / "latest.json"
+            output = None
+            if latest.exists():
+                pointer = _read(latest)
+                output = Path(pointer["path"])
+                if output.parent != self.output_root / "revisions" or sha256(output / "revision.json") != pointer["sha256"]:
+                    raise ValueError("latest revision integrity failed")
+                data = _read(output / "revision.json")
+                for name, digest in data["artifacts"].items():
+                    if sha256(output / name) != digest:
+                        raise ValueError("latest revision artifact changed")
+                if data["input_signature"] != signature:
+                    output = None
+            if output is None:
+                self._status.update(state="optimizing", window_count=len(ids))
+                output = self._publish_revision(metadata, signature)
+            data = _read(output / "revision.json")
+            self._status.update(state="ready", window_count=len(ids), revision=data["revision"],
+                latest_revision_path=str(output), pending_windows=data["pending_windows"],
+                published_windows=data["published_windows"], formal_geometry_acceptance=False, error="")
+            if self._announced == output:
+                return None
+            self._announced = output
+            return output
+        except Exception as error:
+            self._status.update(state="error", error=type(error).__name__ + ": " + str(error))
+            raise

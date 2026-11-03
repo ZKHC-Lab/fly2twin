@@ -1,0 +1,58 @@
+<?xml version="1.0"?>
+<!--
+  Single-command production entry for the continuous single-NX line.
+
+  This launch only assembles the project's own nodes:
+    front/down Capture Actions, Reconstruct Action, continuous scheduler.
+  It never starts roscore, bags, or hardware-group components. The
+  recommended entry is scripts/continuous_production.sh, which performs
+  the ROS-master + CUDA/checkpoint preflight before this launch.
+
+  web_enabled includes continuous_web.launch only when true. The Web node
+  reuses the same capture profiles and continuous_profile (web_host /
+  web_port / web_preview_fps live in that profile).
+-->
+<launch>
+  <arg name="front_capture_profile"
+       doc="Absolute path to the front capture profile YAML" />
+  <arg name="down_capture_profile"
+       doc="Absolute path to the down capture profile YAML" />
+  <arg name="reconstruct_profile"
+       doc="Absolute path to the reconstruct profile YAML" />
+  <arg name="continuous_profile"
+       doc="Absolute path to the continuous session profile YAML" />
+  <arg name="web_enabled" default="false"
+       doc="Enable the production Web node (WP8)" />
+  <arg name="required" default="true" />
+
+  <include file="$(find drone3d_reconstruction_core)/launch/capture_production.launch">
+    <arg name="profile_yaml" value="$(arg front_capture_profile)" />
+    <arg name="ns" value="front" />
+    <arg name="required" value="$(arg required)" />
+  </include>
+  <include file="$(find drone3d_reconstruction_core)/launch/capture_production.launch">
+    <arg name="profile_yaml" value="$(arg down_capture_profile)" />
+    <arg name="ns" value="down" />
+    <arg name="required" value="$(arg required)" />
+  </include>
+  <include file="$(find drone3d_reconstruction_core)/launch/reconstruct_production.launch">
+    <arg name="profile_yaml" value="$(arg reconstruct_profile)" />
+    <arg name="required" value="$(arg required)" />
+  </include>
+  <include file="$(find drone3d_reconstruction_core)/launch/continuous_session.launch">
+    <arg name="front_capture_profile" value="$(arg front_capture_profile)" />
+    <arg name="down_capture_profile" value="$(arg down_capture_profile)" />
+    <arg name="continuous_profile" value="$(arg continuous_profile)" />
+    <arg name="reconstruct_profile" value="$(arg reconstruct_profile)" />
+    <arg name="required" value="$(arg required)" />
+  </include>
+  <group if="$(arg web_enabled)">
+    <include file="$(find drone3d_reconstruction_core)/launch/continuous_web.launch">
+      <arg name="front_capture_profile" value="$(arg front_capture_profile)" />
+      <arg name="down_capture_profile" value="$(arg down_capture_profile)" />
+      <arg name="continuous_profile" value="$(arg continuous_profile)" />
+      <arg name="reconstruct_profile" value="$(arg reconstruct_profile)" />
+      <arg name="required" value="false" />
+    </include>
+  </group>
+</launch>

@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.0.2)
+project(drone3d_runtime)
+find_package(catkin REQUIRED)
+catkin_python_setup()
+catkin_package()
+install(DIRECTORY src/reconstruction_runtime/ DESTINATION ${CATKIN_GLOBAL_PYTHON_DESTINATION}/reconstruction_runtime
+        PATTERN "__pycache__" EXCLUDE PATTERN "*.pyc" EXCLUDE PATTERN "tests" EXCLUDE)
+if(CATKIN_ENABLE_TESTING)
+  catkin_add_nosetests(src/reconstruction_runtime/tests)
+endif()

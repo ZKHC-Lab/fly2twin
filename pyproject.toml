@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+[project]
+name = "drone3d-recon"
+version = "0.1.0"
+description = "Offline camera reconstruction, depth fusion and Gaussian splatting"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "licenses/*.txt", "THIRD_PARTY_NOTICES.md"]
+dependencies = ["numpy>=1.24", "scipy>=1.10", "PyYAML>=6"]
+[project.optional-dependencies]
+core = ["opencv-python>=4.8", "pycolmap==4.2.0", "Pillow>=9"]
+train = ["torch>=2.4", "torchvision", "gsplat==1.5.3", "torchmetrics", "fused-ssim"]
+bag = ["rosbags>=0.10"]
+lidar = ["rosbags>=0.10", "numba>=0.59"]
+test = ["pytest>=8"]
+[project.scripts]
+recon = "recon.cli:main"
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["recon*", "recon_core"]
+exclude = ["recon_core.tests", "recon_core.tests.*"]
+namespaces = false
+[tool.pytest.ini_options]
+pythonpath = ["."]

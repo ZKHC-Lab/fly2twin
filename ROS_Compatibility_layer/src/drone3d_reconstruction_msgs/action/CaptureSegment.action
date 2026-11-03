@@ -1,0 +1,38 @@
+# Capture one immutable, single-camera image batch for a local scene.
+# sample_fps, max_frames, and max_duration must all be finite and greater than zero.
+# Capture seals at the first max_frames or max_duration limit reached.
+string scene_id
+float32 sample_fps
+uint32 max_frames
+duration max_duration
+# Per-goal depth-save override. When set_save_sensor_depth is true the goal
+# uses save_sensor_depth for THIS window only; otherwise the node profile
+# value is used.
+bool save_sensor_depth
+bool set_save_sensor_depth
+---
+uint8 OK=0
+uint8 INVALID_GOAL=1
+uint8 CAMERA_UNAVAILABLE=2
+uint8 IO_ERROR=3
+uint8 CANCELLED=4
+uint8 INTERNAL_ERROR=5
+uint8 error_code
+string message
+string scene_id
+string camera_name
+string image_topic
+string snapshot_uri
+string manifest_uri
+string manifest_sha256
+uint32 frame_count
+time first_stamp
+time last_stamp
+bool has_camera_info
+bool has_odometry
+---
+string stage
+uint32 frame_count
+time latest_stamp
+duration elapsed
+string message
