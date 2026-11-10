@@ -1,93 +1,207 @@
-# 飞境 Fly2Twin
+<div align="center">
 
-中科华创（ZKHC） · 2026
+# Fly2Twin
 
-无人机增量重建、可交互孪生场景与可微视觉飞行的开源框架。无人机只需一台 RGB 相机和一个位姿来源（机载激光惯导里程计，或由图像求得的位姿），机载端边飞边分块重建点云；落地后离线精修位姿并训练 3D 高斯泼溅（3DGS）模型；重建好的场景可以在浏览器里漫游，也可以作为可微仿真的训练场景。
+**Fly once, get a digital twin you can explore and fly in.**
 
-![框架](framework.png)
+Incremental drone reconstruction · Interactive digital twin · Differentiable visual flight
 
-## 模块
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE) [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)](pyproject.toml) [![ROS](https://img.shields.io/badge/ROS-Noetic-22314E.svg)](ROS_Compatibility_layer/README.md) [![Platform](https://img.shields.io/badge/Onboard-Jetson_Orin_NX_16GB-76B900.svg)](ROS_Compatibility_layer/src/drone3d_reconstruction_core/docs/NX_BRINGUP.md)
 
-| 模块 | 目录 | 内容 |
+**English** | [简体中文](README_zh.md)
+
+</div>
+
+<p align="center">
+  <img src="assets/demo_incremental.gif" width="49%" alt="Point cloud growing along the capture trajectory"/>
+  <img src="assets/demo_office_roam.gif" width="49%" alt="Photorealistic 3DGS roaming in the reconstructed office"/>
+  <img src="assets/demo_obstacle_avoidance.gif" width="49%" alt="Vision-based obstacle avoidance inside the reconstructed scene"/>
+  <img src="assets/demo_phone_scene.gif" width="49%" alt="Lounge reconstructed from a phone video with the same pipeline"/>
+</p>
+<p align="center"><sub>Top: incremental reconstruction along the capture trajectory; free roaming in the reconstructed office (3DGS). Bottom: a depth-based avoidance policy flying inside the reconstruction (inset: policy input); a lounge reconstructed from a phone video with the same pipeline.</sub></p>
+
+**Fly2Twin** is an open-source framework that turns a single drone flight into a metric, photorealistic digital twin of an indoor space, and puts that twin directly to work for robots. It needs only an RGB camera and a pose source: LiDAR-inertial odometry on the drone, or poses recovered from the images themselves. The onboard computer builds the point cloud window by window during flight. After landing, the poses are refined with bundle adjustment and a 3D Gaussian Splatting (3DGS) model is trained. The resulting scene opens in any web browser for free roaming and drone piloting, and serves as a training ground for differentiable-physics flight policies.
+
+## News
+
+- **2026-11** — Initial public release (v0.1.0): onboard incremental reconstruction (ROS1), offline refinement and 3DGS, browser viewer, LiDAR-referenced evaluation, policy evaluation in reconstructed scenes.
+
+## Contents
+
+- [Overview](#overview)
+- [Method](#method)
+- [Results](#results)
+- [Getting Started](#getting-started)
+- [Repository Structure](#repository-structure)
+- [Roadmap](#roadmap)
+- [License](#license)
+- [Citation](#citation)
+- [Acknowledgements](#acknowledgements)
+
+## Overview
+
+<p align="center"><img src="assets/framework_en.png" width="100%" alt="Fly2Twin framework"/></p>
+
+| Module | Location | What it does |
 | --- | --- | --- |
-| 无人机增量重建 · 机载 | [ROS_Compatibility_layer/](ROS_Compatibility_layer/README.md) | ROS1 Noetic：相机采集与运动关键帧、40 帧分窗 VGGT-Omega 推理、按位姿逐帧放置、在线多视融合点云、交付包导出、落地全局 BA |
-| 无人机增量重建 · 离线 | [recon/](recon/README.md)、[recon_core/](recon_core/README.md) | 位姿来源插槽、图像特征光束法平差（BA）、Omega 深度、窗口尺度、多视一致性融合、3DGS 训练与评测、导出；点云到激光雷达地图的距离评测；按关键帧设计运镜、渲染并剪辑成片 |
-| 可交互孪生场景 | [viewer/](viewer/README.md) | 浏览器里加载导出的 3DGS / 点云（V 键切换），键盘自由漫游，或操控一架无人机在场景里飞；一条命令打开多个场景做演示 |
-| 可微视觉飞行 | 独立仓库 [DiffDrone-PyTorch3D](https://github.com/kirkchinese/Diffable_Drone_Pytorch3D)（GPL-3.0） | 用重建场景渲染深度图，轻量策略网络直接输出加速度指令，经可微动力学端到端训练 |
+| **Incremental drone reconstruction — onboard** | [`ROS_Compatibility_layer/`](ROS_Compatibility_layer/README.md) | ROS1 Noetic. Camera capture with motion-based keyframes, 40-frame VGGT-Omega windows, per-frame placement with the pose source, an incrementally updated multi-view point cloud, a delivery package, and post-flight global bundle adjustment. |
+| **Incremental drone reconstruction — offline** | [`recon/`](recon/README.md), [`recon_core/`](recon_core/README.md) | Pluggable pose providers, image bundle adjustment, VGGT-Omega depth, window scale estimation, multi-view consistent fusion, 3DGS training and evaluation, scene export, LiDAR-referenced accuracy evaluation, and a camera-path / video toolkit for exported scenes. |
+| **Interactive digital twin** | [`viewer/`](viewer/README.md) | Browser viewer for exported scenes: first-person roaming, drone piloting, 3DGS / point-cloud toggle, route cruise along the capture path, and multi-scene demos. No installation on the viewing side. |
+| **Differentiable visual flight** | [`recon/sim/`](recon/docs/SIM.md); training in [DiffDrone-PyTorch3D](https://github.com/kirkchinese/Diffable_Drone_Pytorch3D) | A lightweight policy maps a 48×64 depth image directly to acceleration commands and is trained end to end through differentiable dynamics. `recon sim` turns an exported scene into a flight volume, samples start/goal pairs and flies the policy in closed loop. |
 
-机载端与离线端的窗口尺度和多视融合是同一份代码（`recon_core`，NumPy/SciPy，Python 3.8 与 3.10 都可运行）。
+The window-scale solver and multi-view fusion are a single implementation shared by the onboard and offline sides (`recon_core`, NumPy/SciPy only, runs on Python 3.8 and 3.10).
 
-## 方法
+## Method
 
-1. **关键帧与分窗**：相对上一关键帧平移 ≥0.15 m、转角 ≥8° 或间隔达 2 s 时取一帧；首窗 40 帧，之后每窗 30 个新帧加 10 个共享帧。
-2. **稠密深度**：每个窗口送入 VGGT-Omega，得到每帧深度（相差一个窗口尺度）和置信度。
-3. **位姿来源**：可替换。无人机上用激光惯导里程计（FAST-LIO），按 RGB 时刻加时间偏移插值；没有外部定位时用 GLOMAP 由图像求位姿。离线可再做 SIFT + XFeat 特征的 BA，以来源位姿为位置先验（σ = 5 cm），重投影阈值三轮收紧 16 → 8 → 4 px。
-4. **窗口尺度**：每个窗口一个米制尺度，同时满足两类约束：窗口内 VGGT 相机轨迹与位姿来源轨迹的尺度比、相邻窗口共享帧上的深度比；在对数域做加权最小二乘，每来一窗全局重解一次。
-5. **多视一致性融合**：每个像素投影到最多 6 个近邻视角，深度对数比 <0.03 计为支持，至少 min(2, 可见视角数) 个支持才保留；2 cm 体素起，点数超上限时自适应放大体素。
-6. **3DGS**：用融合点云初始化；损失为 L1 / SSIM 图像项、与 VGGT 逆深度的 Pearson 相关项、高斯长短轴比惩罚。
+1. **Keyframes and windows.** A frame becomes a keyframe when it has moved ≥ 0.15 m or rotated ≥ 8° from the previous keyframe, or after 2 s. Onboard, every window holds 40 keyframes, 5 of them shared with the previous window. Offline, the first window holds 40 keyframes and each following window adds 30 new keyframes plus 10 shared ones.
+2. **Dense depth.** Each window is processed by [VGGT-Omega](https://github.com/facebookresearch/vggt), which predicts per-frame depth (up to one scale per window) and confidence.
+3. **Pose source.** Replaceable. On the drone, poses come from LiDAR-inertial odometry (FAST-LIO), interpolated to the RGB timestamps with a calibrated time offset. Without external localization, GLOMAP recovers poses from the images. Offline, SIFT and XFeat matches feed a bundle adjustment that uses the source poses as position priors (σ = 5 cm), with the reprojection threshold tightened over three rounds (16 → 8 → 4 px).
+4. **Window scale.** Each window receives one metric scale that satisfies two constraints at once: the scale ratio between the VGGT camera trajectory and the pose-source trajectory, and the depth ratio on frames shared with neighboring windows. The scales are solved jointly by weighted least squares in log space and re-solved globally whenever a window arrives, so later observations correct earlier estimates.
+5. **Multi-view consistent fusion.** Every pixel is checked against up to 6 neighboring views; a neighbor supports it when the log depth ratio is below 0.03, and at least min(2, visible views) supporting neighbors are required. Points are merged on a 2 cm voxel grid, which coarsens adaptively when a point budget is exceeded.
+6. **3DGS.** Gaussians are initialized from the fused cloud and trained with L1/SSIM photometric losses, a Pearson-correlation term against VGGT inverse depth, and an anisotropy penalty that suppresses needle-shaped Gaussians.
 
-## 结果
+## Results
 
-| 场景 | 位姿来源 | 指标 | 数值 |
+A full office floor was captured with the S380 drone's sensor suite (Intel RealSense D435i RGB at 1280×720, Livox MID-360, Jetson Orin NX 16 GB) in 27 minutes, yielding 3,470 keyframes.
+
+| Scene | Pose source | Metric | Value |
 | --- | --- | --- | --- |
-| 整层办公室（S380 的相机与激光雷达，手持采集 27 min，RGB 1280×720） | FAST-LIO，机载融合（本机回放 bag） | 重建点云到激光雷达地图的距离 P50 / P90 | 3.3 / 11.2 cm |
-| 同上 | FAST-LIO + 落地 BA | 同上 | 2.9 / 6.8 cm |
-| 同上 | FAST-LIO + 落地 BA | 3DGS 测试视角 PSNR（640×360，采集轨迹上留出的 433 帧，评测时按该帧图像微调相机位姿） | 25.7 dB |
-| 休息室（手机 4K 视频，抽 1200 帧） | GLOMAP，米制尺度按相机离地 1.4 m 假设 | 3DGS 测试视角 PSNR（1600×900，150 帧未参与训练） | 32.6 dB |
-| 机载 Jetson Orin NX 16 GB | FAST-LIO | 每个 40 帧窗口的 Omega 推理（384 宽） | 约 32 s |
-| 整层办公室重建场景中的仿真避障 | — | 50 组随机起终点，策略输入为重建点云渲染的深度图，未针对该场景重新训练 | 成功 50 组 |
+| Office floor, onboard point cloud | FAST-LIO | Distance to LiDAR map, P50 / P90 | 3.3 / 11.2 cm |
+| Office floor, after post-flight BA | FAST-LIO + BA | Distance to LiDAR map, P50 / P90 | **2.9 / 6.8 cm** |
+| Office floor, 3DGS | FAST-LIO + BA | PSNR, 433 held-out views (640×360, test-time pose alignment) | **25.7 dB** |
+| Lounge, phone 4K video | GLOMAP | PSNR, 150 held-out views (1600×900) | **32.6 dB** |
+| Onboard, Jetson Orin NX 16 GB | FAST-LIO | Per 40-frame window: GPU inference / total | 38 s / 42 s |
+| Obstacle avoidance in the reconstructed office (`recon sim`) | — | 50 random start–goal pairs, policy trained in random obstacle fields | **50 / 50** collision-free |
 
-激光雷达地图由同一次录制的雷达扫描按激光惯导位姿拼成，不是独立真值；距离是每个重建点到地图的最近邻距离，不做配准，口径见[激光雷达评测](recon/docs/LIDAR_EVAL.md)。
+Distances are measured from each reconstructed point to a LiDAR map built from the same recording ([protocol](recon/docs/LIDAR_EVAL.md)).
 
-离采集路线越远，3DGS 伪影越多，查看器可按 G 开启采集走廊引导。机载在线融合点云每次刷新都重算整段，耗时随窗口数增长（本机回放到 20 个窗口时单次约 78 s），尚未增量化。3470 帧规模的落地 BA 内存峰值超过 17 GB，超出 NX 的 16 GB，这一规模目前要在服务器上跑。
+## Getting Started
 
-## 快速开始
+### Requirements
 
-**离线（Python ≥ 3.10，NVIDIA GPU）**
+| Component | Tested configuration |
+| --- | --- |
+| Offline pipeline | Ubuntu 22.04, Python ≥ 3.10, NVIDIA GPU with ≥ 8 GB, PyTorch 2.7 + CUDA 12.8 toolkit |
+| Onboard | Ubuntu 20.04, ROS1 Noetic, Jetson Orin NX 16 GB, a pose source publishing `nav_msgs/Odometry` (e.g. FAST-LIO) |
+| Viewer | Any browser with WebGL2 |
+
+### Model weights
+
+- **VGGT-Omega** — request access on [Hugging Face](https://huggingface.co/facebook/VGGT-Omega) and download `vggt_omega_1b_512.pt`; set its path in `depth.weights` (offline) or in the reconstruction profile (onboard).
+- **XFeat** — used by bundle adjustment; see [`recon/docs/INSTALL.md`](recon/docs/INSTALL.md).
+
+### Installation
 
 ```bash
-python -m pip install -e '.[core,train]'      # 先装好与 CUDA 匹配的 PyTorch
-cp configs/phone_video.yaml my_scene.yaml      # 填写 video 与 depth.weights
-recon run --config my_scene.yaml               # prepare → pose → depth → fuse → train → eval → export
+git clone https://github.com/ZKHC-Lab/fly2twin.git
+cd fly2twin
+# Install a CUDA-matched PyTorch first, then:
+python -m pip install -e '.[core,train]'
 ```
 
-无人机数据（带位姿）用 [drone_with_poses.yaml](configs/drone_with_poses.yaml)；输入格式与全部参数见 [输入契约](recon/docs/INPUTS.md)，展示前请读 [避坑说明](recon/docs/PITFALLS.md)。
+Toolchain details (CUDA headers for gsplat, GPU architecture) are in [`recon/docs/INSTALL.md`](recon/docs/INSTALL.md).
 
-**机载（ROS1 Noetic）**：构建、启动与配置见 [ROS 工作空间说明](ROS_Compatibility_layer/README.md)，交付包与落地 BA 见 [机载第一版说明](ROS_Compatibility_layer/src/drone3d_reconstruction_core/docs/ONBOARD_V1.md)。
+### Quick start: from a phone video to an explorable scene
 
-**查看器**：`python3 -m viewer.tools.demo <导出目录> [<导出目录2> ...]` 在本机起服务并用浏览器打开，默认自由漫游，见 [查看器说明](viewer/README.md)。
+```bash
+cp configs/phone_video.yaml my_scene.yaml   # set `video` and `depth.weights`
+recon run --config my_scene.yaml            # prepare → pose → depth → fuse → train → eval → export
+python3 -m viewer.tools.demo <export_dir>   # serve the exported scene and open it in a browser
+```
 
-**评测与成片**：`recon lidar-reference` / `recon lidar-distance` 计算重建点云到激光雷达地图的距离，需 `pip install -e '.[lidar]'`，见 [激光雷达评测](recon/docs/LIDAR_EVAL.md)；`recon reel` 按关键帧设计运镜、审核像素覆盖度、渲染并剪辑，见 [运镜与剪辑](recon/docs/REEL.md)。
+For drone data with external poses, start from [`configs/drone_with_poses.yaml`](configs/drone_with_poses.yaml). The input contract and every configuration key are documented in [`recon/docs/INPUTS.md`](recon/docs/INPUTS.md).
 
-## 模型权重
+### Onboard reconstruction (ROS1 Noetic)
 
-- VGGT-Omega：在 Hugging Face 申请下载，填入 `depth.weights`（离线）或重建 profile 的 checkpoint（机载）。
-- XFeat：BA 需要其源码与权重，按 [安装说明](recon/docs/INSTALL.md) 准备。
+```bash
+source /opt/ros/noetic/setup.bash
+cd ROS_Compatibility_layer
+catkin_make && source devel/setup.bash
+bash src/drone3d_reconstruction_core/scripts/continuous_production.sh \
+  --front-profile <front_capture_profile.yaml> --down-profile <down_capture_profile.yaml> \
+  --reconstruct-profile <reconstruct_profile.yaml> --continuous-profile <continuous_profile.yaml> --web
+```
 
-本仓库不包含任何权重和采集数据。
+The web console runs at `http://127.0.0.1:8080`. Hardware bring-up on the Jetson Orin NX, the delivery package and post-flight BA are described in [`NX_BRINGUP.md`](ROS_Compatibility_layer/src/drone3d_reconstruction_core/docs/NX_BRINGUP.md) and [`ONBOARD_V1.md`](ROS_Compatibility_layer/src/drone3d_reconstruction_core/docs/ONBOARD_V1.md).
 
-## 许可
+### Policy evaluation in a reconstructed scene
 
-本项目原创代码采用 [Apache-2.0](LICENSE) 许可。
+```bash
+python -m pip install -e '.[core,sim]'
+git clone https://github.com/kirkchinese/Diffable_Drone_Pytorch3D.git   # policy and dynamics
+recon sim prepare <export_dir> scene.npz --ceiling-z 2.95             # level floor, close ceiling
+recon sim pairs scene.npz pairs.npz                                    # 50 start/goal pairs at 1.2 m
+recon sim eval scene.npz pairs.npz eval/ --diffdrone Diffable_Drone_Pytorch3D \
+  --checkpoint exp21_grad_clip_goal_best_ar.pth                       # from its v0.1.0 release
+```
 
-`third_party/vggt-omega/` 及 VGGT-Omega 的输出受 FAIR 非商业研究许可约束，禁止军事等用途；带 VGGT-Omega 的完整流程只能用于研究。其余第三方组件及其许可见 [第三方声明](THIRD_PARTY_NOTICES.md)。
+On the office scene these commands run in about a minute on CPU. Definitions and the checkpoint checksum are in [`recon/docs/SIM.md`](recon/docs/SIM.md).
 
-## 贡献者
+### Viewer controls
 
-本项目由中科华创 ZKHC-Lab 开发并维护，贡献者见 GitHub 仓库页面的 Contributors。
+| Key | Action |
+| --- | --- |
+| `W` `A` `S` `D` / `R` `F` | Move / ascend and descend |
+| Mouse drag | Look around |
+| `Tab` | Switch to drone flight mode |
+| `V` | Toggle 3DGS / point cloud |
+| `P` | Cruise along the capture route |
+| `G` | Toggle capture-corridor guidance |
 
-## 引用
+### Evaluation and tests
+
+```bash
+python -m pip install -e '.[lidar,test]'
+recon lidar-reference ...   # build a LiDAR reference map from a ROS1 bag
+recon lidar-distance ...    # distances from a reconstruction to the reference
+python -m pytest tests      # CPU test suite
+```
+
+ROS-side tests: `catkin_make run_tests -j1 && catkin_test_results --verbose` inside `ROS_Compatibility_layer`.
+
+## Repository Structure
+
+```text
+fly2twin/
+├── ROS_Compatibility_layer/   # Onboard ROS1 workspace: capture, windowed inference, online map, delivery, BA
+├── recon/                     # Offline pipeline: poses, BA, depth, fusion, 3DGS, export, evaluation, reel, sim
+├── recon_core/                # Numerical core shared by onboard and offline (window scale, fusion)
+├── viewer/                    # Browser viewer and demo tools
+├── configs/                   # Example configurations (phone video, drone with poses, image only, S380)
+├── third_party/vggt-omega/    # VGGT-Omega model code and inference entry
+├── scripts/ · tests/          # Equivalence checks and test suite
+└── licenses/ · THIRD_PARTY_NOTICES.md
+```
+
+## Roadmap
+
+- [x] Onboard incremental reconstruction on Jetson Orin NX
+- [x] Post-flight bundle adjustment and 3DGS training
+- [x] Browser viewer with drone piloting
+- [x] Policy evaluation inside reconstructed scenes (`recon sim`, 50 / 50)
+- [ ] Onboard processing at capture rate
+- [ ] Training policies directly in reconstructed scenes
+- [ ] Multi-drone collaborative reconstruction
+- [ ] Legged robots
+
+## License
+
+Fly2Twin is released under the [Apache License 2.0](LICENSE). `third_party/vggt-omega/` and its outputs are under the [FAIR Noncommercial Research License](third_party/vggt-omega/LICENSE). DiffDrone-PyTorch3D (GPL-3.0) is a separate repository that `recon sim` imports at run time. Other third-party components are listed in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+
+## Citation
+
+If you find Fly2Twin useful in your research, please cite:
 
 ```bibtex
 @misc{fly2twin2026,
   title  = {Fly2Twin: Fly Once, Get a Trainable Digital Twin},
-  author = {ZKHC},
+  author = {Xu, Lu and {ZKHC}},
   year   = {2026},
   url    = {https://github.com/ZKHC-Lab/fly2twin}
 }
 ```
 
-使用可微视觉飞行模块时请同时引用：
+When using the differentiable flight module, please also cite:
 
 ```bibtex
 @misc{diffdrone_pytorch3d,
@@ -105,7 +219,16 @@ recon run --config my_scene.yaml               # prepare → pose → depth → 
 }
 ```
 
-## 致谢
+## Acknowledgements
 
-- 可微视觉飞行模块使用 [DiffDrone-PyTorch3D](https://github.com/kirkchinese/Diffable_Drone_Pytorch3D)（GPL-3.0），它是 DiffPhysDrone（Zhang et al., Nature Machine Intelligence, 2025）的 PyTorch3D 复现与扩展，来自徐路的本科毕业设计，以独立仓库提供，本仓库不包含其源码。
-- 稠密深度使用 VGGT-Omega（Meta AI）；3DGS 训练基于 gsplat；位姿求解使用 COLMAP / GLOMAP / pycolmap；特征匹配使用 XFeat；查看器基于 three.js 与 Spark。
+Fly2Twin is developed and maintained by ZKHC (中科华创) and authored by Lu Xu. It builds on excellent open-source work:
+
+- [VGGT-Omega](https://github.com/facebookresearch/vggt) (Visual Geometry Group, University of Oxford; Meta AI) for dense depth;
+- [DiffPhysDrone](https://github.com/HenryHuYu/DiffPhysDrone) (Zhang et al., *Nature Machine Intelligence*, 2025), of which [DiffDrone-PyTorch3D](https://github.com/kirkchinese/Diffable_Drone_Pytorch3D) is a PyTorch3D reimplementation and extension;
+- [FAST-LIO](https://github.com/hku-mars/FAST_LIO) for LiDAR-inertial odometry;
+- [COLMAP](https://github.com/colmap/colmap) / [GLOMAP](https://github.com/colmap/glomap) / pycolmap for structure-from-motion and bundle adjustment;
+- [XFeat](https://github.com/verlab/accelerated_features) for feature matching;
+- [gsplat](https://github.com/nerfstudio-project/gsplat) for Gaussian Splatting;
+- [three.js](https://github.com/mrdoob/three.js) and [Spark](https://github.com/sparkjsdev/spark) for the browser viewer.
+
+Questions and bug reports are welcome on [GitHub Issues](https://github.com/ZKHC-Lab/fly2twin/issues).

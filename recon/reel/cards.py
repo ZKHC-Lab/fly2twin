@@ -5,7 +5,7 @@ Styles:
   title   : chapter title, lower-left, large, with a short accent bar
   label   : small caption (e.g. 实拍 / 重建, 小窗名), placed at (x, y) anchor
   number  : one line of result numbers, lower-left under where a title would be
-  endcard : project name, tagline, GitHub, 开源 — on the shared dark background
+  endcard : project name, tagline, GitHub, footer (default 开源) — on the shared dark background
 Usage from code: cards.title('边飞边建', path) etc.
 """
 from pathlib import Path
@@ -92,7 +92,7 @@ def number(text, out, y=H - 120, style=None):
     im.save(out)
 
 
-def endcard(name, tagline, url, out, logo=None, style=None):
+def endcard(name, tagline, url, out, logo=None, style=None, footer='开源'):
     im = Image.new('RGBA', (W, H), tuple((style or {}).get('background', [14, 17, 22])) + (255,))
     d = ImageDraw.Draw(im)
     y = 330
@@ -104,7 +104,7 @@ def endcard(name, tagline, url, out, logo=None, style=None):
     for text, f, fill, dy in ((name, font('Bold', 96, style), (255, 255, 255, 255), 150),
                               (tagline, font('Regular', 40, style), (215, 222, 230, 255), 110),
                               (url, font('Regular', 32, style), tuple((style or {}).get('accent', [64, 200, 190])) + (255,), 70),
-                              ('开源', font('Medium', 34, style), (255, 255, 255, 255), 0)):
+                              (footer, font('Medium', 34, style), (255, 255, 255, 255), 0)):
         w = d.textlength(text, font=f)
         d.text(((W - w) / 2, y), text, font=f, fill=fill)
         y += dy

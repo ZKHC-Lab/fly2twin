@@ -19,6 +19,7 @@ Original code of this repository is released by ZKHC under the Apache-2.0 [licen
 | torchmetrics / LPIPS / AlexNet | Optional evaluation | torchmetrics Apache-2.0; model/backbone/linear-weight rights must be separately archived |
 | rosbags / numba | Optional `lidar` dependency group; LiDAR reference builder reads ROS1 bags | rosbags Apache-2.0; numba BSD-2-Clause |
 | three.js, Spark, fflate, spz | Vendored browser libraries in `viewer/vendor/` | MIT; license files kept next to each library |
+| DiffDrone-PyTorch3D | Optional run-time import by `recon sim eval` from a checkout the user provides (`model.py`, `navigation_utils.py`, `drone_dynamics.py`) and its released checkpoint; not bundled | GPL-3.0; a distributed work that combines it with this repository is subject to GPL-3.0 |
 | playwright-core | Optional headed browser checks (`viewer/tools/package.json`), not needed by the viewer | Apache-2.0 |
 
 `plyfile` is not imported, declared or used. PLY scalar-vertex parsing and writing are implemented directly with NumPy. No GPL simulator or VGGT-X code is included; the differentiable-flight simulator is a separate GPL-3.0 repository.

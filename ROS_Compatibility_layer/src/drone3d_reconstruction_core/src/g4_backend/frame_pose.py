@@ -41,10 +41,29 @@ class FramePoseConfig:
     pose_time_offset_ms: float = 0.0
     pose_time_offset_stage: str = "backend"
     max_pose_gap_ms: float = 500.0
+    # Weight of one cross-window frame-pair row (recon_core.scale.cross_view_log_ratio);
+    # 0 keeps the trajectory-prior + adjacent-edge solve. Needs capture-stage poses,
+    # the poses frames are placed with.
+    cross_window_weight: float = 0.0
+    cross_window_stride: int = 4
+    # One depth scale per frame (recon_core.scale.solve_frame_scales) from frame-pair rows
+    # inside and across windows; the window scale stays the frame scales' common part.
+    # Replaces the weighted cross-window rows, so cross_window_weight must be 0.
+    frame_scales: bool = False
 
     def __post_init__(self):
         if self.pose_time_offset_stage not in ("capture", "backend"):
             raise ValueError("pose_time_offset_stage must be capture or backend")
+        if not np.isfinite(self.cross_window_weight) or self.cross_window_weight < 0:
+            raise ValueError("cross_window_weight must be finite and nonnegative")
+        if type(self.frame_scales) is not bool:
+            raise ValueError("frame_scales must be a bool")
+        if self.frame_scales and self.cross_window_weight > 0:
+            raise ValueError("frame_scales replaces cross_window_weight; set it to 0")
+        if (self.cross_window_weight > 0 or self.frame_scales) and self.pose_time_offset_stage != "capture":
+            raise ValueError("cross_window_weight / frame_scales need pose_time_offset_stage=capture")
+        if type(self.cross_window_stride) is not int or not 1 <= self.cross_window_stride <= 16:
+            raise ValueError("cross_window_stride must be an integer in 1..16")
         for name in ("min_extent_m", "extent_weight_cap", "edge_weight", "max_pose_gap_ms"):
             value = getattr(self, name)
             if not np.isfinite(value) or value <= 0:

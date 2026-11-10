@@ -74,5 +74,7 @@ def apply_map_snapshot(records, records_root, session_id):
             # prediction_to_map above stays the window-level fallback.
             alignment.update(placement="frame_pose", frame_poses=w["frame_poses"],
                              depth_scale=w["depth_scale"], intrinsics=w["intrinsics"])
+            if "frame_depth_scales" in w:
+                alignment["frame_depth_scales"] = w["frame_depth_scales"]
         result.append({**record, "alignment": alignment})
     return result

@@ -703,6 +703,8 @@ def load_continuous_config(
         pose_time_offset_ms=_finite_number(params.get("pose_time_offset_ms", 0.0), "pose_time_offset_ms"),
         pose_time_offset_stage=str(params.get("pose_time_offset_stage", "backend")),
         frame_pose_fusion=_required_bool(params.get("frame_pose_fusion", False), "frame_pose_fusion"),
+        g4_cross_window_weight=_finite_number(params.get("g4_cross_window_weight", 0.0), "g4_cross_window_weight"),
+        g4_frame_scales=_required_bool(params.get("g4_frame_scales", False), "g4_frame_scales"),
         camera_intrinsics=_optional_intrinsics(params.get("camera_intrinsics")),
         initial_queue_mode=_queue_mode(_required(params, "initial_queue_mode")),
         initial_queue_capacity=_positive_integer(

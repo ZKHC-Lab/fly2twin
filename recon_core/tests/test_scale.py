@@ -3,7 +3,7 @@ import unittest
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from recon_core.scale import batch_window_scales, shared_depth_ratio
+from recon_core.scale import batch_window_scales, shared_depth_ratio, solve_window_scales
 
 
 def window(wid, frames, scale, poses, depth, rotation):
@@ -54,3 +54,66 @@ class SharedDepthRatioTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class CrossViewRatioTest(unittest.TestCase):
+    def setUp(self):
+        self.K = np.array([[40., 0, 31.5], [0, 40., 23.5], [0, 0, 1.]])
+        self.pose_i, self.pose_j = np.eye(4), np.eye(4)
+        self.pose_j[0, 3] = .3  # pure sideways baseline in front of a fronto-parallel wall
+
+    def test_scaled_source_depth_gives_its_log_ratio(self):
+        from recon_core.scale import cross_view_log_ratio
+        wall = np.full((48, 64), 2.)
+        for stride in (1, 2, 4):
+            value, pixels = cross_view_log_ratio(wall[::stride, ::stride] * 1.1, self.K, self.pose_i,
+                                                 wall[::stride, ::stride], self.K, self.pose_j, stride=stride)
+            self.assertAlmostEqual(value, np.log(1.1), places=12)
+            self.assertGreater(pixels * stride * stride, 500)
+
+    def test_too_few_pixels_or_out_of_gate_give_none(self):
+        from recon_core.scale import cross_view_log_ratio
+        wall = np.full((48, 64), 2.)
+        self.assertIsNone(cross_view_log_ratio(wall * 1.5, self.K, self.pose_i, wall, self.K, self.pose_j)[0])
+        far = self.pose_j.copy()
+        far[0, 3] = 5.
+        self.assertIsNone(cross_view_log_ratio(wall, self.K, self.pose_i, wall, self.K, far)[0])
+
+    def test_weighted_edges_change_the_solve(self):
+        prior = {"scale": 2.0, "extent_m": 1.0, "residual_rms_m": 0.0}
+        priors = {0: prior, 1: dict(prior, scale=2.4)}
+        plain, _, _ = solve_window_scales([0, 1], priors, [])
+        weighted, _, _ = solve_window_scales([0, 1], priors, [(0, 1, 1.0, 1e6)])
+        self.assertAlmostEqual(plain[1], 2.4)
+        self.assertAlmostEqual(weighted[0], weighted[1], places=6)
+
+
+class FrameScaleSolveTest(unittest.TestCase):
+    def test_rows_move_frames_off_their_window_scale_and_unanchored_stay_nan(self):
+        from recon_core.scale import solve_frame_scales
+        prior = {"scale": 2.0, "extent_m": 1.0, "residual_rms_m": 0.0}
+        # Windows 0 and 1, three frames each; window 2 has no prior and no rows.
+        frame_window = np.array([0, 0, 0, 1, 1, 1, 2, 2])
+        temporal = [(0, 1), (1, 2), (3, 4), (4, 5), (6, 7)]
+        # Frame 5 of window 1 is 10 % deeper than the frame it overlaps (frame 2).
+        rows = [(5, 2, np.log(1.1)), (2, 5, -np.log(1.1))]
+        windows, frames, constrained = solve_frame_scales([0, 1, 2], {0: prior, 1: prior}, [(0, 1, 1.0)],
+                                                          frame_window, rows, temporal)
+        self.assertEqual(constrained, {0, 1})
+        self.assertEqual(set(windows), {0, 1})
+        self.assertTrue(np.all(np.isnan(frames[6:])))
+        log = np.log(frames[:6] / 2.0)
+        self.assertGreater(log[5] - log[2], .02)            # the row pulls frame 5 up, frame 2 down
+        self.assertLess(abs(log[0]), abs(log[2]) + 1e-12)   # far from the row the deviation fades
+        self.assertTrue(np.all(np.abs(log) < np.log(1.1)))
+
+    def test_without_rows_frames_equal_the_window_solve(self):
+        from recon_core.scale import solve_frame_scales
+        priors = {0: {"scale": 2.0, "extent_m": 1.0, "residual_rms_m": 0.0},
+                  1: {"scale": 2.4, "extent_m": 1.0, "residual_rms_m": 0.0}}
+        windows, frames, _ = solve_frame_scales([0, 1], priors, [(0, 1, 1.0)], np.array([0, 0, 1, 1]), [],
+                                                [(0, 1), (2, 3)])
+        plain, _, _ = solve_window_scales([0, 1], priors, [(0, 1, 1.0)], edge_weight=1.0)
+        for w in (0, 1):
+            self.assertAlmostEqual(windows[w], plain[w], places=8)
+        np.testing.assert_allclose(frames, [windows[0], windows[0], windows[1], windows[1]], rtol=1e-8)

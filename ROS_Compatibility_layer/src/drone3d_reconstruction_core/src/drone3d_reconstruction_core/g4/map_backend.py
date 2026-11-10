@@ -359,6 +359,12 @@ def build_backend(records_root, session_id, output_root, profile=None):
         camera_intrinsics=profile.get("camera_intrinsics") or None)
 
 
+def _pack_cross(rows):
+    return dict(window_i=np.array(rows["window_i"], np.int64), window_j=np.array(rows["window_j"], np.int64),
+                frame_i=np.array(rows["frame_i"], dtype="U256"), frame_j=np.array(rows["frame_j"], dtype="U256"),
+                value=np.array(rows["value"], np.float64), pixels=np.array(rows["pixels"], np.int64))
+
+
 class G4MapBackend:
     def __init__(self, records_root, session_id, output_root, frame_id="g4_map",
                  *, reader=None, scanner=None, registration_config=None, graph_config=None,
@@ -513,7 +519,8 @@ class G4MapBackend:
             labels.append(committed_label)
         return pool, ("+".join(labels) if labels else "none")
 
-    def _cache_window(self, record, previous_record):
+    def _cache_window(self, record, previous_record, earlier=()):
+        """Cache one committed window. ``earlier``: metadata of the cached windows before it."""
         loaded = self.reader.load(record)
         w, meta = loaded.geometry, dict(loaded.metadata)
         pair_data = {}
@@ -577,6 +584,14 @@ class G4MapBackend:
             extra["reference_rotations"] = np.where(loaded.reference_valid[:, None, None],
                                                     loaded.reference_rotations, 0.)
             meta["intrinsics"] = self._model_intrinsics(w, meta)
+        cross = None
+        if self.placement == "frame_pose" and self._measures_rows():
+            stride = self.frame_pose_config.cross_window_stride
+            owned = np.arange(int(meta["shared_prefix"]), len(w.frame_ids))
+            cam = dict(centers=w.centers, rotations=w.rotations, reference_centers=loaded.reference_centers,
+                       reference_valid=loaded.reference_valid, **extra)
+            cross = dict(owned=owned, depth=np.ascontiguousarray(w.depth[owned][:, ::stride, ::stride], np.float32))
+            cross.update(self._measure_cross(w.window_id, meta, cam, cross, earlier))
         target = self._window_path(w.window_id)
         staging = Path(tempfile.mkdtemp(prefix=".window-", dir=target.parent))
         try:
@@ -585,6 +600,8 @@ class G4MapBackend:
                                 reference_valid=loaded.reference_valid, **extra)
             if pair_data:
                 np.savez_compressed(staging / "pairs.npz", **pair_data)
+            if cross is not None:
+                np.savez_compressed(staging / "cross.npz", **cross)
             meta["artifacts"] = {p.name: sha256(p) for p in staging.iterdir()}
             _write(staging / "window.json", meta)
             (staging / "window.sha256").write_text(sha256(staging / "window.json") + "\n")
@@ -593,6 +610,152 @@ class G4MapBackend:
             if staging.exists():
                 shutil.rmtree(staging)
         return meta
+
+    def _measures_rows(self):
+        cfg = self.frame_pose_config
+        return cfg.cross_window_weight > 0 or cfg.frame_scales
+
+    def _scale_problem(self, entries):
+        """Trajectory priors, adjacent edges and (window mode) weighted cross-window rows
+        of (window_id, meta, cameras, cross arrays or None)."""
+        cfg = self.frame_pose_config
+        priors, edges = {}, []
+        for i, meta, cam, cross in entries:
+            priors[i] = trajectory_prior(cam["centers"], cam["rotations"], cam["reference_centers"],
+                                         cam["reference_rotations"], cam["reference_valid"])
+            if meta.get("scale_edge"):
+                edges.append((meta["scale_edge"]["i"], meta["scale_edge"]["j"], float(meta["scale_edge"]["scale"])))
+            if cfg.cross_window_weight > 0 and cross is not None and "window_i" in cross:
+                # Row x_i - x_j = value, i.e. s_i = s_j * exp(value). The window being
+                # measured has no rows yet.
+                for wi, wj, value in zip(cross["window_i"], cross["window_j"], cross["value"]):
+                    edges.append((int(wj), int(wi), float(np.exp(value)), cfg.cross_window_weight))
+        return priors, edges
+
+    def _frame_solve(self, entries):
+        """Per-frame scales over ``entries`` (recon_core.scale.solve_frame_scales).
+
+        Frames are each window's owned frames with a localization pose; temporal pairs
+        link consecutive ones of one window; rows come from every window's cross.npz.
+        Returns (window scales: id -> float, frame scales: id -> array over the window's
+        model frames, NaN where a frame has no scale).
+        """
+        from recon_core.scale import solve_frame_scales
+        priors, edges = self._scale_problem(entries)
+        index, frame_window, temporal = {}, [], []
+        for i, meta, cam, cross in entries:
+            valid, previous = cam["reference_valid"].astype(bool), None
+            for k in cross["owned"]:
+                if valid[k]:
+                    index[(i, str(meta["frame_ids"][k]))] = len(frame_window)
+                    if previous is not None:
+                        temporal.append((previous, len(frame_window)))
+                    previous = len(frame_window)
+                    frame_window.append(i)
+        rows = []
+        for _, _, _, cross in entries:
+            if "window_i" not in cross:
+                continue
+            for wi, wj, fi, fj, value in zip(cross["window_i"], cross["window_j"], cross["frame_i"],
+                                             cross["frame_j"], cross["value"]):
+                a, b = index.get((int(wi), str(fi))), index.get((int(wj), str(fj)))
+                if a is not None and b is not None:
+                    rows.append((a, b, float(value)))
+        window_scales, solved, _ = solve_frame_scales([e[0] for e in entries], priors, edges,
+                                                      np.array(frame_window, np.int64), rows, temporal)
+        frame_scales = {}
+        for i, meta, _, _ in entries:
+            scales = np.full(len(meta["frame_ids"]), np.nan)
+            for k, fid in enumerate(meta["frame_ids"]):
+                n = index.get((i, str(fid)))
+                if n is not None:
+                    scales[k] = solved[n]
+            frame_scales[i] = scales
+        return window_scales, frame_scales, len(rows)
+
+    def _measure_cross(self, window_id, meta, cam, cross, earlier):
+        """Depth rows between this window's frames and the cached windows before it (and,
+        with frame_scales, between this window's own frames).
+
+        Deterministic in the committed inputs: frame pairs are the fusion neighbours
+        (recon_core.fusion.ranked_partners, symmetric) among the frames cached so far, and
+        depths are linearised at the window scales solved over the same windows. Each row
+        stores log s_i - log s_j - log(z / d_j) at those scales; later changes are small.
+        """
+        from scipy.spatial import cKDTree
+        from recon_core.fusion import NEIGHBOR_RADIUS_M, ranked_partners
+        from recon_core.scale import cross_view_log_ratio
+        cfg = self.frame_pose_config
+        entries, depths = [], {}
+        for m in earlier:
+            path = self._window_path(m["window_id"])
+            if not (path / "cross.npz").exists():
+                raise ValueError("cached window lacks cross-window depth; use a new output directory")
+            with np.load(path / "cameras.npz", allow_pickle=False) as a:
+                other = {k: a[k] for k in a.files}
+            with np.load(path / "cross.npz", allow_pickle=False) as a:
+                # Depth maps are read only for windows that end up in a pair.
+                other_cross = {k: a[k] for k in a.files if k != "depth"}
+            depths[m["window_id"]] = path / "cross.npz"
+            entries.append((m["window_id"], m, other, other_cross))
+        entries.append((window_id, meta, cam, cross))
+        if cfg.frame_scales:
+            scales = self._frame_solve(entries)[0]
+        else:
+            priors, edges = self._scale_problem(entries)
+            scales, _, _ = solve_window_scales([e[0] for e in entries], priors, edges, cfg)
+        rows = dict(window_i=[], window_j=[], frame_i=[], frame_j=[], value=[], pixels=[])
+        frames = []  # (window position, owned row, model frame index)
+        for position, (i, m, c, x) in enumerate(entries):
+            if i not in scales:
+                continue
+            valid = c["reference_valid"].astype(bool)
+            for row, k in enumerate(x["owned"]):
+                if valid[k]:
+                    frames.append((position, row, int(k)))
+        new = [n for n, f in enumerate(frames) if f[0] == len(entries) - 1]
+        if not new:
+            return _pack_cross(rows)
+        poses = np.repeat(np.eye(4)[None], len(frames), 0)
+        for n, (position, _, k) in enumerate(frames):
+            c = entries[position][2]
+            poses[n, :3, :3], poses[n, :3, 3] = c["reference_rotations"][k], c["reference_centers"][k]
+        centers, rotations = poses[:, :3, 3], poses[:, :3, :3]
+        tree = cKDTree(centers)
+        candidates = set(new)
+        for a in new:
+            candidates.update(tree.query_ball_point(centers[a], NEIGHBOR_RADIUS_M))
+        ranked = {a: ranked_partners(a, centers, rotations, tree) for a in sorted(candidates)}
+        new_set = set(new)
+        pairs = {(min(a, b), max(a, b)) for a, picks in ranked.items() for b in picks
+                 if (a in new_set or b in new_set) and (cfg.frame_scales or frames[a][0] != frames[b][0])}
+
+        loaded_depth = {window_id: cross["depth"]}
+
+        def metric(n):
+            position, row, _ = frames[n]
+            i, m, _, _ = entries[position]
+            if i not in loaded_depth:
+                with np.load(depths[i], allow_pickle=False) as a:
+                    loaded_depth[i] = a["depth"]
+            return loaded_depth[i][row] * scales[i], np.asarray(m["intrinsics"]["K"], float)
+
+        for a, b in sorted(pairs):
+            (depth_a, K_a), (depth_b, K_b) = metric(a), metric(b)
+            for (i, j, depth_i, K_i, depth_j, K_j) in ((a, b, depth_a, K_a, depth_b, K_b),
+                                                       (b, a, depth_b, K_b, depth_a, K_a)):
+                value, pixels = cross_view_log_ratio(depth_i, K_i, poses[i], depth_j, K_j, poses[j],
+                                                     stride=cfg.cross_window_stride)
+                if value is None:
+                    continue
+                wi, wj = entries[frames[i][0]][0], entries[frames[j][0]][0]
+                rows["window_i"].append(wi)
+                rows["window_j"].append(wj)
+                rows["frame_i"].append(str(entries[frames[i][0]][1]["frame_ids"][frames[i][2]]))
+                rows["frame_j"].append(str(entries[frames[j][0]][1]["frame_ids"][frames[j][2]]))
+                rows["value"].append(np.log(scales[wi]) - np.log(scales[wj]) - value)
+                rows["pixels"].append(pixels)
+        return _pack_cross(rows)
 
     def _model_intrinsics(self, window, meta):
         """Calibrated K at model resolution: profile > snapshot CameraInfo > VGGT median.
@@ -774,7 +937,7 @@ class G4MapBackend:
         """Per-frame localization poses + one VGGT depth scale per window."""
         cfg = self.frame_pose_config
         ids = [m["window_id"] for m in metadata]
-        cams, priors = {}, {}
+        cams, entries = {}, []
         ref_by_stamp, frames = {}, set()
         for meta in metadata:
             i = meta["window_id"]
@@ -783,11 +946,16 @@ class G4MapBackend:
             if "reference_rotations" not in cam:
                 raise ValueError("cached window lacks reference rotations; use a new output directory")
             cams[i] = cam
+            cross = None
+            if self._measures_rows():
+                if not (self._window_path(i) / "cross.npz").exists():
+                    raise ValueError("cached window lacks cross-window depth; use a new output directory")
+                with np.load(self._window_path(i) / "cross.npz", allow_pickle=False) as a:
+                    cross = {k: a[k] for k in a.files if k != "depth"}
+            entries.append((i, meta, cam, cross))
             valid = cam["reference_valid"]
             if valid.any():
                 frames.add(meta["reference_frame_id"])
-            priors[i] = trajectory_prior(cam["centers"], cam["rotations"], cam["reference_centers"],
-                                         cam["reference_rotations"], valid)
             for k in np.flatnonzero(valid):
                 stamp = int(cam["timestamps_ns"][k])
                 pose = (cam["reference_centers"][k], cam["reference_rotations"][k])
@@ -796,9 +964,21 @@ class G4MapBackend:
                 ref_by_stamp[stamp] = pose
         if len(frames) > 1:
             raise ValueError("localization reference frame changed across windows")
-        edges = [(m["scale_edge"]["i"], m["scale_edge"]["j"], float(m["scale_edge"]["scale"]))
-                 for m in metadata if m.get("scale_edge")]
+        priors, edges = self._scale_problem(entries)
         scales, constrained, scale_diag = solve_window_scales(ids, priors, edges, cfg)
+        frame_scales = None
+        if cfg.frame_scales:
+            scales, frame_scales, frame_rows = self._frame_solve(entries)
+            for i in ids:
+                scale_diag[i]["scale"] = scales.get(i)
+                spread = np.log(frame_scales[i] / scales[i]) if i in scales else np.array([])
+                spread = spread[np.isfinite(spread)]
+                scale_diag[i]["frame_scale_log_deviation_p90"] = (
+                    float(np.percentile(np.abs(spread), 90)) if len(spread) else None)
+        if self._measures_rows():
+            for i, _, _, _ in entries:
+                scale_diag[i]["cross_window_rows"] = int(sum(
+                    np.sum((c["window_i"] == i) | (c["window_j"] == i)) for _, _, _, c in entries))
         stamps = np.array(sorted(ref_by_stamp), np.int64)
         ref_c = np.array([ref_by_stamp[int(t)][0] for t in stamps]).reshape(-1, 3)
         ref_R = np.array([ref_by_stamp[int(t)][1] for t in stamps]).reshape(-1, 3, 3)
@@ -851,6 +1031,11 @@ class G4MapBackend:
                                  prediction_to_map=sim3.compose(T, Sim3.from_dict(meta["prediction_to_local"])).to_dict(),
                                  depth_scale=float(s / meta["gauge"]), intrinsics=meta["intrinsics"]["K"],
                                  intrinsics_source=meta["intrinsics"]["source"], frame_poses=frame_poses)
+                    if frame_scales is not None:
+                        # Same gauge as depth_scale; None for frames without a scale (shared
+                        # prefix owned by the previous window, no pose).
+                        entry["frame_depth_scales"] = [
+                            float(v / meta["gauge"]) if np.isfinite(v) else None for v in frame_scales[i]]
                     sl = slice(meta["shared_prefix"], None)
                     placed = ok[sl]
                     centers.append(c[sl][placed]); rotations.append(R[sl][placed])
@@ -905,7 +1090,8 @@ class G4MapBackend:
             previous = None
             for record in records:
                 path = self._window_path(record["window_index"])
-                meta = self._read_window(record["window_index"]) if path.exists() else self._cache_window(record, previous)
+                meta = (self._read_window(record["window_index"]) if path.exists()
+                        else self._cache_window(record, previous, metadata))
                 if meta["input_binding"] != _binding(record):
                     raise ValueError("committed input changed; use a new output directory")
                 metadata.append(meta)

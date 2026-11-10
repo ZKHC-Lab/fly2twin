@@ -74,15 +74,25 @@ pose_time_offset_ms: 0.0
 pose_time_offset_stage: backend
 # Opt-in reference multiview filtering + adaptive voxel fusion for frame_pose Web.
 frame_pose_fusion: false
+# frame_pose window scales: weight of each cross-window overlapping-frame depth row
+# (0 = trajectory prior + adjacent shared frames only). Needs pose_time_offset_stage
+# capture. 0.3 validated on office_gs_04, see docs/ONBOARD_V1.md.
+g4_cross_window_weight: 0.0
+# frame_pose: one depth scale per frame, solved jointly from frame-pair depth rows inside
+# and across windows (needs capture stage and g4_cross_window_weight 0). See docs/ONBOARD_V1.md.
+g4_frame_scales: false
 # frame_pose only: calibrated pinhole of the source RGB image. Unset uses the
 # snapshot CameraInfo; without either the backend falls back to VGGT's own K,
 # which was clearly worse outdoors.
 # camera_intrinsics: {width: 640, height: 480, fx: 604.195618, fy: 604.016418, cx: 318.986664, cy: 247.538086}
 initial_queue_mode: "lossless_fifo"
-# Pending high-water mark: lossless pauses new captures at this threshold.
-# In-flight captures/retries are retained; latest drops oldest pending inputs
+# Pending high-water mark: lossless pauses new captures at this threshold, and
+# every frame that arrives while paused is lost for the whole delivery. Keep it
+# large so that only min_free_disk_gb limits a flight: when reconstruction is
+# slower than capture (NX ~32 s/window vs a new window every ~14 s) the backlog
+# queues on disk and drains after landing. latest drops oldest pending inputs
 # and rebuilds overlap against the last accepted window before inference.
-initial_queue_capacity: 8
+initial_queue_capacity: 1000
 initial_max_retries: 0
 initial_keep_snapshot_on_success: true
 # 0 = inherit the reconstruct profile value for every window. Set a nonzero

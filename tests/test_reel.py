@@ -121,7 +121,7 @@ def test_card_size(tmp_path,monkeypatch,kind):
     monkeypatch.setattr(cards,'font',lambda *args: ImageFont.load_default())
     options=dict(text='Scene')
     if kind=='label': options=dict(items=[['Scene',100,100,'la']])
-    if kind=='endcard': options=dict(name='Scene',tagline='Mapping',url='example.org')
+    if kind=='endcard': options=dict(name='Scene',tagline='Mapping',url='example.org',footer='Org')
     out=tmp_path/(kind+'.png')
     card(kind,out,**options)
     with Image.open(out) as im:

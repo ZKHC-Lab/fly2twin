@@ -734,6 +734,92 @@ class FramePosePlacementTest(unittest.TestCase):
         self.assertEqual(revision["graph"]["edges"], 1)
         self.assertEqual(revision["published_windows"], [0, 1])
 
+    def test_cross_window_rows_pull_a_too_deep_window_and_are_deterministic(self):
+        import dataclasses
+        from g4_backend import FramePoseConfig
+        from drone3d_reconstruction_core.g4.input_adapter import WindowInput
+        self.add_window(0, 0)
+        self.add_window(1, 30)
+        # 3 m walls (cross rows count 0.3-4 m depths). Window 1's depth is 20 % too deep for its
+        # own trajectory; only the overlap shows it.
+        for index, factor in ((0, .5), (1, .6)):
+            loaded = self.loaded[index]
+            self.loaded[index] = WindowInput(dataclasses.replace(loaded.geometry, depth=loaded.geometry.depth * factor),
+                                             loaded.metadata, loaded.reference_centers, loaded.reference_valid,
+                                             loaded.reference_rotations)
+
+        def scales(output, weight):
+            config = FramePoseConfig(pose_time_offset_stage="capture", cross_window_weight=weight)
+            for loaded in self.loaded.values():
+                loaded.metadata["capture_pose_time_offset_ms"] = 0.0
+            service = G4MapBackend(self.root / "records", SESSION, self.root / output, reader=Reader(self.loaded),
+                                   scanner=lambda root, session: list(self.records), placement="frame_pose",
+                                   frame_pose_config=config)
+            self.services.append(service)
+            windows = self.revision(service.update())["windows"]
+            return [w["depth_scale"] for w in windows], windows
+
+        plain, _ = scales("plain", 0.0)
+        self.assertFalse((self.root / "plain" / "windows" / "window-000001" / "cross.npz").exists())
+        crossed, windows = scales("cross", 1.0)
+        again, _ = scales("cross_again", 1.0)
+        self.assertEqual(crossed, again)
+        self.assertLess(crossed[1], plain[1] * 0.97)
+        self.assertGreater(crossed[0], plain[0])
+        self.assertGreater(windows[1]["scale_diagnostics"]["cross_window_rows"], 0)
+        with np.load(self.root / "cross" / "windows" / "window-000001" / "cross.npz") as rows:
+            self.assertTrue(set(rows["window_i"]) | set(rows["window_j"]) <= {0, 1})
+            self.assertTrue(np.all(rows["window_i"] != rows["window_j"]))
+        with np.load(self.root / "cross" / "windows" / "window-000000" / "cross.npz") as rows:
+            self.assertEqual(len(rows["value"]), 0)  # the first window has nothing before it
+
+    def test_frame_scales_follow_rows_inside_and_across_windows(self):
+        import dataclasses
+        from g4_backend import FramePoseConfig
+        from drone3d_reconstruction_core.g4.input_adapter import WindowInput
+        self.add_window(0, 0)
+        self.add_window(1, 25, shared=5)
+        # 1.5 m walls. The second half of window 1 is 15 % too deep: a shape error a window
+        # scale cannot fix, visible to rows against its own first half and window 0.
+        factors = {0: np.full(30, .5), 1: np.r_[np.full(15, .5), np.full(15, .575)]}
+        for index, factor in factors.items():
+            loaded = self.loaded[index]
+            depth = loaded.geometry.depth * factor[:, None, None]
+            self.loaded[index] = WindowInput(dataclasses.replace(loaded.geometry, depth=depth),
+                                             dict(loaded.metadata, capture_pose_time_offset_ms=0.0),
+                                             loaded.reference_centers, loaded.reference_valid,
+                                             loaded.reference_rotations)
+
+        def solve(output):
+            config = FramePoseConfig(pose_time_offset_stage="capture", frame_scales=True)
+            service = G4MapBackend(self.root / "records", SESSION, self.root / output, reader=Reader(self.loaded),
+                                   scanner=lambda root, session: list(self.records), placement="frame_pose",
+                                   frame_pose_config=config)
+            self.services.append(service)
+            return self.revision(service.update())["windows"]
+
+        windows = solve("frames")
+        self.assertEqual(windows, solve("frames_again"))
+        w0, w1 = windows
+        self.assertEqual(len(w1["frame_depth_scales"]), 30)
+        self.assertTrue(all(v is None for v in w1["frame_depth_scales"][:5]))  # owned by window 0
+        self.assertTrue(all(v is not None for v in w0["frame_depth_scales"]))
+        late, early = np.mean(w1["frame_depth_scales"][-5:]), np.mean(w1["frame_depth_scales"][5:10])
+        self.assertLess(late / early, 0.95)  # the too-deep half gets a smaller scale
+        with np.load(self.root / "frames" / "windows" / "window-000001" / "cross.npz") as rows:
+            same = rows["window_i"] == rows["window_j"]
+            self.assertTrue(same.any() and (~same).any())
+
+    def test_frame_scales_replace_weighted_cross_rows(self):
+        from g4_backend import FramePoseConfig
+        with self.assertRaises(ValueError):
+            FramePoseConfig(pose_time_offset_stage="capture", frame_scales=True, cross_window_weight=.3)
+
+    def test_cross_window_rows_need_capture_stage_poses(self):
+        from g4_backend import FramePoseConfig
+        with self.assertRaises(ValueError):
+            FramePoseConfig(cross_window_weight=.3)
+
     def test_window_without_scale_constraint_stays_pending_with_local_gauge(self):
         self.add_window(0, 0)
         self.add_window(1, 40, valid_reference=False)

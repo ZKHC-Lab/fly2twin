@@ -551,8 +551,9 @@ def _aligned_transform(record):
 def _frame_placement(alignment, merge_indices, frame_count):
     """Validated per-frame localization placement of one G4 ``frame_pose`` window.
 
-    Returns (depth_scale, K, centers[F,3], rotations[F,3,3], has_pose[F]) for the
-    displayed (merged) frames, in the same order as the sliced prediction arrays.
+    Returns (depth_scales[F], K, centers[F,3], rotations[F,3,3], has_pose[F]) for the
+    displayed (merged) frames, in the same order as the sliced prediction arrays. A
+    frame's scale is its per-frame G4 scale when the revision has one, else the window's.
     """
     import numpy as np
 
@@ -567,6 +568,17 @@ def _frame_placement(alignment, merge_indices, frame_count):
     if not math.isfinite(scale) or scale <= 0 or not np.isfinite(K).all() or K[0, 0] <= 0 or K[1, 1] <= 0:
         raise WebDashboardError("frame_pose depth_scale/intrinsics are invalid")
     order = merge_indices if merge_indices is not None else list(range(frame_count))
+    per_frame = alignment.get("frame_depth_scales")
+    if per_frame is not None and (not isinstance(per_frame, list) or len(per_frame) != frame_count):
+        raise WebDashboardError("frame_depth_scales must list every model frame")
+    scales = np.full(len(order), scale)
+    if per_frame is not None:
+        for k, index in enumerate(order):
+            if per_frame[index] is not None:
+                value = float(per_frame[index])
+                if not math.isfinite(value) or value <= 0:
+                    raise WebDashboardError("frame_depth_scales entry is invalid")
+                scales[k] = value
     centers = np.full((len(order), 3), np.nan)
     rotations = np.full((len(order), 3, 3), np.nan)
     has_pose = np.zeros(len(order), dtype=bool)
@@ -582,17 +594,17 @@ def _frame_placement(alignment, merge_indices, frame_count):
         if not np.isfinite(rotation).all() or not np.isfinite(center).all():
             raise WebDashboardError("frame_poses entry is not finite")
         centers[k], rotations[k], has_pose[k] = center, rotation, True
-    return scale, K, centers, rotations, has_pose
+    return scales, K, centers, rotations, has_pose
 
 
 def _frame_pose_points(placement, depth, flat_indices):
     """Back-project sampled pixels with calibrated K and each frame's own pose."""
     import numpy as np
 
-    scale, K, centers, rotations, has_pose = placement
+    scales, K, centers, rotations, has_pose = placement
     frames, pixels = np.divmod(flat_indices, depth.shape[1] * depth.shape[2])
     v, u = np.divmod(pixels, depth.shape[2])
-    d = depth.reshape(-1)[flat_indices].astype(np.float64) * scale
+    d = depth.reshape(-1)[flat_indices].astype(np.float64) * scales[frames]
     rays = np.stack(((u - K[0, 2]) / K[0, 0], (v - K[1, 2]) / K[1, 1], np.ones_like(d)), axis=1) * d[:, None]
     points = np.einsum("nij,nj->ni", np.nan_to_num(rotations[frames]), rays) + np.nan_to_num(centers[frames])
     points[~has_pose[frames]] = np.nan
@@ -698,6 +710,8 @@ class WebDashboardCore:
         self._pc_build_lock = threading.Lock()
         self._pc_cache: dict[tuple, dict] = {}
         self._pc_order: list[tuple] = []
+        # session id -> drone3d_onboard.session.SessionFusion (re-fuses only frames whose inputs changed)
+        self._session_fusion: dict[str, Any] = {}
 
     # ------------------------------------------------------------------
     # 状态机
@@ -1425,11 +1439,14 @@ class WebDashboardCore:
                 pass  # Old sessions keep their original display algorithm.
         if (fusion_opt_in and aligned and selected_records
                 and all(_record_alignment(r).get("placement") == "frame_pose" for r in selected_records)):
-            from drone3d_onboard.session import fuse_session
+            from drone3d_onboard.session import SessionFusion
             from .g4.backend_process import output_root
-            xyz, rgb, fusion, _, _ = fuse_session(selected_records,
-                output_root(self._config.formal_records_root, session_id) / "fusion_cache", max_points,
-                require_complete=False)
+            fuser = self._session_fusion.get(session_id)
+            if fuser is None:
+                fuser = SessionFusion(output_root(self._config.formal_records_root, session_id)
+                                      / "fusion_cache" / "incremental")
+                self._session_fusion = {session_id: fuser}  # keep only the session being viewed
+            xyz, rgb, fusion = fuser.fuse(selected_records, max_points)
             result = dict(session_id=session_id, map_id=map_id, aligned=True,
                 coordinate_state=_record_coordinate_state(selected_records[-1]), reason=reason,
                 original_points=fusion['points_2cm'], displayed_points=len(xyz), equivalent_stride=1,
@@ -2286,7 +2303,7 @@ button:disabled{opacity:.45;cursor:default}
       </select>
       <button id="btn-start" class="primary command-control" title="在 IDLE/STOPPED 时开始新重建">开始新重建</button>
       <button id="btn-pause-resume" class="command-control" title="运行中暂停；暂停后恢复">暂停/恢复</button>
-      <button id="btn-stop" class="danger command-control" title="丢弃未完成内容并停止全部重建">停止全部</button>
+      <button id="btn-stop" class="danger command-control" title="停止采集；已采集的窗口继续重建完再结束">停止</button>
     </div>
     <form id="params-form" novalidate>
       <div class="muted" style="margin-bottom:4px">当前值自动填入；留空或选“不变”表示不修改该项。</div>
@@ -2440,7 +2457,7 @@ function drawPointCloud(){if(!gl||!glProgram||rendererState!=="ready")return;var
 function matPerspective(fov,aspect,near,far){var f=1/Math.tan(fov/2),nf=1/(near-far); return [f/aspect,0,0,0, 0,f,0,0, 0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0]}
 function matLookAt(eye,center,up){var z=[eye[0]-center[0],eye[1]-center[1],eye[2]-center[2]]; var l=Math.hypot(z[0],z[1],z[2])||1; z=[z[0]/l,z[1]/l,z[2]/l]; var x=[up[1]*z[2]-up[2]*z[1],up[2]*z[0]-up[0]*z[2],up[0]*z[1]-up[1]*z[0]]; l=Math.hypot(x[0],x[1],x[2])||1; x=[x[0]/l,x[1]/l,x[2]/l]; var y=[z[1]*x[2]-z[2]*x[1],z[2]*x[0]-z[0]*x[2],z[0]*x[1]-z[1]*x[0]]; return [x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0, -(x[0]*eye[0]+x[1]*eye[1]+x[2]*eye[2]), -(y[0]*eye[0]+y[1]*eye[1]+y[2]*eye[2]), -(z[0]*eye[0]+z[1]*eye[1]+z[2]*eye[2]), 1]}
 function bindViewer(){var c=$("pointcloud-canvas"),drag=false,lx=0,ly=0;c.addEventListener("webglcontextlost",function(e){e.preventDefault();rendererState="lost";gl=null;glProgram=null;$("pc-badge").textContent="WebGL context 已丢失，等待自动恢复…"});c.addEventListener("webglcontextrestored",function(){try{initGL();uploadPointCloud();updateAxisBuffers();drawPointCloud()}catch(e){rendererState="error";$("pc-badge").textContent="WebGL 恢复失败: "+e.message}});c.addEventListener("mousedown",function(e){drag=true;lx=e.clientX;ly=e.clientY});window.addEventListener("mouseup",function(){drag=false});window.addEventListener("mousemove",function(e){if(!drag)return;orbit.yaw+=(e.clientX-lx)*0.01;orbit.pitch=Math.max(-1.4,Math.min(1.4,orbit.pitch+(e.clientY-ly)*0.01));lx=e.clientX;ly=e.clientY;drawPointCloud()});c.addEventListener("wheel",function(e){e.preventDefault();orbit.dist=Math.max(0.01,orbit.dist*Math.exp(e.deltaY*0.001));drawPointCloud()},{passive:false});window.addEventListener("resize",drawPointCloud);$("btn-fit").onclick=fitPointCloud;$("btn-reset").onclick=resetView;$("point-size").oninput=drawPointCloud}
-function refreshControls(st){var s=(st&&st.state)||""; var startable=(s==="IDLE"||s==="STOPPED"); var pausable=(s==="RUNNING"||s==="DISK_PAUSED"); var retryable=(s==="MEMORY_PAUSED"); var resumable=(s==="PAUSED"||retryable); var stoppable=(s==="RUNNING"||s==="PAUSED"||s==="DISK_PAUSED"||s==="FATAL_OOM"||s==="MEMORY_PAUSED"||s==="ALIGNMENT_PAUSED");var roleSel=$("start-role"),roleOk=!(roleSel.selectedOptions&&roleSel.selectedOptions[0]&&roleSel.selectedOptions[0].disabled);
+function refreshControls(st){var s=(st&&st.state)||""; var startable=(s==="IDLE"||s==="STOPPED"); var pausable=(s==="RUNNING"||s==="DISK_PAUSED"); var retryable=(s==="MEMORY_PAUSED"); var resumable=(s==="PAUSED"||retryable); var stoppable=(s==="RUNNING"||s==="PAUSED"||s==="DISK_PAUSED"||s==="FATAL_OOM"||s==="MEMORY_PAUSED"||s==="ALIGNMENT_PAUSED"||s==="DRAINING");var roleSel=$("start-role"),roleOk=!(roleSel.selectedOptions&&roleSel.selectedOptions[0]&&roleSel.selectedOptions[0].disabled);
  var modeSel=$("start-mode"),effectiveMode=(st&&st.reconstruction_mode)||((st&&st.effective&&st.effective.reconstruction_mode)||"");if((effectiveMode==="per_window"||effectiveMode==="frame_pool")&&(!startable||!modeDirty))modeSel.value=effectiveMode;if(!startable)modeDirty=false;modeSel.disabled=commandInFlight||!startable;var overlap=$("p-overlap-frames"),uiMode=startable?modeSel.value:effectiveMode;overlap.disabled=commandInFlight||uiMode==="frame_pool";if(uiMode==="frame_pool")overlap.value=0;
  $("btn-start").disabled=commandInFlight||!startable||!roleOk;
  $("btn-pause-resume").disabled=commandInFlight||!(pausable||resumable);
@@ -2450,7 +2467,8 @@ function refreshControls(st){var s=(st&&st.state)||""; var startable=(s==="IDLE"
  var frozenA=st&&(st.alignment_backend==="shared_point_sim3_A"||st.alignment_backend==="global_g4")&&uiMode!=="frame_pool";
  document.querySelectorAll("#params-form input, #params-form select, #params-form button").forEach(function(element){element.disabled=commandInFlight||frozenA||(element.id==="p-overlap-frames"&&uiMode==="frame_pool")});
  $("params-form").title=frozenA?"A 配置参数固定。新增100张，共享20张，首窗共享0张。":"";
- $("btn-stop").title=frozenA?"停止独立会话。配准故障现场保留。":"停止全部重建";
+ $("btn-stop").textContent=s==="DRAINING"?"立即停止":"停止";
+ $("btn-stop").title=s==="DRAINING"?"丢弃还没重建的窗口并立即停止":(frozenA?"停止采集；已采集的窗口继续重建完再结束。配准故障现场保留。":"停止采集；已采集的窗口继续重建完再结束");
 }
 function setCommandsDisabled(value){["#btn-pause-resume",".command-control"].forEach(function(selector){document.querySelectorAll(selector).forEach(function(button){button.disabled=value})});$("start-mode").disabled=value}
 function postCommand(cmd,args,timeoutMs){if(commandInFlight)return Promise.resolve({ok:false,error:"已有命令执行中"});commandInFlight=true;setCommandsDisabled(true);$("command-msg").textContent="执行中: "+cmd;var commandTimeout=timeoutMs||{"start_session":30000,"stop_all":30000,"select_source":15000,"pause":15000,"resume":15000,"set_params":15000}[cmd]||15000;return fetchWithTimeout("api/command",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(Object.assign({command:cmd},args||{}))},commandTimeout).then(function(response){return response.json().catch(function(){throw new Error("HTTP "+response.status+" 且响应不是 JSON")}).then(function(payload){if(!response.ok||!payload.ok)throw new Error(payload.error||("HTTP "+response.status));return payload})}).then(function(result){$("command-msg").textContent="OK: "+cmd+" · "+JSON.stringify(result.response||{});refreshState();return result}).catch(function(error){$("command-msg").textContent="ERR: "+cmd+" · "+error.message;return {ok:false,error:error.message}}).finally(function(){commandInFlight=false;setCommandsDisabled(false);refreshControls(state.status)})}
@@ -2463,7 +2481,7 @@ function wire(){var canvas=$("pointcloud-canvas");bindViewer();try{initGL()}catc
  $("session-select").addEventListener("change",function(){if(!this.value)return;viewFollowLatest=false;$("follow-latest").checked=false;storageSet("drone3d.follow_live","0");viewSession=this.value;viewMap="";mapDirty=false;storageSet("drone3d.view_session",viewSession);state.formal_records=[];recordsKey="";window.__pcKey="";window.__omegaKey="";clearPointCloud();clearOmega();refreshRecords(viewSession+"|manual")});
  $("btn-start").onclick=function(){var role=$("start-role").value;var mode=$("start-mode").value; if(!role){$("command-msg").textContent="ERR: start_session · 未选择相机角色";return} if(!mode){$("command-msg").textContent="ERR: start_session · 未选择重建模式";return} postCommand("start_session",{role:role,reconstruction_mode:mode})};
  $("btn-pause-resume").onclick=function(){var s=(state.status&&state.status.state)||""; postCommand((s==="PAUSED"||s==="MEMORY_PAUSED")?"resume":"pause",{})};
- $("btn-stop").onclick=function(){if(window.confirm("停止全部：这会丢弃未采集完、重建完的内容并停止所有重建进程，确定吗？"))postCommand("stop_all",{})};
+ $("btn-stop").onclick=function(){var st=state.status||{},n=(st.pending_windows||0)+(runningActive(st)?1:0);var text=st.state==="DRAINING"?"立即停止：还没重建的 "+n+" 个窗口将被丢弃，确定吗？":"停止采集：正在采的窗口丢弃，已采集的窗口继续重建完再结束会话。确定吗？";if(window.confirm(text))postCommand("stop_all",{})};
  $("params-form").querySelectorAll("input,select").forEach(function(el){el.addEventListener("input",function(){paramsDirty=true})});
  $("params-form").addEventListener("submit",function(e){e.preventDefault();try{var args=buildSetParams();if(Object.keys(args).length)postCommand("set_params",args).then(function(result){if(result.ok)paramsDirty=false});else $("command-msg").textContent="未填写任何重建参数"}catch(error){$("command-msg").textContent="ERR: set_params · "+error.message}});
  $("p-preview-fps").addEventListener("input",function(){previewDirty=true});

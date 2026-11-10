@@ -88,9 +88,90 @@ class OnboardTests(unittest.TestCase):
                     patch('drone3d_reconstruction_core.g4.input_adapter.local_path', return_value=root/'manifest.json'), \
                     patch('drone3d_reconstruction_core.snapshot_validator.validate_snapshot', return_value=snapshot):
                 rows, windows, depth, _ = load_session([record], root/'cache')
+                record['alignment']['frame_depth_scales'] = [None, 3.]
+                _, _, per_frame, _ = load_session([record], root/'cache_frames')
             self.assertEqual([r['frame_id'] for r in rows], ['f1'])
             self.assertEqual(windows[0]['unposed'], ['f0'])
             np.testing.assert_array_equal(depth[0], 2.)
+            np.testing.assert_array_equal(per_frame[0], 3.)  # a per-frame G4 scale wins over the window scale
+
+    def test_incremental_fusion_matches_fresh_build_and_full_fusion(self):
+        import cv2
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from scipy.spatial import cKDTree
+        from drone3d_onboard.session import SessionFusion, fuse_session
+        rng = np.random.default_rng(3)
+        H, W, per = 18, 24, 6
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            metas, snapshots, records = {}, {}, []
+            for w in range(4):
+                ids = ['w%df%d' % (w, i) for i in range(per)]
+                # Fronto-parallel wall 1.6 m ahead of cameras that only translate: consistent views.
+                depth = 1.6 / (1. + .1 * w) * (1 + .002 * rng.random((per, H, W, 1)))
+                pred = root / ('pred%d.npz' % w)
+                np.savez(pred, depth=depth.astype(np.float32), depth_conf=rng.random((per, H, W)))
+                paths = []
+                for i in range(per):
+                    paths.append(root / ('w%di%d.png' % (w, i)))
+                    cv2.imwrite(str(paths[-1]), rng.integers(0, 255, (36, 48, 3), dtype=np.uint8))
+                metas[w] = dict(model_image_size=[W, H], frame_ids=ids, timestamps_ns=list(range(per)),
+                                prediction_uri=str(pred))
+                snapshots[w] = SimpleNamespace(image_paths=paths, camera_info_payloads=[{}] * per)
+                poses = [dict(rotation=np.eye(3).tolist(), center=[.5 * (w * per + i), 0., 0.]) for i in range(per)]
+                poses[1] = None if w == 2 else poses[1]
+                records.append(dict(window_index=w, snapshot_manifest_uri='file:///w%d' % w,
+                                    snapshot_manifest_sha256=str(w), result_manifest_sha256='%064d' % w,
+                                    alignment=dict(placement='frame_pose', quality_passed=True,
+                                                   merge_frame_indices=list(range(1 if w else 0, per)),
+                                                   frame_poses=poses, depth_scale=1. + .1 * w,
+                                                   intrinsics=[[20., 0, 12], [0, 20., 9], [0, 0, 1]])))
+
+            def rescale(record, scale):
+                return dict(record, alignment=dict(record['alignment'], depth_scale=scale))
+
+            steps = [records[:2], records[:3], [records[0], rescale(records[1], 1.05), records[2]], records,
+                     records[:3] + [dict(records[3], alignment=dict(records[3]['alignment'], frame_poses=[
+                         dict(p, center=[p['center'][0] + .01, 0., 0.]) if p else p
+                         for p in records[3]['alignment']['frame_poses']]))]]
+            fusion = SessionFusion(root / 'incremental', scale_tolerance=0)
+            tolerant = SessionFusion(root / 'tolerant')
+            counts = []
+            with patch('drone3d_reconstruction_core.g4.input_adapter.WindowInputReader.load',
+                       side_effect=lambda r: SimpleNamespace(metadata=metas[r['window_index']])), \
+                    patch('drone3d_reconstruction_core.g4.input_adapter.local_path',
+                          side_effect=lambda uri: root / uri[-2:]), \
+                    patch('drone3d_reconstruction_core.snapshot_validator.validate_snapshot',
+                          side_effect=lambda path, *args: snapshots[int(Path(path).name[1:])]):
+                for step, selected in enumerate(steps):
+                    before = fusion.recomputed
+                    xyz, rgb, info = fusion.fuse(selected, max_points=0)
+                    counts.append(fusion.recomputed - before)
+                    # Running sums after updates equal a fresh build up to summation order.
+                    fresh = SessionFusion(root / ('fresh%d' % step), scale_tolerance=0)
+                    f_xyz, f_rgb, f_info = fresh.fuse(selected, max_points=0)
+                    self.assertEqual(info, f_info)
+                    np.testing.assert_allclose(xyz, f_xyz, rtol=0, atol=1e-12)
+                    np.testing.assert_allclose(rgb, f_rgb, rtol=0, atol=1e-12)
+                    # Same points as the delivery fusion; only the 2 cm grid is anchored elsewhere.
+                    ref_xyz, _, ref_info, _, _ = fuse_session(selected, root / ('full%d' % step), 0, False)
+                    self.assertGreater(ref_info['points_2cm'], 50)
+                    self.assertLess(abs(info['points_2cm'] - ref_info['points_2cm']), .2 * ref_info['points_2cm'])
+                    self.assertLess(cKDTree(ref_xyz).query(xyz)[0].max(), .02 * 3 ** .5)
+                    self.assertLess(cKDTree(xyz).query(ref_xyz)[0].max(), .02 * 3 ** .5)
+                # Default tolerance 0.5 %: a 0.2 % rescale reuses every frame, 1 % does not.
+                tolerant.fuse(records[:3])
+                for scale, expect_reuse in ((1.1 * 1.002, True), (1.1 * 1.01, False)):
+                    before = tolerant.recomputed
+                    tolerant.fuse([records[0], rescale(records[1], scale), records[2]])
+                    self.assertEqual(tolerant.recomputed == before, expect_reuse, scale)
+            # Rows per step: 11, 15, 15, 20, 20. Only new, rescaled or moved frames and their
+            # neighbours (within 1.5 m, 3 frames either side here) are recomputed.
+            self.assertEqual(counts[0], 11)
+            self.assertTrue(4 <= counts[1] < 15, counts)
+            self.assertTrue(5 <= counts[2] < 15, counts)
+            self.assertTrue(5 <= counts[4] < 20, counts)
 
     def test_ba_no_ros_import(self):
         import sys

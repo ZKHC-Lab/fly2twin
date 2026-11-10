@@ -1386,6 +1386,7 @@ class CaptureSession:
         monotonic: Any = time.monotonic,
         feedback_callback: Any = None,
         source_state_callback: Any = None,
+        defer_seal: bool = False,
     ) -> None:
         """构造采集会话。
 
@@ -1400,6 +1401,9 @@ class CaptureSession:
             source_state_callback: source watchdog 状态迁移回调
                 （stage: "SOURCE_STALE"/"SOURCE_RECOVERED"，
                  stamp: 最近通过契约的图像 stamp；异常被忽略）
+            defer_seal: 帧收齐时只置 done 和 final_stamp_ns，封存（fsync、清单）
+                留给调用方在传感器回调线程之外调用 finalize()。封存在磁盘繁忙时
+                可能耗时数秒，放在回调里会让图像/里程计队列溢出丢帧。
         """
         self.config = config
         self.goal = goal
@@ -1428,6 +1432,11 @@ class CaptureSession:
         self.deadline = monotonic() + goal.max_duration_sec
         self.done = threading.Event()
         self.sealed: SealedSnapshot | None = None
+        self._defer_seal = defer_seal
+        self.frames_complete = False
+        # Stamp (ns) of the last written frame once frames are complete; later
+        # images belong to the next window.
+        self.final_stamp_ns: int | None = None
         self.error: CaptureError | None = None
         self.received_images = 0
         self.skipped_images = 0
@@ -1808,8 +1817,15 @@ class CaptureSession:
 
 
     def _finish_success_locked(self) -> None:
-        """成功封存：seal 失败则转为失败状态。"""
+        """成功收齐：立即封存，或（defer_seal）只标记完成、由 finalize() 封存。"""
         if self._pending_frames:
+            return
+        if self.writer.frame_count:
+            last = self.writer._frames[-1].stamp
+            self.final_stamp_ns = last.sec * 10**9 + last.nsec
+        if self._defer_seal:
+            self.frames_complete = True
+            self.done.set()
             return
         try:
             self.sealed = self.writer.seal()
@@ -1817,6 +1833,19 @@ class CaptureSession:
             self.fail_locked(_capture_exception(error))
             return
         self.done.set()
+
+    def finalize(self) -> None:
+        """封存 defer_seal 会话；在传感器回调线程之外调用，且只调用一次。
+
+        done 已在锁内置位，所有回调入口拿到锁后都会直接返回，writer 不再变化，
+        因此这里不持会话锁：封存期间回调和诊断快照都不会被阻塞。
+        """
+        if not self.frames_complete or self.sealed is not None or self.error is not None:
+            return
+        try:
+            self.sealed = self.writer.seal()
+        except BaseException as error:
+            self.error = _capture_exception(error)
 
     def fail(self, error: CaptureError) -> None:
         """从外部线程注入失败（幂等）。"""

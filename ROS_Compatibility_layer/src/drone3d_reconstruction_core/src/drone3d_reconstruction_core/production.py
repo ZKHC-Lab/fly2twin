@@ -340,8 +340,24 @@ def _canonical_existing_directory(value: str, label: str) -> str:
     return str(canonical)
 
 
+_VERIFIED_CHECKPOINTS: set = set()
+
+
 def _verify_checkpoint_digest(checkpoint_path: str, expected: str) -> None:
-    """流式计算 checkpoint 的 SHA-256 并与期望值比对。"""
+    """流式计算 checkpoint 的 SHA-256 并与期望值比对。
+
+    每个目标的分辨率/超时覆盖都会 replace() 出新配置并重跑这里；同一文件
+    （设备、inode、大小、修改时间不变）只哈希一次。NX 上每次重算 4.5 GB
+    约 5 s，还会挤占页缓存。
+    """
+    try:
+        status = os.stat(checkpoint_path)
+        identity = (checkpoint_path, status.st_dev, status.st_ino, status.st_size,
+                    status.st_mtime_ns, expected)
+    except OSError:
+        identity = None
+    if identity is not None and identity in _VERIFIED_CHECKPOINTS:
+        return
     digest = hashlib.sha256()
     try:
         with open(checkpoint_path, "rb") as stream:
@@ -357,6 +373,8 @@ def _verify_checkpoint_digest(checkpoint_path: str, expected: str) -> None:
         raise ProductionConfigError(
             f"checkpoint digest mismatch: expected {expected}, got {actual}"
         )
+    if identity is not None:
+        _VERIFIED_CHECKPOINTS.add(identity)
 
 
 def _preflight_resource_limits(limits: ResourceLimits) -> None:
@@ -487,6 +505,8 @@ class ProductionPlanner:
                     INVALID_GOAL,
                     f"per-goal runtime override invalid: {error}",
                 ) from error
+        timings = {}
+        step = time.monotonic()
         try:
             snapshot = validate_snapshot(
                 goal.snapshot_uri,
@@ -505,6 +525,8 @@ class ProductionPlanner:
         except (AttributeError, TypeError):
             raise PreparationError(INVALID_GOAL, "goal is missing snapshot fields")
 
+        timings["validate_snapshot"] = time.monotonic() - step
+        step = time.monotonic()
         try:
             self._enforce_resources(
                 config.resource_limits,
@@ -523,6 +545,8 @@ class ProductionPlanner:
                 f"resource admission probe failed: {type(error).__name__}",
             )
 
+        timings["resource_gate"] = time.monotonic() - step
+        step = time.monotonic()
         # 确定性选帧：帧数超限时均匀抽帧到 frame_group_size
         selected = _select_snapshot_frames(snapshot, config.frame_group_size)
         from .backend_spec import validate_independent_request
@@ -563,6 +587,7 @@ class ProductionPlanner:
                 warm_command=warm_command,
                 warm_job=warm_job,
                 preserve_uncommitted_staging=config.preserve_failed_worker_staging,
+                timings={**timings, "transaction": time.monotonic() - step},
             )
         except BaseException:
             # 构造失败必须回滚已分配的事务暂存目录

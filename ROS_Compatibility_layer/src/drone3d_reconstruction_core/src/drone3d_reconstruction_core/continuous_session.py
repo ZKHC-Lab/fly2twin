@@ -77,6 +77,10 @@ SESSION_MEMORY_PAUSED = "MEMORY_PAUSED"
 SESSION_ALIGNMENT_PAUSED = "ALIGNMENT_PAUSED"
 SESSION_STOPPING = "STOPPING"
 SESSION_STOPPED = "STOPPED"
+# STOP with queued windows: capture has stopped, the queue is still being reconstructed.
+SESSION_DRAINING = "DRAINING"
+# After the queue drains, how long STOP waits for G4 to publish the complete map.
+_DRAIN_G4_WAIT_SEC = 600.0
 
 # CUDA OOM 的稳定文本模式（大小写不敏感；worker/run.log/result 消息共用）
 _FATAL_OOM_PATTERN = re.compile(
@@ -183,6 +187,10 @@ class ContinuousConfig:
     pose_time_offset_ms: float = 0.0
     pose_time_offset_stage: str = "backend"
     frame_pose_fusion: bool = False
+    # frame_pose 窗口尺度：跨窗口重叠帧深度比的每行权重；0 = 只用轨迹先验与相邻共享帧。
+    g4_cross_window_weight: float = 0.0
+    # frame_pose：每帧一个深度尺度（窗内与跨窗口帧对联合求解）；与 g4_cross_window_weight 二选一。
+    g4_frame_scales: bool = False
     # 源图像分辨率下的标定内参 {width, height, fx, fy, cx, cy}；为空时用快照 CameraInfo。
     camera_intrinsics: dict | None = None
     retention_max_sessions: int = 3
@@ -383,6 +391,29 @@ class ContinuousConfig:
             or abs(self.pose_time_offset_ms) > 1000
         ):
             raise ContinuousConfigError("pose_time_offset_ms must be finite and within +-1000")
+        if (
+            isinstance(self.g4_cross_window_weight, bool)
+            or not isinstance(self.g4_cross_window_weight, (int, float))
+            or not math.isfinite(self.g4_cross_window_weight)
+            or self.g4_cross_window_weight < 0
+        ):
+            raise ContinuousConfigError("g4_cross_window_weight must be finite and nonnegative")
+        if self.g4_cross_window_weight > 0 and (
+            self.g4_placement != "frame_pose" or self.pose_time_offset_stage != "capture"
+        ):
+            raise ContinuousConfigError(
+                "g4_cross_window_weight needs g4_placement=frame_pose and pose_time_offset_stage=capture"
+            )
+        if type(self.g4_frame_scales) is not bool:
+            raise ContinuousConfigError("g4_frame_scales must be a bool")
+        if self.g4_frame_scales and (
+            self.g4_placement != "frame_pose" or self.pose_time_offset_stage != "capture"
+            or self.g4_cross_window_weight > 0
+        ):
+            raise ContinuousConfigError(
+                "g4_frame_scales needs g4_placement=frame_pose, pose_time_offset_stage=capture "
+                "and g4_cross_window_weight=0"
+            )
         if self.camera_intrinsics is not None:
             keys = {"width", "height", "fx", "fy", "cx", "cy"}
             intrinsics = self.camera_intrinsics
@@ -883,6 +914,7 @@ class ContinuousSession:
         self._backend_cleanup_failure = ""
         self._stop_audit: dict[str, Any] | None = None
         self._stopping = False
+        self._capture_stopped = False  # STOP latched for capture only (DRAINING)
         self._capture_thread: threading.Thread | None = None
         self._consume_thread: threading.Thread | None = None
         self._wake_capture = threading.Event()
@@ -921,6 +953,7 @@ class ContinuousSession:
                 SESSION_MEMORY_PAUSED,
                 SESSION_ALIGNMENT_PAUSED,
                 SESSION_STOPPING,
+                SESSION_DRAINING,
             ):
                 return 3, "cannot change source while a session is active"
             self._selected_role = role
@@ -999,6 +1032,7 @@ class ContinuousSession:
             self._dropped = 0
             self._last_error = ""
             self._stopping = False
+            self._capture_stopped = False
             self._active_job_cancel_requested = False
             self._backend_cleanup_failure = ""
             self._stop_audit = None
@@ -1417,10 +1451,13 @@ class ContinuousSession:
         self._memory_failed_window = None
         self._fatal_oom = False
         self._oom_latched = False
-        restart_capture = not self._plan_exhausted
-        self._state = (
-            SESSION_DISK_PAUSED if self._disk_low_locked() else SESSION_RUNNING
-        )
+        restart_capture = not self._plan_exhausted and not self._capture_stopped
+        if self._capture_stopped:
+            self._state = SESSION_DRAINING
+        else:
+            self._state = (
+                SESSION_DISK_PAUSED if self._disk_low_locked() else SESSION_RUNNING
+            )
         self._last_error = ""
         self._start_worker_threads_locked(restart_capture=restart_capture)
         self._wake_capture.set()
@@ -1485,7 +1522,105 @@ class ContinuousSession:
             )
         return None
 
-    def stop_all(self) -> tuple[int, str]:
+    def stop_all(self, discard_queue: bool = False) -> tuple[int, str]:
+        """STOP. With windows queued or reconstructing (per_window), the first STOP
+        only stops capture and the session reconstructs the queue before it stops
+        (DRAINING); the NX reconstructs several times slower than it captures, so
+        deleting the queue would lose most of a flight. STOP again while DRAINING,
+        STOP with nothing queued, or ``discard_queue`` stops at once and discards
+        unfinished windows.
+        """
+        drain = None if discard_queue else self._begin_drain()
+        if drain is not None:
+            return drain
+        return self._stop_now()
+
+    def _begin_drain(self) -> tuple[int, str] | None:
+        with self._lock:
+            if (
+                self._stopping
+                or self._capture_stopped
+                or self._fatal_oom
+                or self._alignment_fault
+                or self._reconstruction_mode != RECONSTRUCTION_MODE_PER_WINDOW
+                or self._state not in (SESSION_RUNNING, SESSION_PAUSED, SESSION_DISK_PAUSED)
+                or not (self._fifo or self._running_window is not None or self._active_job_id is not None)
+            ):
+                return None
+            self._capture_stopped = True
+            self._state = SESSION_DRAINING
+            client = self._capture_client
+            session_id = self._session_id
+            remaining = len(self._fifo) + int(self._running_window is not None)
+            self._write_journal({
+                "event": "session_drain_start",
+                "session_id": session_id,
+                "pending_before": len(self._fifo),
+                "running_window_before": (
+                    self._running_window.window_index if self._running_window is not None else None
+                ),
+            })
+            self._wake_capture.set()
+            self._wake_consume.set()
+        if client is not None:
+            try:
+                client.cancel_goal()  # the unfinished window is discarded
+            except BaseException:
+                pass
+        threading.Thread(
+            target=self._drain_then_stop, args=(session_id,), name="drain", daemon=True
+        ).start()
+        return 0, (
+            f"capture stopped; reconstructing {remaining} remaining window(s) before "
+            "the session stops (STOP again to discard them and stop now)"
+        )
+
+    def _drain_then_stop(self, session_id: str) -> None:
+        """Stop the session once the queue is empty. A memory-guard pause keeps waiting
+        for the operator (RESUME retries, STOP discards); a hard STOP ends the watch."""
+        while True:
+            with self._lock:
+                if self._session_id != session_id or self._stopping or not self._capture_stopped:
+                    return
+                if (
+                    not self._fifo
+                    and self._running_window is None
+                    and self._active_job_id is None
+                    and self._capture_done.is_set()
+                ):
+                    break
+            time.sleep(0.5)  # not _wake_consume: the consume loop owns clearing it
+        # Stopping closes the G4 process: first let it publish a revision with every
+        # formal window, or the delivery export finds the map incomplete.
+        deadline = time.monotonic() + _DRAIN_G4_WAIT_SEC
+        while True:
+            with self._lock:
+                if self._session_id != session_id or self._stopping:
+                    return
+                g4, formal = self._g4_process, self._formal_windows
+            if g4 is None:
+                break
+            status = g4.status()
+            if status.get("state") == "ready" and int(status.get("window_count") or 0) >= formal:
+                break
+            if status.get("state") in ("error", "stopped") or time.monotonic() > deadline:
+                with self._lock:
+                    self._write_journal({
+                        "event": "session_drain_g4_incomplete",
+                        "session_id": session_id,
+                        "formal_windows": formal,
+                        "g4_state": status.get("state"),
+                        "g4_window_count": status.get("window_count"),
+                        "g4_error": status.get("error", ""),
+                    })
+                break
+            time.sleep(1.0)
+        with self._lock:
+            if self._session_id != session_id or self._stopping:
+                return
+        self._stop_now()
+
+    def _stop_now(self) -> tuple[int, str]:
         stop_deadline = self._monotonic() + float(self._config.stop_timeout_sec)
         # STOP 先原子地 latch _stopping，再进入有界收敛。不要先抢
         # _goal_dispatch_lock：consume 线程持该锁执行可能阻塞的
@@ -1784,7 +1919,7 @@ class ContinuousSession:
 
     def shutdown(self, timeout_sec: float) -> None:
         if self._state not in (SESSION_IDLE, SESSION_STOPPED):
-            self.stop_all()
+            self.stop_all(discard_queue=True)  # the process is exiting; nothing would drain
         self._join_threads()
 
     def get_status(self) -> SessionStatus:
@@ -2150,7 +2285,7 @@ class ContinuousSession:
         try:
             while True:
                 with self._lock:
-                    if self._stopping or self._fatal_oom:
+                    if self._stopping or self._fatal_oom or self._capture_stopped:
                         break
                     if self._state in (SESSION_RUNNING, SESSION_DISK_PAUSED):
                         disk_low = self._disk_low_locked()
@@ -2244,6 +2379,12 @@ class ContinuousSession:
                     with self._lock:
                         if self._stopping or self._fatal_oom:
                             break
+                        if self._capture_stopped:
+                            # STOP while draining: the unfinished window is cancelled, not failed.
+                            if record.snapshot_uri and not record.done.is_set():
+                                self._remove_snapshot(record)
+                            self._window_terminal(record, WINDOW_CANCELLED, "stop_all: capture stopped")
+                            break
                         record.capture_attempts += 1
                         self._attempt_failures += 1
                         retry = record.capture_attempts <= effective.max_retries
@@ -2313,7 +2454,7 @@ class ContinuousSession:
         # 不能启动新 Capture goal；等到 RUNNING（或 stopping/fatal）再继续。
         while True:
             with self._lock:
-                if self._stopping:
+                if self._stopping or self._capture_stopped:
                     return "stopping"
                 if self._fatal_oom:
                     return "fatal oom; capture goal suppressed"
@@ -2335,7 +2476,7 @@ class ContinuousSession:
         )
         with self._goal_dispatch_lock:
             with self._lock:
-                if self._stopping:
+                if self._stopping or self._capture_stopped:
                     return "stopping"
                 if self._fatal_oom:
                     return "fatal oom; capture goal suppressed"
@@ -2357,7 +2498,7 @@ class ContinuousSession:
         # 2a：pause 也可能落在 send_goal 返回之后；立刻补发一次 pause，
         # 后续 wait loop 会冻结 scheduler deadline 直到 resume。
         with self._lock:
-            if self._stopping or self._fatal_oom:
+            if self._stopping or self._fatal_oom or self._capture_stopped:
                 client.cancel_goal()
             elif self._state != SESSION_RUNNING:
                 try:
@@ -2373,6 +2514,7 @@ class ContinuousSession:
             with self._lock:
                 stopping = self._stopping
                 fatal_oom = self._fatal_oom
+                capture_stopped = self._capture_stopped
                 source_stale = record.source_stale
                 paused = self._state in (SESSION_PAUSED, SESSION_ALIGNMENT_PAUSED)
                 if stopping and capture_cancel_deadline is None:
@@ -2390,7 +2532,7 @@ class ContinuousSession:
             # 不得因暂停时长取消底层 Capture Action。
             if paused:
                 deadline = self._monotonic() + allowance
-            if stopping or fatal_oom:
+            if stopping or fatal_oom or capture_stopped:
                 client.cancel_goal()
             # stopping 时使用更短的轮询步长，让 bounded convergence
             # deadline 能及时被检查到，避免 stop_all join 已超时。
@@ -2414,7 +2556,8 @@ class ContinuousSession:
                         "retry stop_all when the capture action reaches terminal"
                     )
                 return self._last_error
-            if not stopping and not fatal_oom and not source_stale and not paused and self._monotonic() >= deadline:
+            if (not stopping and not fatal_oom and not capture_stopped and not source_stale and not paused
+                    and self._monotonic() >= deadline):
                 client.cancel_goal()
                 while not client.wait_for_result(0.5):
                     with self._lock:
@@ -2697,6 +2840,10 @@ class ContinuousSession:
                 profile["frame_pose_fusion"] = True
             if self._config.pose_time_offset_stage == "capture":
                 profile["frame_pose"]["pose_time_offset_stage"] = "capture"
+            if self._config.g4_cross_window_weight > 0:
+                profile["frame_pose"]["cross_window_weight"] = float(self._config.g4_cross_window_weight)
+            if self._config.g4_frame_scales:
+                profile["frame_pose"]["frame_scales"] = True
         return profile
 
     # ------------------------------------------------------------------
@@ -4601,6 +4748,7 @@ __all__ = [
     "SESSION_IDLE",
     "SESSION_PAUSED",
     "SESSION_RUNNING",
+    "SESSION_DRAINING",
     "SESSION_STOPPED",
     "SESSION_STOPPING",
 ]

@@ -37,7 +37,7 @@ For `video`, prepare calls the shared phone extractor using the `extract` mappin
 | `pose.units` | `meters` (default) or `arbitrary`, only for external poses |
 | `pose.metric.camera_height_m` | Optional assumed median camera height to scale arbitrary provider output |
 | `pose.position_sigma_m` | 0.05; Cartesian position prior standard deviation |
-| `pose.xfeat_weights`, `pose.batch_size` | Explicit user-owned checkpoint; matching batch size 8 |
+| `pose.xfeat_weights`, `pose.batch_size`, `pose.ransac_threads` | Explicit user-owned checkpoint; matching batch size 8; fundamental-matrix RANSAC on a 4-thread pool while the next batch matches (OpenCV 4.x FM_RANSAC seeds itself per call, so output is bit-identical to one thread; 2026-11-03, 1,500 R1 pairs on GPU: 134 s → 41 s, all saved arrays identical) |
 | `keyframes.enabled` | False for already-selected images; enable only on candidate sequences |
 | `keyframes.translation_m`, `rotation_deg`, `max_gap_s`, `trim_static` | 0.15, 8, 2, true |
 | `selection` | Optional exact split JSON; otherwise every eighth selected frame is test |

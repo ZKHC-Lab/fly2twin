@@ -33,7 +33,7 @@ bash src/drone3d_reconstruction_core/scripts/nx_step2_bringup.sh
 
 滑窗使用 `per_window`，配置 `initial_overlap_frames` 或通过 Web/ROS 设置 `overlap_frames`。首窗采集 N 帧，后续复用前窗尾部 O 帧并采集 N−O 帧；不执行视觉配准，也不预留配准接口。增量模式要求开启 `odom_local_enabled`，使用里程计 Sim(3) 对齐；里程计不可用时输出 `MODEL_LOCAL_UNALIGNED`，不加入累计地图。
 
-运行中 `lossless_fifo` 达到 `queue_capacity` 水位后暂停新采集，消费释放容量后恢复；已启动采集和重试保留。`realtime_latest` 跳过等待窗口时保留各窗口采集时的帧序列，不按重建结果重新拼帧。通过 `set_overlap_frames(N)` 修改复用帧数，从下一窗口生效；0 表示独立采集。v4 合成输入保留相机参数、odom、TF 和可选传感器深度。
+运行中 `lossless_fifo` 达到 `queue_capacity` 水位后暂停新采集，消费释放容量后恢复；已启动采集和重试保留。暂停期间到达的图像全部丢失，交付包和落地 BA 也就缺了这一段，因此模板默认容量为 1000，实际只受 `min_free_disk_gb` 磁盘红线限制：重建慢于采集时，积压的窗口留在磁盘上排队。2026-11-03 NX 实测（15W，384 / 40 帧窗）：每窗处理中位 52.5 s（GPU 推理 38 s），新窗口每 15.8 s 一个，10 分钟积压 27 窗；去掉每窗重复的权重哈希后每窗约 42 s。落地后按 STOP：采集立即停止，会话进入 `DRAINING`，把排队窗口重建完、等 G4 发布完整地图后自动停下（2026-11-03 起；之前的版本 STOP 会删除所有还没重建的窗口）。处理积压期间 Web 按钮变为“立即停止”，再按一次会丢弃剩余窗口。2026-11-03 本机回放加写盘压力时，重建降到约 40–50 s/窗，容量 8 的队列填满，窗口之间出现 15–48 s 的采集空档。`realtime_latest` 跳过等待窗口时保留各窗口采集时的帧序列，不按重建结果重新拼帧。通过 `set_overlap_frames(N)` 修改复用帧数，从下一窗口生效；0 表示独立采集。v4 合成输入保留相机参数、odom、TF 和可选传感器深度。
 
 5 FPS、100 帧、20 帧重叠对应持续约 16 s/窗的名义预算。日志 `window_service_timing` 的 `service_wall_time_sec` 覆盖每次消费的推理、里程计对齐、校验、发布与正常清理；`service_budget_sec` 是该窗口冻结参数对应的名义产窗间隔。还需检查 FIFO 最老等待时间；满载暂停不代表硬件已达到 5 FPS 连续建图吞吐。重叠窗口可以产出正式局部结果，跨窗口坐标由可用的里程计独立约束。
 

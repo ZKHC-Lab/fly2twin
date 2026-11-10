@@ -311,6 +311,42 @@ class CaptureActionServerTest(unittest.TestCase):
         self.assertEqual([r["pose_valid"] for r in rows], ["true", "true"])
         self.assertEqual(server.diagnostics_snapshot()["handoff_replayed_frames"], 2)
 
+    def test_slow_seal_and_commit_do_not_block_sensor_callbacks(self):
+        # 10-29 replay: fsync during sealing stalled 4-11 s inside the sensor
+        # callbacks and the server lock, so the next window lost its first frames.
+        server = self._handoff_server()
+        goal = self._handoff_goal(server, "cs-s0123456789abcdef-w0")
+        with server._lock:
+            session = server._active.session
+            transaction = server._active.transaction
+        gates = {name: (threading.Event(), threading.Event()) for name in ("seal", "commit")}
+
+        def blocking(name, original):
+            def call(*args, **kwargs):
+                entered, release = gates[name]
+                entered.set()
+                release.wait(5.0)
+                return original(*args, **kwargs)
+            return call
+
+        session.writer.seal = blocking("seal", session.writer.seal)
+        transaction.commit = blocking("commit", transaction.commit)
+        self._handoff_image(server, 10)
+        self._handoff_image(server, 10, 500000000)
+        for second, name in ((11, "seal"), (12, "commit")):
+            entered, release = gates[name]
+            self.assertTrue(entered.wait(2.0), name)
+            started = time.monotonic()
+            self._handoff_image(server, second)
+            snapshot = server.diagnostics_snapshot()
+            self.assertLess(time.monotonic() - started, 0.5, name)
+            self.assertEqual(snapshot["stage"], "committing")
+            self.assertEqual(snapshot["handoff_queued_frames"], second - 10)
+            release.set()
+        self.wait_events(goal, 2)
+        self.assertEqual(goal.events[-1][0], "succeeded")
+        self.assertEqual(goal.events[-1][1].frame_count, 2)
+
     def test_handoff_never_replays_frames_into_a_new_session(self):
         server = self._handoff_server()
         first = self._handoff_goal(server, "cs-s0123456789abcdef-w0")

@@ -437,10 +437,10 @@ class CaptureActionServer:
                 self._handoff.push(message)
                 return
         session.on_image(message)
-        # An odometry callback can seal the pending last RGB while this callback
-        # is in flight. Preserve this later image rather than silently losing it.
-        if session.sealed is not None and stamp_ns(message) > (
-                session.sealed.last_stamp.sec * 10**9 + session.sealed.last_stamp.nsec):
+        # An odometry callback can complete the window while this callback is in
+        # flight. Preserve this later image rather than silently losing it.
+        final = session.final_stamp_ns
+        if final is not None and stamp_ns(message) > final:
             with self._lock:
                 active = self._active
                 target = active.session if active is not None else None
@@ -764,6 +764,8 @@ class CaptureActionServer:
                 source_state_callback=lambda stage, stamp: (
                     self._publish_source_state(record, stage, stamp)
                 ),
+                # Sealing fsyncs every frame; keep it off the sensor callback threads.
+                defer_seal=True,
             )
         except BaseException as error:
             self._terminalize(
@@ -893,52 +895,10 @@ class CaptureActionServer:
                     _result(code, message, config=record.config or self._config),
                     message,
                 )
-            elif session.sealed is not None:
+            elif session.sealed is not None or session.frames_complete:
+                # Seal and publish below without the server lock: every sensor
+                # callback takes it, and fsync can stall for seconds on a busy disk.
                 record.phase = "committing"
-                try:
-                    transaction.commit()
-                    record.committed = True
-                except BaseException as error:
-                    if transaction.committed:
-                        # renameat2 已经发布成功；之后的防御性检查/fsync
-                        # 失败绝不把已发布快照当失败重试同一最终名。
-                        record.committed = True
-                        message = (
-                            "capture sealed snapshot committed with warning: "
-                            f"{type(error).__name__}"
-                        )
-                        terminal = (
-                            "succeeded",
-                            _result(
-                                CaptureSegmentResult.OK,
-                                message,
-                                sealed=session.sealed,
-                                config=record.config or self._config,
-                            ),
-                            message,
-                        )
-                    else:
-                        message = f"snapshot publication failed: {type(error).__name__}"
-                        terminal = (
-                            "aborted",
-                            _result(
-                                CaptureSegmentResult.IO_ERROR,
-                                message,
-                                config=record.config or self._config,
-                            ),
-                            message,
-                        )
-                else:
-                    terminal = (
-                        "succeeded",
-                        _result(
-                            CaptureSegmentResult.OK,
-                            "capture sealed snapshot committed",
-                            sealed=session.sealed,
-                            config=record.config or self._config,
-                        ),
-                        "capture snapshot committed",
-                    )
             else:
                 record.phase = "terminalizing"
                 terminal = (
@@ -950,9 +910,39 @@ class CaptureActionServer:
                     ),
                     "capture ended without a terminal outcome",
                 )
-            self._claim_terminal_locked(record)
+            if terminal is not None:
+                self._claim_terminal_locked(record)
 
+        if terminal is None:
+            terminal = self._seal_and_commit(record, session, transaction)
+            with self._lock:
+                if self._active is not record or record.terminal_claimed:
+                    return
+                self._claim_terminal_locked(record)
         self._perform_terminal(record, *terminal)
+
+    def _seal_and_commit(self, record, session, transaction):
+        """Seal the completed window and publish it; runs without the server lock."""
+        config = record.config or self._config
+        session.finalize()
+        if session.error is not None:
+            code = _CAPTURE_CODE_TO_RESULT.get(session.error.code, CaptureSegmentResult.INTERNAL_ERROR)
+            message = f"capture failed: {session.error}"
+            return "aborted", _result(code, message, config=config), message
+        text = "capture snapshot committed"
+        message = "capture sealed snapshot committed"
+        try:
+            transaction.commit()
+        except BaseException as error:
+            if not transaction.committed:
+                message = f"snapshot publication failed: {type(error).__name__}"
+                return "aborted", _result(CaptureSegmentResult.IO_ERROR, message, config=config), message
+            # renameat2 已经发布成功；之后的防御性检查/fsync 失败绝不把已发布
+            # 快照当失败重试同一最终名。
+            message = text = f"capture sealed snapshot committed with warning: {type(error).__name__}"
+        with self._lock:
+            record.committed = True
+        return "succeeded", _result(CaptureSegmentResult.OK, message, sealed=session.sealed, config=config), text
 
     def _replay_handoff(self, record, cutoff):
         """Drain RGB with its own pose brackets; don't rescan history per image."""

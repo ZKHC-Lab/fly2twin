@@ -10,6 +10,11 @@ VGGT depth inside a window is known up to one scale. Two constraint types fix it
   the median over shared frames of the per-frame median d_a / d_b over pixels
   whose confidence exceeds that frame's median in both windows; weight
   ``edge_weight``.
+* cross-window edge (optional): two overlapping frames of different windows,
+  frame i's metric depth moved into camera j with the pose provider's poses and
+  compared with frame j's depth (``cross_view_log_ratio``); one row per directed
+  frame pair with its own weight. This also links revisits that are far apart in
+  time, where the adjacent chain alone drifts.
 
 A connected component of windows without any trajectory prior has no metric
 scale and is reported as unconstrained.
@@ -21,6 +26,9 @@ EXTENT_WEIGHT_CAP = 2.0
 EDGE_WEIGHT = 3.0
 MIN_PIXELS = 500
 MIN_SHARED_FRAMES = 3
+CROSS_GATE_LOG = 0.25          # |log depth ratio| counted for a cross-window pair
+CROSS_MIN_PIXELS = 500         # in model-resolution pixels
+CROSS_DEPTH_RANGE_M = (0.3, 4.0)
 
 
 def rotation_mean(rotations):
@@ -79,13 +87,46 @@ def shared_depth_ratio(frames, min_pixels=MIN_PIXELS):
     return float(np.median(ratios)), len(ratios)
 
 
+def cross_view_log_ratio(depth_i, K_i, pose_i, depth_j, K_j, pose_j, stride=1,
+                         gate=CROSS_GATE_LOG, min_pixels=CROSS_MIN_PIXELS, depth_range=CROSS_DEPTH_RANGE_M):
+    """Median log(z / d_j) of frame i's metric depth moved into camera j.
+
+    ``depth_*`` are metric depth maps sampled every ``stride`` model pixels
+    (``depth[v, u]`` is model pixel (stride*u, stride*v)); ``K_*`` at model
+    resolution; ``pose_*`` camera-to-world. A pixel counts when it projects
+    inside frame j, j's depth there lies in ``depth_range`` and the ratio is
+    within ``gate``. ``min_pixels`` is in model pixels (divided by stride**2).
+    > 0 means frame i's depth is larger than frame j's. Returns (value or None, pixels).
+    """
+    depth_i, depth_j = np.asarray(depth_i, np.float64), np.asarray(depth_j, np.float64)
+    h, w = depth_i.shape
+    hj, wj = depth_j.shape
+    v, u = np.mgrid[0:h, 0:w] * stride
+    ray = np.stack([(u - K_i[0, 2]) / K_i[0, 0], (v - K_i[1, 2]) / K_i[1, 1], np.ones((h, w))], -1)
+    world = (ray * depth_i[..., None]).reshape(-1, 3) @ pose_i[:3, :3].T + pose_i[:3, 3]
+    xyz = (world - pose_j[:3, 3]) @ pose_j[:3, :3]
+    z = xyz[:, 2]
+    front = z > 0.1
+    uu = np.rint((K_j[0, 0] * xyz[front, 0] / z[front] + K_j[0, 2]) / stride).astype(int)
+    vv = np.rint((K_j[1, 1] * xyz[front, 1] / z[front] + K_j[1, 2]) / stride).astype(int)
+    inside = (uu >= 0) & (uu < wj) & (vv >= 0) & (vv < hj)
+    observed = depth_j[vv[inside], uu[inside]]
+    ratio = np.log(np.maximum(z[front][inside], 1e-6) / np.maximum(observed, 1e-6))
+    ok = (np.abs(ratio) < gate) & (observed > depth_range[0]) & (observed < depth_range[1])
+    count = int(ok.sum())
+    if count * stride * stride <= min_pixels:
+        return None, count
+    return float(np.median(ratio[ok])), count
+
+
 def solve_window_scales(window_ids, priors, edges, min_extent_m=MIN_EXTENT_M,
                         extent_weight_cap=EXTENT_WEIGHT_CAP, edge_weight=EDGE_WEIGHT):
     """Log-scale weighted least squares.
 
     ``priors``: id -> trajectory_prior result or None. ``edges``: iterable of
-    (a, b, r) with s_b = s_a * r. Returns (scales: id -> float for constrained
-    windows, constrained: set of ids, diagnostics: id -> dict).
+    (a, b, r) with s_b = s_a * r, or (a, b, r, weight) to override ``edge_weight``.
+    Returns (scales: id -> float for constrained windows, constrained: set of ids,
+    diagnostics: id -> dict).
     """
     ids = list(window_ids)
     index = {w: k for k, w in enumerate(ids)}
@@ -101,14 +142,15 @@ def solve_window_scales(window_ids, priors, edges, min_extent_m=MIN_EXTENT_M,
             weights.append(min(p["extent_m"], extent_weight_cap))
             anchored.add(w)
     adjacency = {w: set() for w in ids}
-    for a, b, rel in edges:
+    for edge in edges:
+        a, b, rel = edge[:3]
         if a not in index or b not in index or not np.isfinite(rel) or rel <= 0:
             continue
         r = np.zeros(len(ids))
         r[index[a]], r[index[b]] = -1, 1
         rows.append(r)
         rhs.append(np.log(rel))
-        weights.append(edge_weight)
+        weights.append(edge[3] if len(edge) > 3 else edge_weight)
         adjacency[a].add(b)
         adjacency[b].add(a)
     constrained, seen = set(), set()
@@ -142,6 +184,88 @@ def solve_window_scales(window_ids, priors, edges, min_extent_m=MIN_EXTENT_M,
             "trajectory_residual_rms_m": None if p is None else p["residual_rms_m"],
             "adjacent_edges": len(adjacency[w])}
     return scales, constrained, diagnostics
+
+
+SIGMA_PRIOR = 0.04      # log-scale noise of a trajectory prior (office_gs_04, LiDAR-fitted truth)
+SIGMA_EDGE = 0.04       # adjacent shared-frame edge
+SIGMA_ROW = 0.08        # one directed frame-pair row (rows of one window pair are correlated)
+SIGMA_FRAME = 0.04      # a frame's deviation from its window scale
+SIGMA_TEMPORAL = 0.02   # deviation change between consecutive frames of one window
+
+
+def solve_frame_scales(window_ids, priors, edges, frame_window, frame_rows, temporal_pairs,
+                       sigma_prior=SIGMA_PRIOR, sigma_edge=SIGMA_EDGE, sigma_row=SIGMA_ROW,
+                       sigma_frame=SIGMA_FRAME, sigma_temporal=SIGMA_TEMPORAL, min_extent_m=MIN_EXTENT_M):
+    """Joint per-frame depth scales: log s_f = x_w(f) + d_f, sparse weighted least squares.
+
+    ``priors``: id -> trajectory_prior result or None, anchoring x_w = log scale when the
+    provider moved more than ``min_extent_m``. ``edges``: (a, b, r) with x_b - x_a = log r.
+    ``frame_window``: window id per frame. ``frame_rows``: (i, j, value) on frame indices with
+    log s_i - log s_j = value (``cross_view_log_ratio`` at known scales, both windows or one).
+    ``temporal_pairs``: (i, j) consecutive frames of one window. Each frame deviation d_f has a
+    zero prior. Every constraint is weighted by 1 / its sigma.
+    Returns (window scales: id -> float, frame scales: array with NaN for unconstrained
+    frames, constrained window ids). Components without an anchor stay unconstrained.
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.linalg import lsqr
+    ids = list(window_ids)
+    index = {w: k for k, w in enumerate(ids)}
+    frame_window = np.asarray(frame_window)
+    frame_w = np.array([index.get(w, -1) for w in frame_window], int)
+    n_w, n_f = len(ids), len(frame_window)
+    # Window connectivity through edges and cross-window rows; components need an anchor.
+    parent = list(range(n_w))
+
+    def find(k):
+        while parent[k] != k:
+            parent[k] = parent[parent[k]]
+            k = parent[k]
+        return k
+
+    anchored = [w for w in ids if priors.get(w) is not None and priors[w]["scale"] > 0
+                and priors[w]["extent_m"] > min_extent_m]
+    links = [(index[a], index[b]) for a, b, r in edges if a in index and b in index and np.isfinite(r) and r > 0]
+    links += [(frame_w[i], frame_w[j]) for i, j, v in frame_rows if frame_w[i] >= 0 and frame_w[j] >= 0 and np.isfinite(v)]
+    for a, b in links:
+        parent[find(a)] = find(b)
+    roots = {find(index[w]) for w in anchored}
+    constrained = {w for w in ids if find(index[w]) in roots}
+    if not constrained:
+        return {}, np.full(n_f, np.nan), set()
+    cols = {w: k for k, w in enumerate(w for w in ids if w in constrained)}
+    frame_col = np.array([n_w + q for q in range(n_f)])  # deviation unknowns after the windows
+    rr, cc, vv, rhs = [], [], [], []
+
+    def add(entries, value, sigma):
+        row = len(rhs)
+        for col, coeff in entries:
+            rr.append(row); cc.append(col); vv.append(coeff / sigma)
+        rhs.append(value / sigma)
+
+    for w in anchored:
+        if w in cols:
+            add([(cols[w], 1.)], np.log(priors[w]["scale"]), sigma_prior)
+    for a, b, r in edges:
+        if a in cols and b in cols and np.isfinite(r) and r > 0:
+            add([(cols[b], 1.), (cols[a], -1.)], np.log(r), sigma_edge)
+    in_solve = np.array([frame_w[q] >= 0 and ids[frame_w[q]] in cols for q in range(n_f)])
+    for i, j, value in frame_rows:
+        if in_solve[i] and in_solve[j] and np.isfinite(value):
+            add([(cols[ids[frame_w[i]]], 1.), (frame_col[i], 1.),
+                 (cols[ids[frame_w[j]]], -1.), (frame_col[j], -1.)], value, sigma_row)
+    for q in np.flatnonzero(in_solve):
+        add([(frame_col[q], 1.)], 0., sigma_frame)
+    for i, j in temporal_pairs:
+        if in_solve[i] and in_solve[j]:
+            add([(frame_col[i], 1.), (frame_col[j], -1.)], 0., sigma_temporal)
+    A = coo_matrix((vv, (rr, cc)), shape=(len(rhs), n_w + n_f)).tocsr()
+    x = lsqr(A, np.asarray(rhs), atol=1e-12, btol=1e-12, iter_lim=50 * (n_w + n_f))[0]
+    window_scales = {w: float(np.exp(x[k])) for w, k in cols.items()}
+    frame_scales = np.full(n_f, np.nan)
+    for q in np.flatnonzero(in_solve):
+        frame_scales[q] = np.exp(x[cols[ids[frame_w[q]]]] + x[frame_col[q]])
+    return window_scales, frame_scales, constrained
 
 
 def batch_window_scales(windows, ids, poses):

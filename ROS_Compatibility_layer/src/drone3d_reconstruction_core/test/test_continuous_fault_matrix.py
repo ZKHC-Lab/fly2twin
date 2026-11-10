@@ -1311,7 +1311,7 @@ def scenario_failure_then_continue():
             if path.name.startswith(failed_scene + "-")
         ]
         assert not retained, "terminal failed window snapshot must be removed"
-        service.stop_all()
+        service.stop_all(discard_queue=True)
         assert not any(bed.front_root.iterdir()), "stop_all must leave no snapshots"
         return _evidence(
             "ordinary failure kept its journal diagnosis, removed its snapshot, and did not block later windows",
@@ -1404,7 +1404,7 @@ def scenario_stop_all_cleanup_no_orphan():
             timeout=10.0,
         )
         assert any(bed.front_root.iterdir()), "expected snapshot dirs before stop_all"
-        code, _ = service.stop_all()
+        code, _ = service.stop_all(discard_queue=True)
         assert code == 0
         assert service.get_status().state == SESSION_STOPPED
         assert not any(bed.front_root.iterdir()), (

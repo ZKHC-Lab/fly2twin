@@ -156,6 +156,8 @@ class PreparedLaunch:
     warm_command: tuple[str, ...] | None = None
     warm_job: dict[str, Any] | None = None
     preserve_uncommitted_staging: bool = False
+    # Seconds spent in each preparation step, logged once per goal.
+    timings: dict[str, float] = field(default_factory=dict, compare=False)
 
     def __post_init__(self) -> None:
         if type(self.preserve_uncommitted_staging) is not bool:
@@ -725,7 +727,9 @@ class ReconstructActionServer:
                 builder_kwargs["image_resolution"] = image_resolution
             if worker_timeout_sec is not None:
                 builder_kwargs["worker_timeout_sec"] = worker_timeout_sec
+            prepare_started = time.monotonic()
             prepared_launch = self._command_builder(goal, **builder_kwargs)
+            prepare_sec = time.monotonic() - prepare_started
             if not isinstance(prepared_launch, PreparedLaunch):
                 raise TypeError("command_builder must return PreparedLaunch")
         except ResourceBusyError as error:
@@ -805,6 +809,12 @@ class ReconstructActionServer:
             with self._lock:
                 if self._active is record and not record.terminal_claimed:
                     record.controller_job_id = controller_job_id
+            rospy.loginfo(
+                "reconstruct launch timing: prepare %.2f s (%s), worker start %.2f s",
+                prepare_sec,
+                ", ".join(f"{k} {v:.2f}" for k, v in prepared_launch.timings.items()),
+                time.monotonic() - prepare_started - prepare_sec,
+            )
         except BusyError as error:
             with self._lock:
                 published_job = record.controller_job_id is not None

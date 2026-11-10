@@ -43,6 +43,7 @@ from drone3d_reconstruction_core.continuous_session import (
     SESSION_MEMORY_PAUSED,
     SESSION_PAUSED,
     SESSION_RUNNING,
+    SESSION_DRAINING,
     SESSION_STOPPED,
     SESSION_STOPPING,
     WINDOW_CANCELLED,
@@ -901,7 +902,7 @@ class ContinuousSessionTest(unittest.TestCase):
         )
         self.assertGreaterEqual(final.succeeded_windows, 3)
         self.assertEqual(final.failed_windows, 0)
-        service.stop_all()
+        service.stop_all(discard_queue=True)
         self.assertFalse(any(self.front_root.iterdir()))
 
     def test_lossless_capacity_backpressures_capture_and_resumes_without_drops(self):
@@ -935,7 +936,7 @@ class ContinuousSessionTest(unittest.TestCase):
         timing = service.diagnostics_snapshot()
         self.assertGreaterEqual(timing["service_wall_time_sec"], 0.0)
         self.assertEqual(timing["service_budget_sec"], 1.0 / self.config.initial_sample_fps)
-        service.stop_all()
+        service.stop_all(discard_queue=True)
         self.assertFalse(any(self.front_root.iterdir()))
 
     def test_hot_tune_freezes_capture_and_pending_configs_and_applies_next_window(self):
@@ -1762,7 +1763,7 @@ class ContinuousSessionTest(unittest.TestCase):
         self.assertTrue(dropped[0]["config_digest"])
         backend.release_first.set()
         backend.jobs[backend.submitted[0]]["state"] = JOB_SUCCEEDED
-        service.stop_all()
+        service.stop_all(discard_queue=True)
         self.assertEqual(service.get_status().state, SESSION_STOPPED)
         self.assertFalse(any(self.front_root.iterdir()))
 
@@ -1961,7 +1962,7 @@ class ContinuousSessionTest(unittest.TestCase):
             if path.name.startswith(failed_scene + "-")
         ]
         self.assertEqual(retained, [])
-        service.stop_all()
+        service.stop_all(discard_queue=True)
         self.assertFalse(any(self.front_root.iterdir()))
 
     def test_pause_resume_controls_active_capture(self):
@@ -2103,7 +2104,69 @@ class ContinuousSessionTest(unittest.TestCase):
         service.start_session("")
         self.wait_until(lambda: service.get_status().pending_windows >= 1)
         backend.release_first.set()  # 模拟真实 Action 可被 cancel 终态收敛
-        service.stop_all()
+        service.stop_all(discard_queue=True)
+        self.assertEqual(service.get_status().state, SESSION_STOPPED)
+        self.assertFalse(any(self.front_root.iterdir()))
+
+    def test_stop_reconstructs_queued_windows_before_stopping(self):
+        backend = FakeBackend(block_first=True)
+        service = self.make_session(backend=backend)
+        service.select_source("front")
+        service.start_session("")
+        self.wait_until(lambda: len(backend.submitted) == 1 and service.get_status().pending_windows >= 2)
+        code, message = service.stop_all()
+        self.assertEqual(code, 0, message)
+        status = service.get_status()
+        self.assertEqual(status.state, SESSION_DRAINING)
+        queued = status.pending_windows
+        self.assertGreaterEqual(queued, 2)
+        captured_at_stop = status.window_index
+        # Capture has stopped and the queue is kept: START and PAUSE are refused meanwhile.
+        self.assertNotEqual(service.start_session("")[0], 0)
+        self.assertNotEqual(service.pause()[0], 0)
+        backend.jobs[backend.submitted[0]]["state"] = JOB_SUCCEEDED
+        backend.release_first.set()
+        final = self.wait_until(
+            lambda: service.get_status() if service.get_status().state == SESSION_STOPPED else None,
+            timeout=10.0,
+        )
+        self.assertEqual(final.failed_windows, 0)
+        self.assertGreaterEqual(final.succeeded_windows, 1 + queued)
+        self.assertLessEqual(final.window_index, captured_at_stop + 1)
+        events = [json.loads(line)["event"] for line in
+                  (Path(self.config.journal_root) / (final.session_id + ".jsonl")).read_text().splitlines()]
+        self.assertLess(events.index("session_drain_start"), events.index("session_stop"))
+
+    def test_drain_waits_for_g4_to_publish_every_window_before_stopping(self):
+        service = self.make_session(backend=FakeBackend())
+        polled = []
+
+        class FakeG4:
+            def status(self):
+                polled.append(1)
+                count = 3 if len(polled) >= 3 else 2  # the last window joins the map late
+                return {"state": "ready" if len(polled) >= 3 else "optimizing", "window_count": count}
+
+        stops = []
+        service._stop_now = lambda: stops.append(len(polled)) or (0, "stopped")
+        service._session_id = "s" + "0" * 16
+        service._capture_stopped = True
+        service._formal_windows = 3
+        service._g4_process = FakeG4()
+        service._capture_done.set()
+        service._drain_then_stop(service._session_id)
+        self.assertEqual(stops, [3])
+
+    def test_second_stop_while_draining_discards_queue(self):
+        backend = FakeBackend(block_first=True)
+        service = self.make_session(backend=backend)
+        service.select_source("front")
+        service.start_session("")
+        self.wait_until(lambda: len(backend.submitted) == 1 and service.get_status().pending_windows >= 1)
+        self.assertEqual(service.stop_all()[0], 0)
+        self.assertEqual(service.get_status().state, SESSION_DRAINING)
+        backend.release_first.set()  # 模拟真实 Action 可被 cancel 终态收敛
+        self.assertEqual(service.stop_all()[0], 0)
         self.assertEqual(service.get_status().state, SESSION_STOPPED)
         self.assertFalse(any(self.front_root.iterdir()))
 
@@ -2113,7 +2176,7 @@ class ContinuousSessionTest(unittest.TestCase):
         service.select_source("front")
         self.assertEqual(service.start_session("")[0], 0)
         self.wait_until(lambda: len(backend.submitted) >= 1)
-        code, message = service.stop_all()
+        code, message = service.stop_all(discard_queue=True)
         self.assertNotEqual(code, 0)
         self.assertIn("still terminating", message)
         self.assertEqual(service.get_status().state, SESSION_STOPPING)
@@ -2121,7 +2184,7 @@ class ContinuousSessionTest(unittest.TestCase):
         self.assertEqual(service.start_session("")[0], 3)
         backend.stuck = False
         self.wait_until(lambda: service._consume_done.is_set())
-        self.assertEqual(service.stop_all()[0], 0)
+        self.assertEqual(service.stop_all(discard_queue=True)[0], 0)
         self.assertEqual(service.get_status().state, SESSION_STOPPED)
 
     def test_config_rejects_window_frames_above_group(self):
@@ -3465,7 +3528,7 @@ class ContinuousSessionTest(unittest.TestCase):
         with service._lock:
             self.assertEqual(service._active_job_id, first_job_id)
 
-        code, message = service.stop_all()
+        code, message = service.stop_all(discard_queue=True)
         self.assertEqual(code, 3, message)
         self.assertEqual(service.get_status().state, SESSION_STOPPING)
 
@@ -3476,7 +3539,7 @@ class ContinuousSessionTest(unittest.TestCase):
         with service._lock:
             self.assertEqual(service._windows[0].state, WINDOW_CANCELLED)
             self.assertEqual(service._windows[0].error, "stop_all")
-        self.assertEqual(service.stop_all()[0], 0)
+        self.assertEqual(service.stop_all(discard_queue=True)[0], 0)
         self.assertEqual(service.get_status().state, SESSION_STOPPED)
         stop_event = next(
             event
@@ -3541,7 +3604,7 @@ class ContinuousSessionTest(unittest.TestCase):
         service.start_session("front")
         self.assertTrue(backend.submit_entered.wait(3.0))
 
-        code, message = service.stop_all()
+        code, message = service.stop_all(discard_queue=True)
         self.assertEqual(code, 3, message)
         self.assertIsNone(service._stop_audit["backend_job_id_before"])
 
@@ -3550,7 +3613,7 @@ class ContinuousSessionTest(unittest.TestCase):
         self.assertEqual(backend.cancel_calls, 1)
         self.assertEqual(backend.collect_calls, 1)
         self.assertEqual(service.get_status().failed_windows, 0)
-        self.assertEqual(service.stop_all()[0], 0)
+        self.assertEqual(service.stop_all(discard_queue=True)[0], 0)
 
         stop_event = next(
             event
@@ -3582,7 +3645,7 @@ class ContinuousSessionTest(unittest.TestCase):
         service.start_session("front")
         self.wait_until(lambda: len(backend.submitted) == 1)
 
-        code, message = service.stop_all()
+        code, message = service.stop_all(discard_queue=True)
 
         self.assertEqual(code, 3, message)
         self.assertIn("cleanup_failed", message)
@@ -3625,7 +3688,7 @@ class ContinuousSessionTest(unittest.TestCase):
         service.select_source("front")
         service.start_session("")
         self.wait_until(lambda: len(backend.submitted) >= 1)
-        code, message = service.stop_all()
+        code, message = service.stop_all(discard_queue=True)
         self.assertEqual(code, 3, message)
         self.assertEqual(service.get_status().state, SESSION_STOPPING)
         # 旧 worker/消费线程未收敛时不得启动新 session。
@@ -3635,7 +3698,7 @@ class ContinuousSessionTest(unittest.TestCase):
         backend.cancel_raises = False
         backend.status_terminal = True
         self.wait_until(lambda: service._consume_done.is_set(), timeout=5.0)
-        code, message = service.stop_all()
+        code, message = service.stop_all(discard_queue=True)
         self.assertEqual(code, 0, message)
         self.assertEqual(service.get_status().state, SESSION_STOPPED)
 
@@ -3893,14 +3956,14 @@ class ContinuousSessionTest(unittest.TestCase):
         self.assertFalse(backend.release_collect.is_set())
         with service._lock:
             self.assertEqual(service._active_job_id, job_id)
-        code, message = service.stop_all()
+        code, message = service.stop_all(discard_queue=True)
         self.assertNotEqual(code, 0)
         self.assertEqual(service.get_status().state, SESSION_STOPPING)
         with service._lock:
             self.assertEqual(service._active_job_id, job_id)
         self.assertEqual(service.start_session("")[0], 3)
         backend.release_collect.set()
-        self.assertEqual(service.stop_all()[0], 0)
+        self.assertEqual(service.stop_all(discard_queue=True)[0], 0)
         self.assertEqual(service.get_status().state, SESSION_STOPPED)
         with service._lock:
             self.assertIsNone(service._active_job_id)
@@ -4010,6 +4073,17 @@ class FramePosePlacementConfigTests(GroupedSessionFixture):
         profile = session._backend_profile()
         self.assertTrue(profile['frame_pose_fusion'])
         self.assertEqual(profile['frame_pose'], dict(pose_time_offset_ms=40.,pose_time_offset_stage='capture'))
+        cross = self.make_session(g4_placement='frame_pose', pose_time_offset_ms=40.,
+                                  pose_time_offset_stage='capture', g4_cross_window_weight=.3)._backend_profile()
+        self.assertEqual(cross['frame_pose']['cross_window_weight'], .3)
+        frames = self.make_session(g4_placement='frame_pose', pose_time_offset_ms=40.,
+                                   pose_time_offset_stage='capture', g4_frame_scales=True)._backend_profile()
+        self.assertTrue(frames['frame_pose']['frame_scales'])
+        with self.assertRaises(Exception):  # one scale solve or the other, not both
+            self.make_session(g4_placement='frame_pose', pose_time_offset_stage='capture',
+                              g4_frame_scales=True, g4_cross_window_weight=.3)
+        with self.assertRaises(Exception):  # cross-window rows use the capture-stage poses
+            self.make_session(g4_placement='frame_pose', g4_cross_window_weight=.3)
 
     def test_frame_pose_profile_carries_placement_offset_and_intrinsics(self):
         from g4_backend import FRAME_POSE_METHOD_ID

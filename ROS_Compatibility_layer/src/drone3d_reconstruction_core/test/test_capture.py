@@ -511,6 +511,47 @@ class ImageCodecTest(CaptureTestBase):
 
 
 class CaptureSessionAndWriterTest(CaptureTestBase):
+    def test_deferred_seal_leaves_fsync_to_finalize(self):
+        session = self.make_session(
+            goal=validate_capture_goal(self.make_goal(max_frames=2), self.make_config()),
+            defer_seal=True,
+        )
+        session.on_odometry(self.odometry_message(10, 0))
+        session.on_image(self.image_message(10, 0))
+        session.on_odometry(self.odometry_message(10, 500000000))
+        session.on_image(self.image_message(10, 500000000))
+        self.assertTrue(session.done.is_set())
+        self.assertTrue(session.frames_complete)
+        self.assertIsNone(session.sealed)
+        self.assertEqual(session.final_stamp_ns, 10 * 10**9 + 500000000)
+        manifest = session.writer.staging_path / "files_sha256.csv"
+        self.assertFalse(manifest.exists())
+        # Later images belong to the next window and do not touch this one.
+        session.on_image(self.image_message(11, 0))
+        self.assertEqual(session.writer.frame_count, 2)
+        session.finalize()
+        self.assertIsNone(session.error)
+        self.assertEqual(session.sealed.frame_count, 2)
+        self.assertTrue(manifest.exists())
+
+    def test_deferred_seal_reports_too_few_frames_as_error(self):
+        config = self.make_config(min_captured_frames=2, source_timeout_sec=30.0)
+        clock = [0.0]
+        session = self.make_session(
+            config=config,
+            goal=validate_capture_goal(self.make_goal(max_frames=3), config),
+            defer_seal=True,
+            monotonic=lambda: clock[0],
+        )
+        session.on_odometry(self.odometry_message(10, 0))
+        session.on_image(self.image_message(10, 0))
+        clock[0] = 11.0  # past the 10 s goal duration, inside the source timeout
+        session.check_deadline()
+        self.assertTrue(session.frames_complete)
+        session.finalize()
+        self.assertIsNone(session.sealed)
+        self.assertIsNotNone(session.error)
+
     def test_session_seals_and_commits_valid_v4_snapshot(self):
         config = self.make_config()
         goal = validate_capture_goal(

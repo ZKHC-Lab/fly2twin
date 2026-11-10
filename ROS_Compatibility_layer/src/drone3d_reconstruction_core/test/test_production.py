@@ -431,6 +431,25 @@ class ProductionConfigTest(ProductionTestBase):
             self.make_config(checkpoint_sha256="b" * 64)
         self.assertIn("checkpoint digest mismatch", str(context.exception))
 
+    def test_per_goal_override_does_not_rehash_unchanged_checkpoint(self):
+        from dataclasses import replace
+        config = self.make_config()
+        real_open = open
+        opened = []
+
+        def counting_open(path, *args, **kwargs):
+            if str(path) == str(self.checkpoint):
+                opened.append(path)
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", counting_open):
+            replace(config, image_resolution=config.image_resolution)
+        self.assertEqual(opened, [])
+        self.checkpoint.write_bytes(b"a different checkpoint body")
+        with self.assertRaises(ProductionConfigError) as context:
+            replace(config, image_resolution=config.image_resolution)
+        self.assertIn("checkpoint digest mismatch", str(context.exception))
+
     def test_preflight_rejects_frame_cap_and_pixel_inconsistency(self):
         tight_snapshot_limits = SnapshotSafetyLimits(
             max_frame_count=2,

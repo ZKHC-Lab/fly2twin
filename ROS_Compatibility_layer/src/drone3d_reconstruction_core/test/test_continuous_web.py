@@ -333,7 +333,7 @@ class WebDashboardServerTest(unittest.TestCase):
             hashlib.sha256(recordpath.read_bytes()).hexdigest())
         root = output_root(self.sessions_root, session)
 
-        def publish(second_pose):
+        def publish(second_pose, frame_depth_scales=None):
             directory = root / "revisions" / "1"
             directory.mkdir(parents=True, exist_ok=True)
             window = dict(window_id=0, included_in_global_preview=True, global_frame_status="localized",
@@ -344,6 +344,8 @@ class WebDashboardServerTest(unittest.TestCase):
                           source=dict(result_manifest_sha256=record["result_manifest_sha256"],
                                       snapshot_manifest_sha256=snapshot_sha, shared_prefix=0,
                                       frame_ids=[0, 1], gauge=1.))
+            if frame_depth_scales is not None:
+                window["frame_depth_scales"] = frame_depth_scales
             revision = dict(session_id=session, revision=1, replacement="complete_map",
                             reference_frame_id="odom", windows=[window])
             data = json.dumps(revision).encode()
@@ -358,6 +360,13 @@ class WebDashboardServerTest(unittest.TestCase):
         # Pixel (u, v) with K = I and depth 1 * 2 -> camera point (2u, 2v, 2).
         expected = {(10., 0., 2.), (12., 0., 2.), (0., 5., 2.), (0., 7., 2.)}
         self.assertEqual({tuple(np.round(p, 6)) for p in cloud["xyz"].tolist()}, expected)
+
+        # Per-frame scales: frame 0 has none and keeps the window scale 2, frame 1 uses 3.
+        publish({"rotation": [[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]], "center": [0., 5., 0.]}, [None, 3.])
+        core = WebDashboardCore(self._config())
+        cloud = core.build_point_cloud(session, session + "-g4", 100)
+        self.assertEqual({tuple(np.round(p, 6)) for p in cloud["xyz"].tolist()},
+                         {(10., 0., 2.), (12., 0., 2.), (0., 5., 3.), (0., 8., 3.)})
 
         # A frame without a localization pose is dropped, not placed by the window Sim(3).
         publish(None)

@@ -22,7 +22,8 @@ class RuntimeMemoryGuardTest(unittest.TestCase):
 
     def make(self, probe=None):
         def memory():
-            return {'available_bytes': GIB - 1 if self.low.is_set() else 4 * GIB,
+            return {'total_bytes': 30 * GIB,
+                    'available_bytes': GIB - 1 if self.low.is_set() else 4 * GIB,
                     'swap_used_bytes': 2 * GIB + 1 if self.swap.is_set() else GIB}
         def finished(event):
             self.events.append(event)
@@ -44,13 +45,23 @@ class RuntimeMemoryGuardTest(unittest.TestCase):
         self.assertTrue(any(r.get('cancel_accepted') is True for r in rows))
         self.assertEqual(rows[-1]['cause'], 'resource_guard')
 
-    def test_swap_growth_stops_worker_even_with_available_ram(self):
-        guard = self.make()
+    def test_swap_growth_stops_worker_when_available_ram_is_short(self):
+        guard = self.make()  # 4 of 30 GiB available: below a quarter
         guard.start([sys.executable, '-c', 'import time; time.sleep(30)'])
         self.swap.set()
         self.assertTrue(self.done.wait(4))
         self.assertEqual(self.events[0].cause, 'resource_guard')
         self.assertIn('job_swap_growth_above_1_gib', self.log.read_text())
+
+    def test_swap_growth_with_plenty_available_is_ignored(self):
+        # Heavy buffered writes make the kernel swap idle pages of other
+        # processes while most memory is still available.
+        guard = self.make(lambda: {'total_bytes': 30 * GIB, 'available_bytes': 16 * GIB,
+                                   'swap_used_bytes': 2 * GIB + 1 if self.swap.is_set() else GIB})
+        self.swap.set()
+        guard.start([sys.executable, '-c', 'import time; time.sleep(.3)'])
+        self.assertTrue(self.done.wait(4))
+        self.assertEqual(self.events[0].cause, 'worker_exit')
 
     def test_clean_exit_remains_success_and_old_watchdog_leaves_new_job_alone(self):
         guard = self.make()
@@ -69,7 +80,7 @@ class RuntimeMemoryGuardTest(unittest.TestCase):
             return WarmWorkerController(worker_timeout_sec=30., term_grace_sec=.1,
                                         warm_command=command, pool_log_path=str(self.log.with_suffix('.pool.log')), **kw)
         guard = MemoryGuardedController(factory, on_finished=finished, audit_path=self.log,
-                    probe=lambda: {'available_bytes': GIB-1 if self.low.is_set() else 4*GIB,
+                    probe=lambda: {'total_bytes': 30*GIB, 'available_bytes': GIB-1 if self.low.is_set() else 4*GIB,
                                    'swap_used_bytes': 0}, interval_sec=.02)
         self.addCleanup(guard.shutdown)
         guard.start_warm(command, {'example': True})
@@ -83,7 +94,8 @@ class RuntimeMemoryGuardTest(unittest.TestCase):
         count = [0]
         def probe():
             count[0] += 1
-            return {'available_bytes': GIB, 'swap_used_bytes': 0 if count[0] == 1 else GIB}
+            return {'total_bytes': 30 * GIB, 'available_bytes': GIB,
+                    'swap_used_bytes': 0 if count[0] == 1 else GIB}
         guard = self.make(probe)
         guard.start([sys.executable, '-c', 'import time; time.sleep(.15)'])
         self.assertTrue(self.done.wait(4))

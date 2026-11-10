@@ -83,6 +83,26 @@ def _open_job_log(output_dir: Path):
     return os.fdopen(descriptor, "w", encoding="utf-8", buffering=1)
 
 
+class _ElapsedLines:
+    """Prefix each run.log line with seconds since the job arrived (stage timing on the NX)."""
+
+    def __init__(self, stream, started: float):
+        self._stream = stream
+        self._started = started
+        self._line_start = True
+
+    def write(self, text: str) -> int:
+        for part in text.splitlines(keepends=True):
+            if self._line_start:
+                self._stream.write("[%7.2f s] " % (time.monotonic() - self._started))
+            self._stream.write(part)
+            self._line_start = part.endswith("\n")
+        return len(text)
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+
 def _run_one_job(model, job: dict, checkpoint: str, checkpoint_sha256: str) -> dict:
     job_id = int(job["job_id"])
     started = time.monotonic()
@@ -101,8 +121,9 @@ def _run_one_job(model, job: dict, checkpoint: str, checkpoint_sha256: str) -> d
             run_log.write(WORKER_RUN_LOG_MARKER)
             run_log.flush()
             try:
-                with contextlib.redirect_stdout(run_log):
+                with contextlib.redirect_stdout(_ElapsedLines(run_log, started)):
                     _run_reconstruction(args, str(output_dir), model=model)
+                    print("job finished")
             except BaseException:
                 traceback.print_exc(file=run_log)
                 run_log.flush()

@@ -21,6 +21,7 @@ recon run --config my_scene.yaml --through fuse
 - [等价验收](docs/EQUIVALENCE.md) · [提取来源与历史验收](docs/EXTRACTION_REPORT.md)
 - [镜头设计、覆盖度审核与剪辑](docs/REEL.md)
 - [激光雷达参照与点云距离评测](docs/LIDAR_EVAL.md)
+- [重建场景中的策略评测（`recon sim`，英文）](docs/SIM.md)
 - [展示与复现避坑](docs/PITFALLS.md) · [第三方声明](../THIRD_PARTY_NOTICES.md)
 
 原创代码采用 [Apache-2.0](../LICENSE) 许可；VGGT-Omega 及其输出受上游研究用途许可约束。仓库不含模型权重和采集数据；网页查看器见 [viewer/](../viewer/README.md)。

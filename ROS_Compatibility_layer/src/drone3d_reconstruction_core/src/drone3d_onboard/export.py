@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 from .common import dump, digest
 from recon_core.ply import write_ply
-from .session import fuse_session
+from .session import frame_depth_scale, fuse_session
 
 
 def export_session(records_root, session_id, destination, capture_profile, max_points=1000000):
@@ -68,9 +68,11 @@ def export_session(records_root, session_id, destination, capture_profile, max_p
     window_list = []
     for win in windows:
         name = 'windows/%06d.npz' % win['window_id']
+        frame_scale = [frame_depth_scale(win['alignment'], k) for k in range(len(win['source']['frame_ids']))]
         with np.load(win['source']['prediction_uri'], allow_pickle=False) as f:
             np.savez_compressed(destination/name, depth=f['depth'], confidence=f['depth_conf'],
-                depth_scale=win['alignment']['depth_scale'], K=win['alignment']['intrinsics'],
+                depth_scale=win['alignment']['depth_scale'], frame_depth_scale=np.array(frame_scale, float),
+                K=win['alignment']['intrinsics'],
                 frame_ids=np.array(win['source']['frame_ids']), timestamp_ns=win['source']['timestamps_ns'],
                 owned_indices=win['alignment']['merge_frame_indices'])
         window_list.append(dict(window_id=win['window_id'], path=name, depth_scale=win['alignment']['depth_scale']))

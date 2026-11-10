@@ -22,12 +22,14 @@ def main():
     dist.add_argument('--cloud', required=True, type=Path)
     dist.add_argument('--reference', required=True, type=Path)
     dist.add_argument('--out', required=True, type=Path)
-    from .reel.cli import register, dispatch
-    register(commands)
+    from .reel import cli as reel
+    from .sim import cli as sim
+    reel.register(commands)
+    sim.register(commands)
     args=p.parse_args()
-    if args.command == 'reel':
+    if args.command in ('reel', 'sim'):
         try:
-            dispatch(args)
+            (reel if args.command == 'reel' else sim).dispatch(args)
         except (ImportError, ValueError, RuntimeError, FileNotFoundError) as exc:
             p.error(str(exc))
         return

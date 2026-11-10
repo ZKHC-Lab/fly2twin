@@ -115,10 +115,10 @@ kind 为 headline/title/label/number/endcard，全部 1920×1080 RGBA。Python �
 - headline、number：`text`；number 可给 `y`（默认 960）。
 - title：`text, sub=None, top=False`。
 - label：`items=[[text,x,y,anchor],...]`，anchor 为 la/ra/ma。
-- endcard：`name, tagline, url, logo=None`。
+- endcard：`name, tagline, url, logo=None, footer='开源'`；footer 是最后一行，可换成发布单位全称。
 - 通用 `style={font, font_index, background, accent}`；背景/强调色为 RGB 0–255。
 
-CLI 通用 `--font`、`--font-index`、`--background`、`--accent`；标题文字用 `--text`，片尾项目名也用 `--text`，另有 `--tagline`、`--url`、`--logo`。label 可用 `--items` JSON，未给时把 text 放在 (120,100)。
+CLI 通用 `--font`、`--font-index`、`--background`、`--accent`；标题文字用 `--text`，片尾项目名也用 `--text`，另有 `--tagline`、`--url`、`--logo`、`--footer`。label 可用 `--items` JSON，未给时把 text 放在 (120,100)。
 
 ## 分镜格式与剪辑
 

@@ -35,6 +35,7 @@ def register(commands):
     s.add_argument('--top', action='store_true')
     s.add_argument('--tagline', default='')
     s.add_argument('--url', default='')
+    s.add_argument('--footer', default='开源', help='Endcard last line')
     s.add_argument('--logo', type=Path)
     s.add_argument('--items', type=json.loads, help='Label [[text,x,y,anchor],...]')
     s.add_argument('--font', type=Path)
@@ -58,7 +59,7 @@ def dispatch(args):
         style = {k: data[k] for k in ('font', 'font_index', 'background', 'accent')}
         options = dict(style=style)
         if kind == 'endcard':
-            options.update(name=data['text'], tagline=data['tagline'], url=data['url'], logo=data['logo'])
+            options.update(name=data['text'], tagline=data['tagline'], url=data['url'], logo=data['logo'], footer=data['footer'])
         elif kind == 'label':
             options['items'] = data['items'] or [[data['text'], 120, 100, 'la']]
         else:

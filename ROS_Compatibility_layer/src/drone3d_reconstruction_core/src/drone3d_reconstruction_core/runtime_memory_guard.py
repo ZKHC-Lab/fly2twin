@@ -9,6 +9,10 @@ import time
 
 GIB = 1024 ** 3
 INTERVAL_SEC = 0.5
+# Swap growth only signals danger while available memory is also short. With
+# plenty available it is the kernel trading idle pages for page cache during
+# heavy writes (2026-10-29 / 11-03 replays: +1.2 GiB swap at 16-20 GB available).
+SWAP_PRESSURE_AVAILABLE_FRACTION = 0.25
 
 
 def read_memory():
@@ -16,9 +20,9 @@ def read_memory():
     with open('/proc/meminfo', encoding='ascii') as stream:
         for line in stream:
             key, _, value = line.partition(':')
-            if key in ('MemAvailable', 'SwapTotal', 'SwapFree'):
+            if key in ('MemTotal', 'MemAvailable', 'SwapTotal', 'SwapFree'):
                 values[key] = int(value.split()[0]) * 1024
-    return {'available_bytes': values['MemAvailable'],
+    return {'total_bytes': values['MemTotal'], 'available_bytes': values['MemAvailable'],
             'swap_used_bytes': values['SwapTotal'] - values['SwapFree']}
 
 
@@ -85,8 +89,9 @@ class MemoryGuardedController:
             try:
                 sample = self._probe()
                 growth = sample['swap_used_bytes'] - state['baseline']['swap_used_bytes']
+                pressure = sample['available_bytes'] < SWAP_PRESSURE_AVAILABLE_FRACTION * sample['total_bytes']
                 reason = ('available_memory_below_1_gib' if sample['available_bytes'] < GIB
-                          else 'job_swap_growth_above_1_gib' if growth > GIB else '')
+                          else 'job_swap_growth_above_1_gib' if growth > GIB and pressure else '')
             except Exception as error:
                 sample, growth = {}, 0
                 reason = 'memory_probe_failed:' + type(error).__name__
