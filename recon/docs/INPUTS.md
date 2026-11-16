@@ -51,10 +51,16 @@ For `video`, prepare calls the shared phone extractor using the `extract` mappin
 | `train.seed`, `train.resolution` | 42, [640,360] |
 | `train.steps` | Optional; default max(30000, nearest-1000(frame_count×60)) |
 | `train.depth_lambda`, `train.aniso_lambda` | 0.1, 0.1; BEST settings |
+| `train.pose_opt` | false; per training camera a right-composed SE(3) residual (translation + continuous 6D rotation), identity at start; test cameras are not optimised |
+| `train.pose_lr`, `train.pose_reg` | 1e-5, 1e-6; Adam learning rate (no decay) and weight of the squared 9-value residual of the current camera; translation in normalised scene units |
 | `eval.alignment_steps` | 200; use 200 for comparison with the reported protocol |
 | `threads` | 4 for training/evaluation CPU image operations |
 | `eval.omega_dir` | Optional phone-only historical `depth.npy`, `conf.npy`, `frame_ids.npy` prior; otherwise read raw depth-window new owners |
 | `dependency_revision` | Optional environment identifier included in the content fingerprint; change when external kernels change |
+
+With `train.pose_opt`, training also writes `optimized_poses.npz` (training `frame_ids` and world `c2w`, metric input stays metric) and stores the residuals with their frame IDs under `pose` in `final.pt`; when off, nothing is created and `pose` stays `None`.
+
+Pose optimisation does not replace landing BA (office_gs_04, 2935 training / 433 interpolation test frames, 30000 steps, BA test cameras; PSNR fixed → after the 200-step test pose fit): BA cameras 23.82 → 24.51 dB; LIO cameras 21.34 → 22.96; LIO + pose_opt at lr 1e-5 / reg 1e-6 21.48 → 24.13, i.e. it recovers about three quarters of the fitted-pose gap but stays 0.38 dB below BA; at lr 1e-4 / reg 1e-4 both LIO (18.75 → 21.79) and BA (18.74 → 21.88) cameras degrade badly. The LIO arms reused the BA-pose fused initial cloud and depth cache, which favours them. The optimised LIO rotations moved 0.17° median and stayed 0.64° from BA (0.72° before), so the residual mostly absorbs inconsistencies rather than recovering the BA cameras.
 
 YAML values under `pose`, `depth`, `train`, etc. are nested mappings. No model checkpoint, GPU lock, toolchain path or local dataset is defined in package source. Published example paths are placeholders and must be replaced; examples do not claim to contain a redistributable dataset.
 

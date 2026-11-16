@@ -195,7 +195,7 @@ If you find Fly2Twin useful in your research, please cite:
 ```bibtex
 @misc{fly2twin2026,
   title  = {Fly2Twin: Fly Once, Get a Trainable Digital Twin},
-  author = {Xu, Lu and {ZKHC}},
+  author = {Xu, Lu and Xu, Bin and {ZKHC}},
   year   = {2026},
   url    = {https://github.com/ZKHC-Lab/fly2twin}
 }
@@ -221,7 +221,7 @@ When using the differentiable flight module, please also cite:
 
 ## Acknowledgements
 
-Fly2Twin is developed and maintained by ZKHC (中科华创) and authored by Lu Xu. It builds on excellent open-source work:
+Fly2Twin is developed and maintained by ZKHC (中科华创). Author: Lu Xu. Project team: Bin Xu, Lu Xu. It builds on excellent open-source work:
 
 - [VGGT-Omega](https://github.com/facebookresearch/vggt) (Visual Geometry Group, University of Oxford; Meta AI) for dense depth;
 - [DiffPhysDrone](https://github.com/HenryHuYu/DiffPhysDrone) (Zhang et al., *Nature Machine Intelligence*, 2025), of which [DiffDrone-PyTorch3D](https://github.com/kirkchinese/Diffable_Drone_Pytorch3D) is a PyTorch3D reimplementation and extension;

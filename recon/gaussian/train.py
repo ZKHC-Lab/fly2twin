@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""BEST numerical loop: float32 cameras, shuffled epochs, no camera/appearance fitting."""
+"""BEST numerical loop: float32 cameras, shuffled epochs, optional camera fitting."""
 from dataclasses import asdict
 from functools import lru_cache
 import json
@@ -56,13 +56,18 @@ def train(data, out, folder, image, settings):
         return d, m
 
     splats, optimizers = initialize(data['points'], data['colors'], data['scene_scale'])
+    camera = None
+    if settings.get('pose_opt', False):
+        from .camera import CameraResidual
+        camera = CameraResidual(len(train_ids)).cuda()
+        camera_optimizer = torch.optim.Adam(camera.parameters(), lr=float(settings.get('pose_lr', 1e-5)))
     strategy = BaselineStrategy(**plan["strategy"], reset_at_zero=settings.get('reset_at_zero', False))
     strategy.check_sanity(splats, optimizers)
     state = strategy.initialize_state(scene_scale=data['scene_scale'])
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizers['means'], gamma=0.01 ** (1 / steps))
     config = dict(group=data['group'], camera_group=data['camera_group'], steps=steps, seed=seed,
                   resolution=[w, h], sh_degree=3, sh_degree_interval=plan["sh_interval"], packed=False,
-                  pose_opt=False, appearance='none', background='black', depth_source='Omega' if depth_lambda else 'none',
+                  pose_opt=camera is not None, appearance='none', background='black', depth_source='Omega' if depth_lambda else 'none',
                   rgb_loss='0.8 L1 + 0.2 (1-fused_ssim padding=valid)', depth_lambda=depth_lambda, depth_min_m=0.3, aniso_lambda=settings.get("aniso_lambda", .1),
                   depth_loss='1-Pearson(1/expected_optical_z_m,1/prior_depth_m), per frame',
                   prior_resize='native scaled depth bilinear; good nearest; finite 0.3<d<8 m',
@@ -93,7 +98,10 @@ def train(data, out, folder, image, settings):
         if depth_lambda:
             d, mask = prior(index)
             counts[int(data['frame_ids'][index])] = int(mask.sum())
-        prediction, _, info = render(splats, data['c2w'][index:index+1], data['K'][index:index+1],
+        pose = data['c2w'][index:index+1]
+        if camera is not None:
+            pose = camera(pose, [local])
+        prediction, _, info = render(splats, pose, data['K'][index:index+1],
                                      w, h, degree=min(step // plan["sh_interval"], 3), depth=bool(depth_lambda))
         strategy.step_pre_backward(splats, optimizers, state, step, info)
         rgb = prediction[..., :3]
@@ -110,7 +118,12 @@ def train(data, out, folder, image, settings):
             depth_loss = 1 - corr
         aniso_loss = anisotropy(splats["scales"])
         loss = rgb_loss + depth_lambda * depth_loss + settings.get("aniso_lambda", .1) * aniso_loss
+        if camera is not None:
+            loss = loss + float(settings.get('pose_reg', 1e-6)) * camera.values[local].square().sum()
         loss.backward()
+        if camera is not None:
+            camera_optimizer.step()
+            camera_optimizer.zero_grad(set_to_none=True)
         for optimizer in optimizers.values():
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
@@ -131,6 +144,13 @@ def train(data, out, folder, image, settings):
                  max_frame_visits=int(visits.max()), **memory_stats())
     dump(out / 'train_stats.json', stats)
     dump(out / 'prior_pixels.json', counts)
-    torch.save(dict(splats={k: v.detach().cpu() for k, v in splats.items()}, pose=None, affine=None,
+    pose_state = None
+    if camera is not None:
+        with torch.no_grad():
+            optimized = camera(data['c2w'][train_ids], slice(None)).cpu().numpy()
+        optimized[:, :3, 3] = optimized[:, :3, 3] * data['meters_per_unit'] + np.asarray(data['center'])
+        np.savez(out / 'optimized_poses.npz', frame_ids=data['frame_ids'][train_ids], c2w=optimized)
+        pose_state = dict(values=camera.values.detach().cpu(), frame_ids=data['frame_ids'][train_ids])
+    torch.save(dict(splats={k: v.detach().cpu() for k, v in splats.items()}, pose=pose_state, affine=None,
                     config=config, stats=stats), out / 'final.pt')
     np.savez(out / 'train_visits.npz', frame_ids=data['frame_ids'][train_ids], visits=visits)

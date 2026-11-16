@@ -195,7 +195,7 @@ fly2twin/
 ```bibtex
 @misc{fly2twin2026,
   title  = {Fly2Twin: Fly Once, Get a Trainable Digital Twin},
-  author = {Xu, Lu and {ZKHC}},
+  author = {Xu, Lu and Xu, Bin and {ZKHC}},
   year   = {2026},
   url    = {https://github.com/ZKHC-Lab/fly2twin}
 }
@@ -221,7 +221,7 @@ fly2twin/
 
 ## 致谢
 
-飞境由中科华创（ZKHC）开发并维护，作者徐路。它建立在以下优秀的开源工作之上：
+飞境由中科华创（ZKHC）开发并维护。作者：徐路；项目团队：许彬、徐路。它建立在以下优秀的开源工作之上：
 
 - [VGGT-Omega](https://github.com/facebookresearch/vggt)（牛津大学 VGG 组；Meta AI）：稠密深度；
 - [DiffPhysDrone](https://github.com/HenryHuYu/DiffPhysDrone)（Zhang et al., *Nature Machine Intelligence*, 2025）：[DiffDrone-PyTorch3D](https://github.com/kirkchinese/Diffable_Drone_Pytorch3D) 是它的 PyTorch3D 复现与扩展；
