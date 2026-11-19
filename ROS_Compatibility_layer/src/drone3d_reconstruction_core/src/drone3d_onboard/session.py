@@ -83,13 +83,25 @@ def load_session(records, cache, require_complete=True):
     return rows, windows, depth, good
 
 
-def fuse_session(records, cache, max_points=1000000, require_complete=True):
+def fuse_session(records, cache, max_points=1000000, require_complete=True, revisit=False):
+    """``revisit``: correct the frame scales with surfaces other windows saw again (recon_core.revisit)
+    before fusing; the cached depth is rewritten and every row gets ``revisit_log_scale``."""
     rows, windows, depth, good = load_session(records, cache, require_complete)
     ids = np.arange(len(rows))
-    xyz, rgb, info = colored_cloud(ids, np.array([r['c2w'] for r in rows]),
-        np.array([r['K'] for r in rows]), depth, good,
+    poses, K = np.array([r['c2w'] for r in rows]), np.array([r['K'] for r in rows])
+    summary = None
+    if revisit:
+        from recon_core.revisit import frame_log_scale_corrections
+        corrections, summary = frame_log_scale_corrections(poses, K, depth, good, np.array([r['window_id'] for r in rows]))
+        for i, row in enumerate(rows):
+            depth[i] = depth[i] * np.float32(np.exp(corrections[i]))
+            row['revisit_log_scale'] = float(corrections[i])
+        depth.flush()
+    xyz, rgb, info = colored_cloud(ids, poses, K, depth, good,
         {str(i): r['image_path'] for i, r in enumerate(rows)}, max_points)
     info['frames_without_pose'] = sum(len(w['unposed']) for w in windows)
+    if summary is not None:
+        info['revisit'] = summary
     return xyz, rgb, info, rows, windows
 
 

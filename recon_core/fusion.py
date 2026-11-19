@@ -115,6 +115,37 @@ def frame_points(i, poses, K, depth, good, neighbors):
     return world.reshape(H, W, 3)[::2, ::2][keep], keep
 
 
+def supported_points(i, poses, K, depth, good, neighbors, rows, cols):
+    """The multiview check of ``frame_points`` for the pixels (rows, cols) of frame ``i`` only.
+
+    Returns (xyz float64 of the pixels that pass, keep mask over the given pixels): the
+    decisions ``frame_points`` takes for those pixels, at a cost proportional to their number.
+    """
+    depth_i = np.asarray(depth[i])
+    H, W = depth_i.shape
+    d, n = depth_i[rows, cols], len(rows)
+    Ki = K[i]
+    ray = np.stack([(cols-Ki[0, 2])/Ki[0, 0], (rows-Ki[1, 2])/Ki[1, 1], np.ones(n)], -1)
+    world = (ray * d[:, None]) @ poses[i, :3, :3].T + poses[i, :3, 3]
+    support, seen = np.zeros(n, np.int16), np.zeros(n, np.int16)
+    for j in neighbors[i]:
+        depth_j = depth[j]
+        xyz = (world-poses[j, :3, 3]) @ poses[j, :3, :3]
+        z = xyz[:, 2]
+        front = z > 0.1
+        uu, vv = np.full(n, -1, int), np.full(n, -1, int)
+        uu[front] = np.rint(K[j, 0, 0]*xyz[front, 0]/z[front] + K[j, 0, 2]).astype(int)
+        vv[front] = np.rint(K[j, 1, 1]*xyz[front, 1]/z[front] + K[j, 1, 2]).astype(int)
+        inside = front & (uu >= 0) & (uu < W) & (vv >= 0) & (vv < H)
+        observed = np.full(n, np.nan)
+        observed[inside] = depth_j[vv[inside], uu[inside]]
+        seen += inside
+        support += inside & (np.abs(np.log(np.maximum(observed, 1e-6)/np.maximum(z, 1e-6))) < SUPPORT_LOG_RATIO)
+    keep = np.asarray(good[i])[rows, cols] & (support >= np.minimum(2, np.maximum(seen, 1)))
+    keep &= (d > DEPTH_RANGE_M[0]) & (d < DEPTH_RANGE_M[1])
+    return world[keep], keep
+
+
 def frame_image(path, H, W):
     """BGR image resized to the depth grid, stride 2 (uint8), for point colours."""
     import cv2

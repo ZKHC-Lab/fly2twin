@@ -48,6 +48,7 @@ For `video`, prepare calls the shared phone extractor using the `extract` mappin
 | `depth.resolution` | [512,288]; first component sets inference long edge; both components must match actual model/cache output |
 | `depth.first_window`, `depth.new_frames`, `depth.overlap` | 40, 30, 10; V1.0 window planning below |
 | `fusion.max_points` | 300000; permitted range 4..1000000 |
+| `fusion.revisit` | false; true corrects every training frame's depth scale with surfaces that other windows also saw ([recon_core](../../recon_core/README.md), `revisit.py`) before fusing. The cached metric depth and `scales.npz` then include the correction, `scales.npz` gains `revisit_log_scale` and `report.json` a `revisit` summary. Absent or false reproduces earlier outputs exactly |
 | `train.seed`, `train.resolution` | 42, [640,360] |
 | `train.steps` | Optional; default max(30000, nearest-1000(frame_count×60)) |
 | `train.depth_lambda`, `train.aniso_lambda` | 0.1, 0.1; BEST settings |

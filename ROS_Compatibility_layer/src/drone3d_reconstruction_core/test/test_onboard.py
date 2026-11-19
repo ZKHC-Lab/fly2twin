@@ -59,17 +59,24 @@ class OnboardTests(unittest.TestCase):
             image=root/'image.png'; cv2.imwrite(str(image),np.full((720,1280,3),127,np.uint8))
             pred=root/'pred.npz'; np.savez(pred,depth=np.ones((1,16,16,1)),depth_conf=np.ones((1,16,16)))
             K=np.array([[900.,0,640],[0,900,360],[0,0,1.]])
-            row=dict(frame_id='source0',timestamp_ns=123,image_path=str(image),c2w=np.eye(4),K=K,camera_info={'K':K.ravel().tolist(),'D':[0.]*5,'width':1280,'height':720})
+            row=dict(frame_id='source0',timestamp_ns=123,image_path=str(image),c2w=np.eye(4),K=K,camera_info={'K':K.ravel().tolist(),'D':[0.]*5,'width':1280,'height':720},revisit_log_scale=.02)
             ext=dict(translation=[.056558,-.006717,-.077751],rotation=Rotation.from_quat([-.494176,.506142,-.498990,.500618]).as_matrix().tolist())
-            win=dict(window_id=0,source=dict(body_from_camera=ext,prediction_uri=str(pred),frame_ids=['source0'],timestamps_ns=[123]),alignment=dict(depth_scale=2.,intrinsics=K.tolist(),merge_frame_indices=[0]))
+            win=dict(window_id=0,source=dict(body_from_camera=ext,prediction_uri=str(pred),frame_ids=['source0'],timestamps_ns=[123]),alignment=dict(depth_scale=2.,intrinsics=K.tolist(),merge_frame_indices=[0]),selected=[(0,0)])
             result=(np.array([[1.,2.,3.]]),np.array([[1.,0.,0.]]),{},[row],[win])
             with patch('drone3d_reconstruction_core.continuous_web._formal_records_for',return_value=[]), patch('drone3d_onboard.export.fuse_session',return_value=result):
                 manifest=export_session(records,sid,root/'delivery',capture)
                 with self.assertRaises(FileExistsError):export_session(records,sid,root/'delivery',capture)
+                export_session(records,sid,root/'plain',capture,revisit=False)
             self.assertEqual(manifest['pose_time_offset_stage'],'capture')
             self.assertEqual(cv2.imread(str(root/'delivery/keyframes/000000.jpg')).shape,(720,1280,3))
             for name,value in manifest['hashes'].items():self.assertEqual(digest(root/'delivery'/name),value)
-            with np.load(root/'delivery/poses.npz') as data:np.testing.assert_array_equal(data['c2w'],np.eye(4)[None])
+            with np.load(root/'delivery/poses.npz') as data:
+                np.testing.assert_array_equal(data['c2w'],np.eye(4)[None])
+                np.testing.assert_array_equal(data['revisit_log_scale'],[.02])
+            # The owned frame's exported scale carries the revisit correction; without the step nothing is added.
+            with np.load(root/'delivery/windows/000000.npz') as data:np.testing.assert_allclose(data['frame_depth_scale'],[2.*np.exp(.02)],rtol=1e-15)
+            with np.load(root/'plain/windows/000000.npz') as data:np.testing.assert_array_equal(data['frame_depth_scale'],[2.])
+            with np.load(root/'plain/poses.npz') as data:self.assertNotIn('revisit_log_scale',data.files)
 
     def test_session_skips_frames_without_localization(self):
         from types import SimpleNamespace
@@ -160,6 +167,16 @@ class OnboardTests(unittest.TestCase):
                     self.assertLess(abs(info['points_2cm'] - ref_info['points_2cm']), .2 * ref_info['points_2cm'])
                     self.assertLess(cKDTree(ref_xyz).query(xyz)[0].max(), .02 * 3 ** .5)
                     self.assertLess(cKDTree(xyz).query(ref_xyz)[0].max(), .02 * 3 ** .5)
+                # Delivery fusion with the revisit step: every row carries its correction and the cached depth includes it.
+                _, _, plain_info, plain_rows, _ = fuse_session(records, root / 'plain', 0, False)
+                plain = np.array(np.load(root / 'plain/depth_m.npy'))
+                _, _, revisit_info, revisit_rows, _ = fuse_session(records, root / 'revisit', 0, False, True)
+                corrections = np.array([r['revisit_log_scale'] for r in revisit_rows])
+                self.assertNotIn('revisit', plain_info)
+                self.assertNotIn('revisit_log_scale', plain_rows[0])
+                self.assertEqual(revisit_info['revisit']['frames'], len(revisit_rows))
+                np.testing.assert_allclose(np.load(root / 'revisit/depth_m.npy'),
+                                           plain * np.exp(corrections)[:, None, None].astype(np.float32), rtol=1e-6)
                 # Default tolerance 0.5 %: a 0.2 % rescale reuses every frame, 1 % does not.
                 tolerant.fuse(records[:3])
                 for scale, expect_reuse in ((1.1 * 1.002, True), (1.1 * 1.01, False)):

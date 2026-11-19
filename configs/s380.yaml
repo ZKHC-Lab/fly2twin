@@ -32,6 +32,7 @@ depth:
   overlap: 10
 fusion:
   max_points: 300000
+  revisit: true
 train:
   seed: 42
   resolution: [640, 360]

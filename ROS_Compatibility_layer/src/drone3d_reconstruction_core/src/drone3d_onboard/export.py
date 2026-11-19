@@ -8,7 +8,7 @@ from recon_core.ply import write_ply
 from .session import frame_depth_scale, fuse_session
 
 
-def export_session(records_root, session_id, destination, capture_profile, max_points=1000000):
+def export_session(records_root, session_id, destination, capture_profile, max_points=1000000, revisit=True):
     import cv2
     import yaml
     from drone3d_reconstruction_core.continuous_web import _formal_records_for
@@ -27,7 +27,7 @@ def export_session(records_root, session_id, destination, capture_profile, max_p
     records = _formal_records_for(session_id, Path(records_root))
     destination.mkdir(parents=True)
     # manifest is the completion marker; failures never publish a valid package.
-    xyz, rgb, fusion, rows, windows = fuse_session(records, destination/'cache', max_points)
+    xyz, rgb, fusion, rows, windows = fuse_session(records, destination/'cache', max_points, revisit=revisit)
     (destination/'keyframes').mkdir()
     (destination/'windows').mkdir()
     # One fixed camera: a frame whose CameraInfo was not associated at capture uses the shared one.
@@ -64,11 +64,15 @@ def export_session(records_root, session_id, destination, capture_profile, max_p
         if e is None or not np.allclose(e['translation'], ext['translation'], atol=2e-6, rtol=0) or not np.allclose(e['rotation'], ext['rotation'], atol=2e-6, rtol=0):
             raise ValueError('Body-from-camera extrinsic changes within the session')
     np.savez(destination/'poses.npz', frame_ids=np.arange(len(rows)), timestamp_ns=np.array(stamps, np.int64),
-        c2w=np.array(poses), K=np.array(Ks), blur=np.array(blur))
+        c2w=np.array(poses), K=np.array(Ks), blur=np.array(blur),
+        **({'revisit_log_scale': np.array([r['revisit_log_scale'] for r in rows])} if revisit else {}))
     window_list = []
     for win in windows:
         name = 'windows/%06d.npz' % win['window_id']
         frame_scale = [frame_depth_scale(win['alignment'], k) for k in range(len(win['source']['frame_ids']))]
+        if revisit:   # owned frames carry the correction, like cache/depth_m.npy; shared frames keep the solved scale
+            for row, k in win['selected']:
+                frame_scale[k] *= float(np.exp(rows[row]['revisit_log_scale']))
         with np.load(win['source']['prediction_uri'], allow_pickle=False) as f:
             np.savez_compressed(destination/name, depth=f['depth'], confidence=f['depth_conf'],
                 depth_scale=win['alignment']['depth_scale'], frame_depth_scale=np.array(frame_scale, float),
@@ -97,6 +101,7 @@ def main():
     p.add_argument('--output', required=True, type=Path)
     p.add_argument('--capture-profile', required=True, type=Path)
     p.add_argument('--max-points', type=int, default=1000000)
+    p.add_argument('--no-revisit', action='store_true', help='Keep the frame scales of the last revision (skip recon_core.revisit)')
     p.add_argument('--wait-stop-service', help='Optional ROS service: export automatically after this session reaches STOPPED')
     p.add_argument('--wait-timeout-sec', type=float, default=86400.)
     args = p.parse_args()
@@ -117,7 +122,7 @@ def main():
             if rospy.is_shutdown() or time.monotonic() >= deadline:
                 raise TimeoutError('Session did not reach STOPPED before export deadline')
             time.sleep(1)
-    export_session(args.records_root, args.session, args.output, args.capture_profile, args.max_points)
+    export_session(args.records_root, args.session, args.output, args.capture_profile, args.max_points, not args.no_revisit)
 
 
 if __name__ == '__main__':

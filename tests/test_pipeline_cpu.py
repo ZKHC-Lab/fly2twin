@@ -4,9 +4,8 @@ import numpy as np
 import pytest
 
 
-def test_pipeline_fuse_and_cache(tmp_path):
-    cv2=pytest.importorskip('cv2')
-    from recon.pipeline import run
+def scene(tmp_path,cv2,windows=None):
+    """Nine frames 0.2 m apart in front of a wall 2 m away; frame 7 is held out. Returns the config."""
     n,w,h=9,64,48
     ids=np.arange(101,101+n)
     poses=np.tile(np.eye(4),(n,1,1));poses[:,0,3]=np.arange(n)*.2
@@ -18,13 +17,22 @@ def test_pipeline_fuse_and_cache(tmp_path):
         rows.append(dict(frame_id=int(frame),timestamp_ns=int(i*200_000_000),path=str(path)))
     manifest=tmp_path/'manifest.json';manifest.write_text(json.dumps(dict(resolution=[w,h],K=K.tolist(),frames=rows)))
     cameras=tmp_path/'cameras.npz';np.savez(cameras,frame_ids=ids,c2w=poses,K=np.tile(K,(n,1,1)))
-    cache=tmp_path/'depth';cache.mkdir();(cache/'first').mkdir()
-    (cache/'windows.json').write_text(json.dumps(dict(windows=[dict(id='first',idx=ids.tolist(),new=ids.tolist())])))
+    cache=tmp_path/'depth';cache.mkdir()
+    windows=windows or [('first',np.arange(n),np.arange(n))]
+    (cache/'windows.json').write_text(json.dumps(dict(windows=[dict(id=name,idx=ids[idx].tolist(),new=ids[new].tolist()) for name,idx,new in windows])))
     extrinsics=np.linalg.inv(poses)[:,:3]
-    np.savez(cache/'first/prediction.npz',depth=np.full((n,h,w,1),2.,np.float32),
-             depth_conf=np.tile(np.arange(h*w,dtype=np.float32).reshape(h,w),(n,1,1)),extrinsic=extrinsics)
-    cfg=dict(manifest=str(manifest),cameras=str(cameras),output=str(tmp_path/'output'),
-             pose={'provider':'external','refine':'none','units':'meters'},depth={'cache':str(cache),'resolution':[w,h]})
+    for name,idx,_ in windows:
+        (cache/name).mkdir()
+        np.savez(cache/name/'prediction.npz',depth=np.full((len(idx),h,w,1),2.,np.float32),
+                 depth_conf=np.tile(np.arange(h*w,dtype=np.float32).reshape(h,w),(len(idx),1,1)),extrinsic=extrinsics[idx])
+    return dict(manifest=str(manifest),cameras=str(cameras),output=str(tmp_path/'output'),
+                pose={'provider':'external','refine':'none','units':'meters'},depth={'cache':str(cache),'resolution':[w,h]})
+
+
+def test_pipeline_fuse_and_cache(tmp_path):
+    cv2=pytest.importorskip('cv2')
+    from recon.pipeline import run
+    cfg=scene(tmp_path,cv2)
     root=run(cfg,through='fuse')
     report=json.loads((root/'fuse/report.json').read_text())
     assert report['frame_count']==8 and report['populated_slots']==8 and report['points']>=4
@@ -35,6 +43,23 @@ def test_pipeline_fuse_and_cache(tmp_path):
     # Artifact corruption is not silently accepted, even when inputs have not changed.
     (root/'fuse/report.json').write_text('{}')
     with pytest.raises(RuntimeError,match='artifact changed'):run(cfg,through='fuse')
+
+
+def test_fuse_with_revisit_keeps_cache_scales_and_report_consistent(tmp_path):
+    cv2=pytest.importorskip('cv2')
+    from recon.pipeline import run
+    two=[('K000',np.arange(6),np.arange(6)),('K001',np.arange(3,9),np.arange(6,9))]
+    (tmp_path/'plain').mkdir();(tmp_path/'revisit').mkdir()
+    plain=run(scene(tmp_path/'plain',cv2,two),through='fuse')
+    cfg=scene(tmp_path/'revisit',cv2,two);cfg['fusion']={'revisit':True}
+    root=run(cfg,through='fuse')
+    report=json.loads((root/'fuse/report.json').read_text())
+    assert report['revisit']['frames']==8 and report['revisit']['windows']==2 and 'revisit' not in json.loads((plain/'fuse/report.json').read_text())
+    with np.load(root/'fuse/scales.npz') as z, np.load(plain/'fuse/scales.npz') as old:
+        assert 'revisit_log_scale' not in old.files and z['revisit_log_scale'].shape==(8,)
+        np.testing.assert_allclose(z['scales'],old['scales']*np.exp(z['revisit_log_scale']),rtol=1e-12)
+        factor=np.ones(9);factor[np.searchsorted(np.arange(101,110),z['frame_ids'])]=np.exp(z['revisit_log_scale'])
+    np.testing.assert_allclose(np.load(root/'fuse/cache/depth_m.npy'),np.load(plain/'fuse/cache/depth_m.npy')*factor[:,None,None].astype(np.float32),rtol=1e-6)
 
 
 def test_blur_uses_candidates_before_keyframe_thinning(tmp_path,monkeypatch):

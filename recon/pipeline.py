@@ -223,12 +223,25 @@ def fuse(cfg,out,root):
     sw,sh=data['manifest']['resolution']
     cap=int(cfg.get('fusion',{}).get('max_points',300000))
     if not 4<=cap<=1000000: raise ValueError('Initialization cap must be 4..1000000')
-    xyz,rgb,info=colored_cloud(train_ids,poses[train],resize_K(K[train],width,height,sw,sh),depths[train],good[train],paths,max_points=cap)
+    Kd,depth_train,good_train=resize_K(K[train],width,height,sw,sh),depths[train],good[train]
+    extra,revisit={},None
+    if cfg.get('fusion',{}).get('revisit',False):
+        # Surfaces seen again by other windows: one more scale factor per frame (recon_core.revisit); the cache keeps the corrected depth.
+        from recon_core.revisit import frame_log_scale_corrections
+        owner=np.full(len(ids),-1)
+        for k,win in enumerate(retained): owner[np.searchsorted(ids,win['new'])]=k
+        corrections,revisit=frame_log_scale_corrections(poses[train],Kd,depth_train,good_train,owner[train])
+        factor=np.exp(corrections)
+        depth_train*=factor[:,None,None].astype(np.float32)
+        for row,d,f in zip(train,depth_train,factor): depths[row]=d;frame_scales[row]*=f
+        depths.flush();extra=dict(revisit_log_scale=corrections)
+    xyz,rgb,info=colored_cloud(train_ids,poses[train],Kd,depth_train,good_train,paths,max_points=cap)
     if len(xyz)<4: raise ValueError('Insufficient fused points')
     np.savez(out/'initial.npz',points=xyz.astype(np.float32),colors=rgb.astype(np.float32))
-    np.savez(out/'scales.npz',frame_ids=train_ids,scales=frame_scales[train],window_scales=scales)
+    np.savez(out/'scales.npz',frame_ids=train_ids,scales=frame_scales[train],window_scales=scales,**extra)
     dump(out/'report.json',dict(frame_count=len(train),depth_slots=len(ids),populated_slots=int(np.any(good,axis=(1,2)).sum()),
-         points_at_2cm=info['points_2cm'],points=info['points'],voxel_m=info['voxel_m'],window_scales=scales.tolist(),trajectory=trajectory,edges=edges))
+         points_at_2cm=info['points_2cm'],points=info['points'],voxel_m=info['voxel_m'],window_scales=scales.tolist(),trajectory=trajectory,edges=edges,
+         **({} if revisit is None else dict(revisit=revisit))))
 
 
 def load_data(cfg,root,init=False):

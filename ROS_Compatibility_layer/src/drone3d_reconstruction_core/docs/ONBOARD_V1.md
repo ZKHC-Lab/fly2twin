@@ -144,14 +144,16 @@ python3 -m drone3d_onboard.export \
   --capture-profile /absolute/capture.yaml --output /absolute/session_delivery
 ```
 
+导出默认先做回访约束（[recon_core](../../../../recon_core/README.md) 的 `revisit.py`）：用别的窗口也看到的同一处表面（相邻窗口，或隔一段时间从别处再次看到），给每帧再解一个深度尺度修正量，然后才融合。只改深度尺度，不改位姿；与别的窗口没有共同表面的帧保持原尺度。`--no-revisit` 关闭这一步：点云、深度缓存和各数组与此前的导出相同，`poses.npz` 不含 `revisit_log_scale`。在线点云（`SessionFusion`）不做这一步。
+
 会话 STOP 后执行。也可提前运行同一命令并增加 `--wait-stop-service /continuous_session/command`：仅在指定会话进入 STOPPED 后自动导出，会话 ID 改变或超时则失败。普通导出不依赖 ROS master；等待模式才依赖 ROS。
 
 交付目录包括：
 
 - `manifest.json`：版本 1、米制 Z-up、c2w 约定、新外参、偏移位置/取值、全尺寸 CameraInfo（含畸变）、采集参数、窗口清单和 SHA-256。
 - `keyframes/NNNNNN.jpg`：CameraInfo 分辨率的原尺寸图像（本机台架为 1280×720），JPEG q95。
-- `poses.npz`：`frame_ids`（交付包连续编号）、`timestamp_ns`、`c2w`（Nx4x4）、`K`（Nx3x3）、`blur`。原会话帧 ID 在 manifest 的 `source_frame_id` 中保留。
-- `windows/NNNNNN.npz`：每窗原始 Omega `depth` / `confidence`、`depth_scale`、`frame_depth_scale`（每模型帧一个；没有逐帧尺度时等于窗口尺度）、模型分辨率 K、原帧 ID、时间、拥有帧索引。米制深度为原始深度乘该帧尺度，不乘第二次 gauge。
+- `poses.npz`：`frame_ids`（交付包连续编号）、`timestamp_ns`、`c2w`（Nx4x4）、`K`（Nx3x3）、`blur`、`revisit_log_scale`（每帧的回访修正量，对数尺度；`--no-revisit` 时没有这个数组）。原会话帧 ID 在 manifest 的 `source_frame_id` 中保留。
+- `windows/NNNNNN.npz`：每窗原始 Omega `depth` / `confidence`、`depth_scale`、`frame_depth_scale`（每模型帧一个；没有逐帧尺度时等于窗口尺度；本窗拥有的帧已乘上回访修正量，与 `cache/depth_m.npy` 相差不超过 float32 舍入；与上一窗共享的帧和 `depth_scale` 保持求解出的尺度）、模型分辨率 K、原帧 ID、时间、拥有帧索引。米制深度为原始深度乘该帧尺度，不乘第二次 gauge。
 - `cloud.ply`：NumPy 写入的二进制 little-endian XYZ float32、RGB uint8；米制、Z-up，不引入 plyfile。
 - `cache/depth_m.npy`、`good.npy`：同帧序的米制深度与过滤前基础掩码，可用于复核融合和未体素化观测评测。
 
