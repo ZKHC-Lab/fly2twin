@@ -29,13 +29,15 @@ bash src/drone3d_reconstruction_core/scripts/nx_step2_bringup.sh
 第 6 步前会自动执行 `continuous_production_preflight.py`（ROS master + CUDA + checkpoint digest）。
 加 `--no-web` 可以不开 Web；路径可用 `--step2-root` / `--workspace` 覆盖。
 
+一键脚本的生产栈按台架配置运行：640×480、16 帧窗、G4 图配准。机载主线（1280×720、40 帧窗、逐帧位姿放置）的配置见 [机载融合与交付包](ONBOARD_V1.md) 第 1 节，目前只在 bag 回放中验证过，还没有接入一键脚本。
+
 ## 滑窗运行与验收
 
-滑窗使用 `per_window`，配置 `initial_overlap_frames` 或通过 Web/ROS 设置 `overlap_frames`。首窗采集 N 帧，后续复用前窗尾部 O 帧并采集 N−O 帧；不执行视觉配准，也不预留配准接口。增量模式要求开启 `odom_local_enabled`，使用里程计 Sim(3) 对齐；里程计不可用时输出 `MODEL_LOCAL_UNALIGNED`，不加入累计地图。
+滑窗使用 `per_window`（要求 `odom_local_enabled: true`），配置 `initial_overlap_frames` 或通过 Web/ROS 设置 `overlap_frames`。首窗采集 N 帧，后续复用前窗尾部 O 帧并采集 N−O 帧。窗口放置由 `alignment_backend` 决定：默认 `global_g4`（见 [G4 接入](G4_INTEGRATION.md)，主线是其中的逐帧位姿放置）；旧的 `odom_pose_constrained_sim3` 不做视觉配准，按里程计 Sim(3) 对齐，里程计不可用时输出 `MODEL_LOCAL_UNALIGNED`，不加入累计地图。
 
 运行中 `lossless_fifo` 达到 `queue_capacity` 水位后暂停新采集，消费释放容量后恢复；已启动采集和重试保留。暂停期间到达的图像全部丢失，交付包和落地 BA 也就缺了这一段，因此模板默认容量为 1000，实际只受 `min_free_disk_gb` 磁盘红线限制：重建慢于采集时，积压的窗口留在磁盘上排队。2026-11-03 NX 实测（15W，384 / 40 帧窗）：每窗处理中位 52.5 s（GPU 推理 38 s），新窗口每 15.8 s 一个，10 分钟积压 27 窗；去掉每窗重复的权重哈希后每窗约 42 s。落地后按 STOP：采集立即停止，会话进入 `DRAINING`，把排队窗口重建完、等 G4 发布完整地图后自动停下（2026-11-03 起；之前的版本 STOP 会删除所有还没重建的窗口）。处理积压期间 Web 按钮变为“立即停止”，再按一次会丢弃剩余窗口。2026-11-03 本机回放加写盘压力时，重建降到约 40–50 s/窗，容量 8 的队列填满，窗口之间出现 15–48 s 的采集空档。`realtime_latest` 跳过等待窗口时保留各窗口采集时的帧序列，不按重建结果重新拼帧。通过 `set_overlap_frames(N)` 修改复用帧数，从下一窗口生效；0 表示独立采集。v4 合成输入保留相机参数、odom、TF 和可选传感器深度。
 
-5 FPS、100 帧、20 帧重叠对应持续约 16 s/窗的名义预算。日志 `window_service_timing` 的 `service_wall_time_sec` 覆盖每次消费的推理、里程计对齐、校验、发布与正常清理；`service_budget_sec` 是该窗口冻结参数对应的名义产窗间隔。还需检查 FIFO 最老等待时间；满载暂停不代表硬件已达到 5 FPS 连续建图吞吐。重叠窗口可以产出正式局部结果，跨窗口坐标由可用的里程计独立约束。
+例如按 5 FPS 时间采样、40 帧窗、5 帧共享时，名义产窗间隔约 7 s；开启运动关键帧后按实际选帧间隔计。日志 `window_service_timing` 的 `service_wall_time_sec` 覆盖每次消费的推理、里程计对齐、校验、发布与正常清理；`service_budget_sec` 是该窗口冻结参数对应的名义产窗间隔。还需检查 FIFO 最老等待时间；满载暂停不代表硬件已达到 5 FPS 连续建图吞吐。重叠窗口可以产出正式局部结果，跨窗口坐标由可用的里程计独立约束。
 
 ## 帧数池模式
 
@@ -78,7 +80,7 @@ bash src/drone3d_reconstruction_core/scripts/nx_step2_bringup.sh \
 
 ## 录制离线重建数据（3DGS 用）
 
-只起传感器和 TF，不起生产栈，录原始 bag 回本机处理。生产栈的配置按 640×480 写，换彩色分辨率时脚本要求同时加
+只起传感器和 TF，不起生产栈，录原始 bag 回本机处理。一键脚本的生产栈配置按 640×480 写（台架配置；主线的 1280×720 配置见 [机载融合与交付包](ONBOARD_V1.md)），换彩色分辨率时脚本要求同时加
 `--no-production`。
 
 ```bash
@@ -113,7 +115,7 @@ bash $S/nx_record.sh --name office_gs_02    # Ctrl-C 停止，默认存到 ~/bag
 | 彩色分辨率 | 1280×720 | testflight3 为 640×480，3DGS 训练视角只到约 25 dB；同一办公室手机视频（960×540）在相机一致的局部片段上训练视角 33–40 dB。本机 flight-out2 已在该无人机上以 1280×720 录到 29.8 Hz（同时有对齐深度） |
 | 帧率 | 30 fps | 自动曝光的最长曝光受帧间隔限制：15 fps 下可到 66 ms，30 fps 下 33 ms |
 | 曝光 | 手动 10 ms | 旋转拖影 ≈ 角速度 × 曝光 × 焦距，1280×720 焦距约 906 px。转向不超过 10°/s 时 10 ms 拖影约 1.6 px |
-| 增益 | 96 | 台架实测亮度中位（testflight3 为 123）：5 ms 时增益 64 为 42、128 为 71；8 ms、128 为 90；10 ms 时增益 64 为 65、128 为 103；自动曝光为 137。增益 128 时白墙上可见颗粒噪声；10 ms、96 预计约 85。`camera_check.py` 亮度低于 80 时把增益提到 128 |
+| 增益 | 96 | 台架实测亮度中位（testflight3 为 123）：5 ms 时增益 64 为 42、128 为 71；8 ms、128 为 90；10 ms 时增益 64 为 65、128 为 103；自动曝光为 137。增益 128 时白墙上可见颗粒噪声；10 ms、96 预计约 85。`camera_check.py` 报出的亮度低于 80 时，手动把增益提到 128 |
 | 飞行 | 转向不超过约 20°/s | 两次办公室录制合并，按测试帧角速度分档的 3DGS PSNR（固定位姿）：< 5°/s 24.3 dB（11 帧）、5–10 23.5、10–20 23.5、20–40 22.6、≥ 40 21.8 dB。20°/s 以下基本持平 |
 
 台架验证（2026-10-16，realsense2_camera 2.3.2 / librealsense 2.50，相机接 USB 3.0）：`/camera/rgb_camera` 的
@@ -173,5 +175,4 @@ kill -INT "$pid"
 
 - `reconstruct_profile.yaml` 里 `warm_worker_enabled: true`，模型跨窗口常驻。
 - warm worker 进程日志：`<step2-root>/worker_results/.warm-worker.log`。
-- 常驻模型约占 4.3 GB RSS，因此该 profile 的 `min_mem_available_bytes` 已调到 3.5 GiB；资源闸门逻辑本身不变，每个窗口仍会真实采样判定。
-- `single_nx20_continuous_profile_signed` 必须保持 `false`，一键脚本不会改动它。
+- 常驻模型约占 4.3 GB RSS，因此该 profile 的 `min_mem_available_bytes` 已调到 3 GiB；资源闸门逻辑本身不变，每个窗口仍会真实采样判定。

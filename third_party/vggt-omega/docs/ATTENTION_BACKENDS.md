@@ -15,10 +15,10 @@
 
 ```bash
 export CUDA_HOME=/usr/local/cuda
-python -I vggt-omega/tools/build_flash_attention.py \
+python -I third_party/vggt-omega/tools/build_flash_attention.py \
   --source /absolute/path/to/flash-attention-v1.0.9 \
   --cutlass /absolute/path/to/cutlass-319a389 \
-  --build /absolute/path/to/vggt-omega/.native/flash_attn_v109
+  --build /absolute/path/to/third_party/vggt-omega/.native/flash_attn_v109
 ```
 
 脚本只编译 SM 8.7，单个 ninja job / NVCC thread，不安装或替换 torch。推荐在构建进程外施加内存上限。

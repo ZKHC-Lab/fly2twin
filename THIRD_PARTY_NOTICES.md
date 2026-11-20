@@ -30,7 +30,7 @@ Numerical functions originate in the private project's experiment scripts listed
 
 The evaluation camera parameterization is a new implementation of the continuous 6D rotation representation (Zhou et al., CVPR 2019) with right-composed local translation, matching the mathematical interface of gsplat's example camera optimizer. No gsplat example source is copied. The Gaussian initialization/render/training algorithms were extracted from the project's own T17/T21 pipeline; upstream algorithm and dependency attribution is retained here.
 
-## Before publishing
+## Before each release
 
 - Archive dependency SBOM, model revision/digest/license and binary notices.
 - Confirm rights to any example imagery.

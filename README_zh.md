@@ -53,11 +53,11 @@
 
 ## 方法
 
-1. **关键帧与分窗**：相对上一关键帧平移 ≥ 0.15 m、转角 ≥ 8° 或间隔达 2 s 时取一帧。机载每窗 40 个关键帧，其中 5 个与上一窗共享；离线首窗 40 帧，之后每窗 30 个新帧加 10 个共享帧。
-2. **稠密深度**：每个窗口送入 [VGGT-Omega](https://github.com/facebookresearch/vggt)，得到每帧深度（每窗相差一个尺度）和置信度。
+1. **关键帧与分窗**：无人机数据在相对上一关键帧平移 ≥ 0.15 m、转角 ≥ 8° 或间隔达 2 s 时取一帧；手机视频按时间均匀分段，每段取最清晰的一帧。机载每窗 40 个关键帧，其中 5 个与上一窗共享；离线首窗 40 帧，之后每窗 30 个新帧加 10 个共享帧。
+2. **稠密深度**：每个窗口送入 [VGGT-Omega](https://github.com/facebookresearch/vggt-omega)，得到每帧深度（每窗相差一个尺度）和置信度。
 3. **位姿来源**：可替换。无人机上用激光惯导里程计（FAST-LIO），按标定的时间偏移插值到 RGB 时刻；没有外部定位时用 GLOMAP 由图像求位姿。离线用 SIFT 与 XFeat 匹配做 BA，以来源位姿为位置先验（σ = 5 cm），重投影阈值三轮收紧（16 → 8 → 4 px）。
-4. **窗口尺度**：每个窗口一个米制尺度，同时满足两类约束：VGGT 相机轨迹与位姿来源轨迹的尺度比、相邻窗口共享帧上的深度比。在对数域做加权最小二乘联合求解，每来一窗全局重解一次，后来的观测会修正前面的估计。
-5. **回访约束**：上一步只在位姿相近的视角之间建立深度约束。同一处表面隔一段时间从别处再次被看到时，两个窗口的尺度各自漂移，融合后同一面墙会出现两层。融合前把每个窗口的点与其他窗口的点做点到面匹配，再给每帧解一个尺度修正量（稀疏最小二乘；修正量被拉向零，并在窗口内保持平滑）。只改深度尺度，不改位姿；与别的窗口没有共同表面的帧保持原尺度。
+4. **窗口尺度**：每个窗口一个米制尺度，同时满足两类约束：VGGT 相机轨迹与位姿来源轨迹的尺度比、相邻窗口共享帧上的深度比。在对数域做加权最小二乘联合求解，每来一窗全局重解一次，后来的观测会修正前面的估计。机载端在窗口尺度之外再给每帧解一个偏差，同一窗口内的帧也用帧对深度比互相约束；离线端每窗一个尺度。
+5. **回访约束**：上一步只在位姿相近的视角之间建立深度约束。同一处表面隔一段时间从别处再次被看到时，两个窗口的尺度各自漂移，融合后同一面墙会出现两层。融合前把每个窗口的点与其他窗口的点做点到面匹配，再给每帧解一个尺度修正量（稀疏最小二乘；修正量被拉向零，并在窗口内保持平滑）。只改深度尺度，不改位姿；与别的窗口没有共同表面的帧保持原尺度。机载端在导出交付包时执行这一步，飞行中的实时点云不做。
 6. **多视一致性融合**：每个像素与最多 6 个近邻视角比对，深度对数比 < 0.03 计为支持，至少需要 min(2, 可见视角数) 个支持；点在 2 cm 体素上合并，点数超出上限时自适应放大体素。
 7. **3DGS**：用融合点云初始化高斯，损失包括 L1 / SSIM 图像项、与 VGGT 逆深度的 Pearson 相关项，以及抑制针状高斯的各向异性惩罚。
 
@@ -105,7 +105,7 @@ python -m pip install -e '.[core,train]'
 ### 从手机视频到可漫游场景
 
 ```bash
-cp configs/phone_video.yaml my_scene.yaml   # 填写 video 与 depth.weights
+cp configs/phone_video.yaml my_scene.yaml   # 填写 video、depth.weights 与 output
 recon run --config my_scene.yaml            # prepare → pose → depth → fuse → train → eval → export
 python3 -m viewer.tools.demo <导出目录>      # 启动服务并在浏览器中打开导出的场景
 ```
@@ -171,7 +171,7 @@ fly2twin/
 ├── configs/                   # 配置示例（手机视频、带位姿无人机、纯图像、S380）
 ├── third_party/vggt-omega/    # VGGT-Omega 模型代码与推理入口
 ├── scripts/ · tests/          # 等价验收与测试
-└── licenses/ · THIRD_PARTY_NOTICES.md
+└── licenses/ · requirements-lock/ · THIRD_PARTY_NOTICES.md
 ```
 
 ## 路线图
@@ -224,7 +224,7 @@ fly2twin/
 
 飞境由中科华创（ZKHC）开发并维护。作者：徐路；项目团队：许彬、徐路。它建立在以下优秀的开源工作之上：
 
-- [VGGT-Omega](https://github.com/facebookresearch/vggt)（牛津大学 VGG 组；Meta AI）：稠密深度；
+- [VGGT-Omega](https://github.com/facebookresearch/vggt-omega)（牛津大学 VGG 组；Meta AI）：稠密深度；
 - [DiffPhysDrone](https://github.com/HenryHuYu/DiffPhysDrone)（Zhang et al., *Nature Machine Intelligence*, 2025）：[DiffDrone-PyTorch3D](https://github.com/kirkchinese/Diffable_Drone_Pytorch3D) 是它的 PyTorch3D 复现与扩展；
 - [FAST-LIO](https://github.com/hku-mars/FAST_LIO)：激光惯导里程计；
 - [COLMAP](https://github.com/colmap/colmap) / [GLOMAP](https://github.com/colmap/glomap) / pycolmap：运动恢复结构与 BA；

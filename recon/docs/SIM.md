@@ -2,7 +2,7 @@
 
 2026-11-10
 
-`recon sim` flies a vision-based obstacle-avoidance policy inside a scene exported by `recon export`. It closes the reconstructed space into a flight volume, samples start/goal pairs, renders the policy's depth camera from the point cloud, and runs the closed loop on CPU. The policy, its input/output processing, the quadrotor dynamics and the navigation metrics come from [DiffDrone-PyTorch3D](https://github.com/kirkchinese/Diffable_Drone_Pytorch3D), which is installed separately and imported at run time.
+`recon sim` flies a vision-based obstacle-avoidance policy inside a scene written by the `export` stage of `recon run`. It closes the reconstructed space into a flight volume, samples start/goal pairs, renders the policy's depth camera from the point cloud, and runs the closed loop on CPU. The policy, its input/output processing, the quadrotor dynamics and the navigation metrics come from [DiffDrone-PyTorch3D](https://github.com/kirkchinese/Diffable_Drone_Pytorch3D), which is installed separately and imported at run time.
 
 On the office-floor reconstruction, a policy trained only in randomly generated obstacle fields reached all 50 goals without collision (table below).
 

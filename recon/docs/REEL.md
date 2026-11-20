@@ -6,7 +6,7 @@
 
 先写分镜槽位和每段要表达的内容，再搜索合格机位、设计镜头、看覆盖度和联系表，最后渲染与剪辑。画面文字只放标题、小窗名、一行结果数字；帧数、裁切、倍速、指标口径写在制作报告里，不叠在画面上。
 
-场景输入**只有 recon export 导出包目录**，通过 [load_scene](../io/scene.py) 读取 `scene.json`、完整 SH Gaussian PLY、融合点云和相机；不读训练检查点或旧实验布局。位置、注视点、速度、模板距离都在导出世界系中，以米计；竖直方向取 `scene.world_up`，不是固定 Z 轴。输入显示契约见 [INPUTS](INPUTS.md#display-contract-scene-schema-v2)。手机假设相机高度得到的米制尺度不等于实测尺度。
+场景输入**只有 `recon run` 导出阶段写出的导出包目录**，通过 [load_scene](../io/scene.py) 读取 `scene.json`、完整 SH Gaussian PLY、融合点云和相机；不读训练检查点或旧实验布局。位置、注视点、速度、模板距离都在导出世界系中，以米计；竖直方向取 `scene.world_up`，不是固定 Z 轴。输入显示契约见 [INPUTS](INPUTS.md#display-contract-scene-schema-v2)。手机假设相机高度得到的米制尺度不等于实测尺度。
 
 安装 `.[core,train]`；CPU 剪辑和卡片只需 core（OpenCV、Pillow、NumPy、SciPy）。GPU 渲染沿用 torch/gsplat 依赖。`ffmpeg` 是系统外部程序，cut/beats 在执行前检查 PATH；未安装会明确报错。默认字体通过 fontconfig 查找 **Noto Sans CJK SC** 的对应字重和 SC 字面；不静默回退成其它字体。没有该字体时安装 Noto CJK，或显式传字体文件和字面序号。资源队列、内存限制和 CUDA 环境由调用者管理，模块导入不修改环境。
 

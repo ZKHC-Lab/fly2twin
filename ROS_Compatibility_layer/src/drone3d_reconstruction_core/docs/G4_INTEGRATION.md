@@ -1,6 +1,8 @@
 # G4 接入现有连续会话
 
-现有流程为采集 → Omega 重建 → G4 后台配准 → 原 Web 显示。
+> 本文前半部分（到“长窗分组”一节）记录早期的 G4 图配准：每窗一个 Sim(3)，16 帧窗口。它仍是配置模板的默认值，但已不是机载主线。现行做法是逐帧位姿放置（`g4_placement: frame_pose`），见下文“逐帧位姿放置”一节和[机载融合与交付包](ONBOARD_V1.md)。
+
+G4 图配准模式的流程为采集 → Omega 重建 → G4 后台配准 → 原 Web 显示。
 入口继续使用 `continuous_production.sh` 和 `continuous_production.launch`。
 连续会话拥有 G4 子进程。启动入口不增加独立 G4 ROS 节点。
 
@@ -19,7 +21,7 @@
 | 点云过滤 | 全窗 P50 与深度边缘过滤0.03 |
 | 调度 | `lossless_fifo`。后台全图求解。完成后原子切换地图修订 |
 
-模板与 `tools/nx_bench/profiles/` 已采用这些默认值。
+配置模板已采用这些默认值，内部台架配置相同。
 部署目录中已复制的旧 YAML 需要显式更新。更新仓库不会改写远端运行配置。
 旧里程计模式保留为 `odom_pose_constrained_sim3`。
 旧台架配置 `legacy_odom_128x100` 已删除，可从标签 `archive/pre-restructure` 恢复。
@@ -138,7 +140,7 @@ NX上的16帧吞吐未在本轮测量。
 ## 逐帧位姿放置（frame_pose）
 
 `g4_placement: frame_pose` 把整图求解换成逐帧放置：每帧用 RGB 时刻（加 `pose_time_offset_ms`）的定位相机位姿，
-VGGT 只提供深度和每窗一个深度尺度。采集、快照、修订文件、显示指针与 Web 沿用 G4 链路；默认 `graph` 行为不变。
+VGGT 只提供深度和每窗一个深度尺度（主线另开逐帧尺度 `g4_frame_scales`，见 [机载第一阶段](ONBOARD_V1.md) 第 1 节）。采集、快照、修订文件、显示指针与 Web 沿用 G4 链路；默认 `graph` 行为不变。
 方法身份 `frame_pose_window_scale_20261008`。
 
 2026-10-28 新增可选的采集端稠密 LIO 时间偏移、多视融合、交付包导出与落地全局 BA，配置和验收边界见 [机载第一阶段](ONBOARD_V1.md)。下文历史实验数值与旧后端偏移规则不变。
@@ -146,7 +148,7 @@ VGGT 只提供深度和每窗一个深度尺度。采集、快照、修订文件
 **为什么**：VGGT 窗内几何好，但窗内相机轨迹与深度尺度彼此补偿；把整窗当刚体用一个 Sim(3) 放置时，轨迹误差直接
 变成点云错位（墙面双层），尺度误差变成整块偏移。换成外部位姿后只剩深度尺度一个量需要估计。
 
-**算法**（`g4_backend/frame_pose.py`）：
+**算法**（`g4_backend/frame_pose.py`，数值实现在 `recon_core.scale`，与离线端共用）：
 
 - 窗口尺度：对数尺度最小二乘。轨迹先验 = 窗内 VGGT 光心先按朝向平均求旋转、再对定位光心求尺度，仅在定位光心
   运动范围 > 0.3 m 时使用，权重 min(范围, 2)；相邻边 = 共享 RGB 帧上 `中位(d_前窗 / d_本窗)`（双方置信度不低于
@@ -155,9 +157,9 @@ VGGT 只提供深度和每窗一个深度尺度。采集、快照、修订文件
 - 位姿：定位光心与旋转在 (RGB 时间 + 偏移) 处于所有窗口参考位姿之间线性/slerp 插值；无括号区间（会话末尾、
   稀疏帧间隔 > 500 ms）时用该帧自身 RGB 时刻位姿，不丢帧。无有效位姿的帧不显示。
 - 内参：配置 `camera_intrinsics` > 快照 CameraInfo（各帧一致才采用）> VGGT 窗内中位 K。按像素中心约定缩放到模型分辨率。
-- Web：按 `depth_scale`、`intrinsics` 与逐帧 `frame_poses` 从深度反投影；掩码仍是全窗置信度 P50 与 3×3 相对深度边缘 0.03。
+- Web：按 `depth_scale`、`intrinsics` 与逐帧 `frame_poses` 从深度反投影；未开 `frame_pose_fusion` 时掩码仍是全窗置信度 P50 与 3×3 相对深度边缘 0.03，开启后改用多视一致性融合（见 [机载第一阶段](ONBOARD_V1.md) 第 2 节）。
 
-**配置**：`g4_placement`、`pose_time_offset_ms`、`camera_intrinsics`（见连续配置模板）。建议窗口 40 帧、10 帧共享，
+**配置**：`g4_placement`、`pose_time_offset_ms`、`camera_intrinsics`（见连续配置模板）。建议窗口 40 帧、5 帧共享（2026-11-03 起，此前为 10；本节以下的实验均在 10 帧共享下测得，两者的点云差异在重复波动之内，见 [机载第一阶段](ONBOARD_V1.md) 第 1 节），
 并在采集配置开启运动关键帧 `keyframe_min_translation_m: 0.15`、`keyframe_min_rotation_deg: 8`、`keyframe_max_interval_sec: 2`
 （需 `odometry_association: interpolate`），采样率 5 Hz 作为候选帧率。窗口尺度靠窗内运动估计：按时间采样时，
 慢飞/悬停的窗口只覆盖零点几米，尺度误差可达 28%；关键帧让每窗覆盖数米，且跳过静止段的冗余帧。

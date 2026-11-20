@@ -2,7 +2,7 @@
 
 2026-10-28 · 面向维护者
 
-本文的 E0–E3 为来源仓库（dronerecon）的历史验收；迁入研发仓库后的复验见下一节。查看器已移到仓库根 `viewer/`，下文查看器路径是来源仓库的。
+本文的 E0–E3 为来源仓库（dronerecon）的历史验收；迁入研发仓库后的复验见下一节。查看器已移到仓库根 `viewer/`，下文查看器路径是来源仓库的。本文是 2026-10-28/29 的验收记录，“运行入口”与“第 6 步建议”两节保留当时的状态；现行用法见 [recon/README](../README.md) 和[输入契约](INPUTS.md)。
 
 ## 验收状态
 
@@ -118,7 +118,7 @@ E3 运行期间的执行进程持有 GPU 锁覆盖了纯 CPU 的 SfM 阶段（�
 ## 证据索引（来源标注，无本地超链接）
 
 ```text
-规格：Drone_3D-01/Data/experiments/open_release_20261026/repo_rework/ANALYSIS.md
+规格：Data/experiments/open_release_20261026/repo_rework/ANALYSIS.md
 参考：同目录上级 drone_v1/{pipeline.py,finish_stage1.py,gs_1280/config.json,inputs/fusion.json}
 参考：同目录上级 phone/{extract_frames.py,sfm.py,train_3dgs.py,render_roam.py,prepare_sofa_route.py}
 参考：同目录上级 phone/runs/restroom_fix/{extract.json,sfm.json,cameras.npz,shared,gs/metrics.json}

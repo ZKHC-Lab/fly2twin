@@ -1,7 +1,7 @@
 # ROS 环境与部署边界
 
 ROS CPU 解释器和模型 CUDA 解释器分开安装。
-当前本机验证环境为ROS1 Noetic、Python3.8.10、NumPy1.24.4、SciPy1.10.1和OpenCV4.2.0。
+2026-09-23 审计时的本机验证环境为ROS1 Noetic、Python3.8.10、NumPy1.24.4、SciPy1.10.1和OpenCV4.2.0。
 模型环境为Python3.10.20、PyTorch2.7.1+cu128和torchvision0.22.1+cu128。
 GPU为RTX5060 Laptop。以上CUDA版本不作为NX安装指令。
 完整版本证据位于 `Data/experiments/_archive_gpt/ros_deployment_audit_20260923/evidence/`。

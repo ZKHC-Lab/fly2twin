@@ -21,7 +21,7 @@ microsoft-edge --user-data-dir="$HOME/.cache/drone-viewer-edge" --use-angle=gl-e
 
 `url` 相对 scene.json；`scale` 为正的等比倍数，默认 1；`rotationDeg` 为 XYZ Euler 角（度），`offset` 为飞行机体局部坐标偏移（场景单位），均默认 `[0,0,0]`。变换顺序为缩放→旋转→偏移，目标方向 +Y 向上、−Z 机头。URL 查询项 `droneUrl`（相对页面）、`droneScale`、`droneRotation=0,90,0`、`droneOffset=0,0,0` 逐项优先覆盖。自定义 GLB 默认不添加旋翼盘；可选 `droneModel.metaUrl`（相对 scene.json）提供 `motor_centers` 与 `rotor_radius_m`，二者均用模型变换前单位。
 
-**多场景与自由漫游**：`?manifest=/a/scene.json,/b/scene.json` 同时载入多个场景，页面上方按钮或 `[` `]` 切换，`&scene=<id>` 指定起始场景；`&guided=0` 关闭采集走廊吸附（G 键切换）。scene.json 可选字段：`id`、`name`、`subtitle`；`bounds`（`min`/`max`，源世界坐标，点云每轴 0.5/99.5 分位范围）；`world_up`（源世界竖直方向，非 Z-up 的场景如图像位姿 SfM 用拟合地面法向，查看器整体旋转到竖直）；`cloud`（点云 PLY，相对 scene.json，`recon export` 默认写 `cloud.ply`；须为 binary little-endian，含 x/y/z 与 red/green/blue），有它时按 V 在 3DGS 与点云之间切换，相机位置不变，点云模式用 58° 视场而不是采集内参。有 bounds 时查看器将其转换到显示坐标后外扩 `?margin=`，默认 1.5 场景单位；没有 bounds 时仍按采集相机外扩 1 m，margin 不影响旧回退。
+**多场景与自由漫游**：`?manifest=/a/scene.json,/b/scene.json` 同时载入多个场景，页面上方按钮或 `[` `]` 切换，`&scene=<id>` 指定起始场景；`&guided=0` 关闭采集走廊吸附（G 键切换）。scene.json 可选字段：`id`、`name`、`subtitle`；`bounds`（`min`/`max`，源世界坐标，点云每轴 0.5/99.5 分位范围）；`world_up`（源世界竖直方向，非 Z-up 的场景如图像位姿 SfM 用拟合地面法向，查看器整体旋转到竖直）；`cloud`（点云 PLY，相对 scene.json，`recon run` 的导出阶段默认写 `cloud.ply`；须为 binary little-endian，含 x/y/z 与 red/green/blue），有它时按 V 在 3DGS 与点云之间切换，相机位置不变，点云模式用 58° 视场而不是采集内参。有 bounds 时查看器将其转换到显示坐标后外扩 `?margin=`，默认 1.5 场景单位；没有 bounds 时仍按采集相机外扩 1 m，margin 不影响旧回退。
 
 ## 演示
 

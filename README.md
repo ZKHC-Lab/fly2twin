@@ -53,11 +53,11 @@ The window-scale solver and multi-view fusion are a single implementation shared
 
 ## Method
 
-1. **Keyframes and windows.** A frame becomes a keyframe when it has moved ≥ 0.15 m or rotated ≥ 8° from the previous keyframe, or after 2 s. Onboard, every window holds 40 keyframes, 5 of them shared with the previous window. Offline, the first window holds 40 keyframes and each following window adds 30 new keyframes plus 10 shared ones.
-2. **Dense depth.** Each window is processed by [VGGT-Omega](https://github.com/facebookresearch/vggt), which predicts per-frame depth (up to one scale per window) and confidence.
+1. **Keyframes and windows.** For drone data, a frame becomes a keyframe when it has moved ≥ 0.15 m or rotated ≥ 8° from the previous keyframe, or after 2 s; a phone video is split into uniform time bins and the sharpest frame of each bin is kept. Onboard, every window holds 40 keyframes, 5 of them shared with the previous window. Offline, the first window holds 40 keyframes and each following window adds 30 new keyframes plus 10 shared ones.
+2. **Dense depth.** Each window is processed by [VGGT-Omega](https://github.com/facebookresearch/vggt-omega), which predicts per-frame depth (up to one scale per window) and confidence.
 3. **Pose source.** Replaceable. On the drone, poses come from LiDAR-inertial odometry (FAST-LIO), interpolated to the RGB timestamps with a calibrated time offset. Without external localization, GLOMAP recovers poses from the images. Offline, SIFT and XFeat matches feed a bundle adjustment that uses the source poses as position priors (σ = 5 cm), with the reprojection threshold tightened over three rounds (16 → 8 → 4 px).
-4. **Window scale.** Each window receives one metric scale that satisfies two constraints at once: the scale ratio between the VGGT camera trajectory and the pose-source trajectory, and the depth ratio on frames shared with neighboring windows. The scales are solved jointly by weighted least squares in log space and re-solved globally whenever a window arrives, so later observations correct earlier estimates.
-5. **Revisit alignment.** The scale solve only links views that are close in pose. When a surface is seen again later from somewhere else, the scales of the two windows drift independently and the fused cloud shows the same wall twice. Before fusion, the points of each window are matched point-to-plane against the points of the other windows, and one scale correction per frame is solved by sparse least squares (corrections are pulled towards zero and kept smooth inside a window). Only depth scales change, never poses; a frame that shares no surface with another window keeps its scale.
+4. **Window scale.** Each window receives one metric scale that satisfies two constraints at once: the scale ratio between the VGGT camera trajectory and the pose-source trajectory, and the depth ratio on frames shared with neighboring windows. The scales are solved jointly by weighted least squares in log space and re-solved globally whenever a window arrives, so later observations correct earlier estimates. Onboard, each frame additionally gets a deviation from its window scale, and frames inside a window constrain each other through frame-pair depth ratios as well; offline uses one scale per window.
+5. **Revisit alignment.** The scale solve only links views that are close in pose. When a surface is seen again later from somewhere else, the scales of the two windows drift independently and the fused cloud shows the same wall twice. Before fusion, the points of each window are matched point-to-plane against the points of the other windows, and one scale correction per frame is solved by sparse least squares (corrections are pulled towards zero and kept smooth inside a window). Only depth scales change, never poses; a frame that shares no surface with another window keeps its scale. Onboard, this step runs when the delivery package is exported, not on the live point cloud during flight.
 6. **Multi-view consistent fusion.** Every pixel is checked against up to 6 neighboring views; a neighbor supports it when the log depth ratio is below 0.03, and at least min(2, visible views) supporting neighbors are required. Points are merged on a 2 cm voxel grid, which coarsens adaptively when a point budget is exceeded.
 7. **3DGS.** Gaussians are initialized from the fused cloud and trained with L1/SSIM photometric losses, a Pearson-correlation term against VGGT inverse depth, and an anisotropy penalty that suppresses needle-shaped Gaussians.
 
@@ -105,7 +105,7 @@ Toolchain details (CUDA headers for gsplat, GPU architecture) are in [`recon/doc
 ### Quick start: from a phone video to an explorable scene
 
 ```bash
-cp configs/phone_video.yaml my_scene.yaml   # set `video` and `depth.weights`
+cp configs/phone_video.yaml my_scene.yaml   # set `video`, `depth.weights` and `output`
 recon run --config my_scene.yaml            # prepare → pose → depth → fuse → train → eval → export
 python3 -m viewer.tools.demo <export_dir>   # serve the exported scene and open it in a browser
 ```
@@ -171,7 +171,7 @@ fly2twin/
 ├── configs/                   # Example configurations (phone video, drone with poses, image only, S380)
 ├── third_party/vggt-omega/    # VGGT-Omega model code and inference entry
 ├── scripts/ · tests/          # Equivalence checks and test suite
-└── licenses/ · THIRD_PARTY_NOTICES.md
+└── licenses/ · requirements-lock/ · THIRD_PARTY_NOTICES.md
 ```
 
 ## Roadmap
@@ -224,7 +224,7 @@ When using the differentiable flight module, please also cite:
 
 Fly2Twin is developed and maintained by ZKHC (中科华创). Author: Lu Xu. Project team: Bin Xu, Lu Xu. It builds on excellent open-source work:
 
-- [VGGT-Omega](https://github.com/facebookresearch/vggt) (Visual Geometry Group, University of Oxford; Meta AI) for dense depth;
+- [VGGT-Omega](https://github.com/facebookresearch/vggt-omega) (Visual Geometry Group, University of Oxford; Meta AI) for dense depth;
 - [DiffPhysDrone](https://github.com/HenryHuYu/DiffPhysDrone) (Zhang et al., *Nature Machine Intelligence*, 2025), of which [DiffDrone-PyTorch3D](https://github.com/kirkchinese/Diffable_Drone_Pytorch3D) is a PyTorch3D reimplementation and extension;
 - [FAST-LIO](https://github.com/hku-mars/FAST_LIO) for LiDAR-inertial odometry;
 - [COLMAP](https://github.com/colmap/colmap) / [GLOMAP](https://github.com/colmap/glomap) / pycolmap for structure-from-motion and bundle adjustment;

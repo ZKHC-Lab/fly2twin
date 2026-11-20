@@ -1,7 +1,7 @@
 # G4 独立核心
 
 这个包提取已冻结的 `legacy_g4_20260916` 方法。
-核心依赖 NumPy 和 SciPy。
+核心依赖 NumPy、SciPy，以及仓库根的 `recon_core`（逐帧位姿放置的尺度求解在那里）。
 核心读取数组和数据对象。
 ROS 消息、磁盘缓存、模型推理、线程调度和地图发布由调用方负责。
 
@@ -31,6 +31,8 @@ G4 原基准没有回环边。
 
 ## 安装和核查
 
+在仓库根目录执行。`recon_core` 没有写进本包的依赖声明，需要它能被导入，仓库根在路径上即可。
+
 ```bash
 python -m pip install ./ROS_Compatibility_layer/src/drone3d_reconstruction_core/src/g4_backend
 python -m unittest discover -s ROS_Compatibility_layer/src/drone3d_reconstruction_core/src/g4_backend/tests -v
@@ -46,6 +48,8 @@ python -m unittest discover -s ROS_Compatibility_layer/src/drone3d_reconstructio
 | `registration.py` | 共享帧采样、E1 RANSAC、共识重拟合和分层 bootstrap |
 | `localization.py` | 位置插值、杆臂变换、时间块分区和定位采样 |
 | `graph.py` | 分量初始化、位置约束和 G4 图求解 |
+| `frame_pose.py` | 逐帧外部位姿放置与窗口尺度，机载主线使用；数值在 `recon_core.scale` |
+| `window_plan.py` | 长窗分组计划与登记清单校验 |
 
 ## 数据契约
 
@@ -134,7 +138,7 @@ E1 仅使用 `split == 0` 的拟合点。
 reviewer R1 在单次定位残差上先施加 Huber，再乘时间块权重。
 这两个顺序产生不同目标函数。
 S14 还对四条特定连接施加 0.1 权重。
-本包不混入 R1 顺序、S14 边权或后来的逐帧修正。
+G4 图求解不混入 R1 顺序、S14 边权或后来的逐帧修正。逐帧位姿放置是独立的 `frame_pose.py`，方法身份不同。
 
 ## 工程与运行边界
 

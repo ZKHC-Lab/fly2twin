@@ -36,6 +36,15 @@ CUDA_VISIBLE_DEVICES='' TORCH_CUDA_ARCH_LIST=12.0 MAX_JOBS=2 \
 
 On memory-constrained shared machines, wrap compilation with a memory limit (the local acceptance used a 16 GB systemd user scope). If JIT was interrupted after generating the ninja build, resume `ninja -C <extension-build-directory> -j 2` outside the GPU lock.
 
+## XFeat (bundle adjustment only)
+
+`pose.refine: ba` matches features with [XFeat](https://github.com/verlab/accelerated_features) in addition to SIFT. XFeat is not a pip dependency: clone it, put the checkout on `PYTHONPATH` so that `modules.xfeat` imports, and point `pose.xfeat_weights` at its `weights/xfeat.pt`. Nothing is downloaded at run time; a missing module or checkpoint is an error.
+
+```bash
+git clone https://github.com/verlab/accelerated_features.git
+export PYTHONPATH="$PWD/accelerated_features${PYTHONPATH:+:$PYTHONPATH}"
+```
+
 ## Separate CPU and GPU phases
 
 External poses (`pose.provider: external`, `pose.refine: none`) with cached depth support CPU-only preparation and fusion, including the phone B0 protocol:

@@ -1,8 +1,10 @@
 # ROS 兼容层
 
-ROS1 Noetic / catkin 工作空间：相机采集 → 快照封存 → VGGT-Omega 重建 → G4 后台配准 → 原 Web 查看。
+ROS1 Noetic / catkin 工作空间，无人机机载端的连续重建：相机采集与运动关键帧 → 快照封存 → 分窗 VGGT-Omega 推理 → 后台放置与尺度求解 → 增量多视融合点云 → Web 查看；落地后导出交付包并做全局 BA。
 
-默认384×288，首窗16帧，后续11新＋5共享。完成全局求解后原子更新历史窗口。[G4接入与性能说明](src/drone3d_reconstruction_core/docs/G4_INTEGRATION.md)。
+当前主线用逐帧位姿放置（`g4_placement: frame_pose`）：每帧按位姿来源给出的相机位姿放置，VGGT 提供深度，后台求窗口尺度和逐帧尺度。每窗 40 个关键帧，其中 5 个与上一窗共享，推理长边 384。配置见[机载融合、交付包与落地全局 BA](src/drone3d_reconstruction_core/docs/ONBOARD_V1.md)。
+
+配置模板的默认值仍是早期的 G4 图配准（`g4_placement: graph`）：16 帧窗口，11 个新帧加 5 个共享帧，见 [G4 接入与性能说明](src/drone3d_reconstruction_core/docs/G4_INTEGRATION.md)。后台完成求解后原子更新历史窗口。
 
 ## 目录
 
@@ -19,7 +21,7 @@ ROS1 Noetic / catkin 工作空间：相机采集 → 快照封存 → VGGT-Omega
 - [长窗分组(100/120 与尾窗规则)](docs/LONG_WINDOW_GROUPING.md)
 - [3DGS 离线重建(位姿精化、初始点云、评测)](docs/GS_OFFLINE_RECONSTRUCTION.md)
 - [机体→相机外参(2026-10-23 重标与验证)](docs/CAMERA_EXTRINSIC.md)
-- 核心包文档:[G4 接入](src/drone3d_reconstruction_core/docs/G4_INTEGRATION.md)、[NX 台架启动](src/drone3d_reconstruction_core/docs/NX_BRINGUP.md)
+- 核心包文档:[机载融合与交付包](src/drone3d_reconstruction_core/docs/ONBOARD_V1.md)、[G4 接入](src/drone3d_reconstruction_core/docs/G4_INTEGRATION.md)、[NX 台架启动](src/drone3d_reconstruction_core/docs/NX_BRINGUP.md)
 - 其他模块:[drone3d_runtime](src/drone3d_runtime/README.md)
 
 ## 构建与测试
@@ -47,6 +49,7 @@ bash src/drone3d_reconstruction_core/scripts/nx_step2_bringup.sh
 ```
 
 顺序：roscore → Livox → FAST-LIO → RealSense → TF → 生产栈；不启动飞控或桨叶。
+一键脚本的生产栈按台架配置运行：640×480、16 帧窗、G4 图配准。机载主线的配置见 [机载融合与交付包](src/drone3d_reconstruction_core/docs/ONBOARD_V1.md) 第 1 节，目前只在 bag 回放中验证过，还没有接入一键脚本。
 外部里程计用 `--external-odom /Odometry`，同时禁用 Livox 加 `--no-livox`；关闭 Web 加 `--no-web`。
 
 仅启动生产栈（要求已有可达的 roscore）：
@@ -74,14 +77,14 @@ bash src/drone3d_reconstruction_core/scripts/continuous_production.sh \
 ## 工具
 
 - `bash tools/check.sh validator`：真实结果校验与原子提交检查；`bag`、`web` 子命令见 `--help`。
-- `bash tools/nx_bench/bench/run100.sh --help`：参数化基准测试，支持 `--dry-run`。
+- `bash tools/nx_bench/bench/run100.sh --help`：参数化基准测试，支持 `--dry-run`（内部台架工具，开源导出不包含）。
 - 安装：在上述构建与测试通过后执行 `catkin_make install`，新终端加载 `install/setup.bash`。
 
 ## 模式与限制
 
 - 会话创建时选择模式，运行中禁止切换；停止后可创建另一种模式的新会话。
 - `per_window`：默认G4全局配准。G4会话内固定输入配置。旧 `odom_pose_constrained_sim3` 模式仍支持逐窗里程计对齐和运行时重叠调整。
-- `g4_placement: frame_pose`：G4 会话改为逐帧外部定位位姿 + 每窗 VGGT 深度尺度（建议 40–70 帧窗）。离线真数据对 D435i 参考面精度中位约 4.4 cm（原 G4 冻结解 11.8 cm），每窗后台更新约 0.2 s；本机真实 bag 全链回放（配合采集运动关键帧）室内外均约 4.5 cm。见 [G4 接入](src/drone3d_reconstruction_core/docs/G4_INTEGRATION.md) 的“逐帧位姿放置”。
+- `g4_placement: frame_pose`：当前主线，G4 会话改为逐帧外部定位位姿加 VGGT 深度尺度，见本页开头和[机载融合与交付包](src/drone3d_reconstruction_core/docs/ONBOARD_V1.md)。早期以 D435i 参考面做的验证见 [G4 接入](src/drone3d_reconstruction_core/docs/G4_INTEGRATION.md) 的“逐帧位姿放置”。
 - `frame_pool`：重叠固定为 0 且不可修改；不进行对齐；Web 仅显示最新一次重建点云。
 - `window_frames` 是采集及帧数池重建的目标帧数，可调整；合格帧不足时继续入池等待。
 - 采集完成立即入池；每次重建和重试重新按质量、位置、朝向和时间覆盖选帧，允许旧优质帧再次入选。

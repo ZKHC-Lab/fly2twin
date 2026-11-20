@@ -27,7 +27,8 @@ For `video`, prepare calls the shared phone extractor using the `extract` mappin
 
 | Key | Default / meaning |
 | --- | --- |
-| `manifest` or `video`, `output` | Exactly one input source and the output parent directory |
+| `manifest`, `video` or `delivery`, `output` | Exactly one input source and the output parent directory |
+| `exclude_frames` | Optional frame IDs dropped from the prepared manifest before splitting; see above |
 | `protocol` | `drone` (default) or `phone`; train/eval loading and scoring protocol |
 | `extract`, `sfm` | Shared video extraction and GLOMAP settings, as in the phone preset |
 | `cameras` | Optional external camera NPZ; sparse points are needed for camera-height scale fitting |
