@@ -1,7 +1,7 @@
 """Adapters from phone preprocessing/training conventions to recon stages."""
 from pathlib import Path
 import numpy as np
-from recon.io.common import load_json, dump
+from recon.io.common import load_json, stage_manifest, dump
 
 
 def arguments(settings):
@@ -55,10 +55,7 @@ def load_phone_data(cfg, root):
     with np.load(root / 'pose/cameras.npz', allow_pickle=False) as z:
         data = dict(z)
     poses, native_K = data['c2w'], data['K']
-    manifest_path = root / 'pose/manifest.json'
-    if not manifest_path.exists():
-        manifest_path = root / 'prepare/manifest.json'
-    manifest = load_json(manifest_path)
+    manifest = stage_manifest(root)
     selection = load_json(root / 'prepare/selection.json')
     data.update(train_indices=np.array(selection['train_indices'], int),
                 test_indices=np.array(selection['test_indices'], int),

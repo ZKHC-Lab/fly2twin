@@ -88,6 +88,8 @@ g4_frame_scales: true
 | | **逐帧尺度** | 3.06 cm | **8.27 cm** | 79.1% | 32.6% |
 | | 逐窗按雷达拟合（窗口上限） | 2.90 cm | 6.88 cm | 84.3% | 35.1% |
 
+上表都没有做导出时的回访约束（见第 3 节）。r1_run7 的逐帧尺度结果再加上回访约束是 P50 2.92 / P90 6.14 cm、5 cm 内 85.7%（2026-11-20，[recon_core](../../../../recon_core/README.md) 回访约束一节）。
+
 噪声取值在 118 窗上测定，留出段是第二段未用过的录制。同一个求解器只取窗口部分时，窗口尺度误差也下降（留出段中位 3.6% → 2.8%），但点云 P90 不降（8.99 cm），收益来自逐帧一层。本机 G4 后台单线程 118 窗 218 → 258 s；求解本身 0.17 s（3470 帧、2.5 万行），主要开销是测帧对。
 
 TF 使用 [新机体—相机外参](../../../docs/CAMERA_EXTRINSIC.md)：平移 `[0.056558, -0.006717, -0.077751]` m，四元数 xyzw `[-0.494176, 0.506142, -0.498990, 0.500618]`。旧 bag 的外参必须覆盖，不能同时发布冲突的 body→camera 变换。
@@ -97,6 +99,8 @@ TF 使用 [新机体—相机外参](../../../docs/CAMERA_EXTRINSIC.md)：平移
 采集端在去重后的稠密 `/Odometry` 中，针对 RGB 时间 +40 ms 做线性位置 / SLERP 朝向插值；快照关联头仍标记 RGB 时间，`interpolation.query_stamp` 记录实际查询时间，另存偏移值和 `capture` 标记。缺少前后括号时不外推，不以旧姿态冒充偏移后姿态。
 
 后端 profile 与 `run.json` 的 `frame_pose.pose_time_offset_stage=capture` 表示直接使用已偏移定位；实际快照标记与配置不一致时报错。未声明该选项的旧会话继续使用原后端关键帧插值与原回退规则；带采集偏移标记的输入不能再走后端偏移，避免重复 +40 ms。新输出目录不可复用旧代码的缓存。
+
+采集时某帧没关联上位姿（括号缺失、间隔过大），快照里该帧 `pose_valid` 为假，地图后端放不了这一帧。2026-11-23 起，一个窗口送去重建的帧（含复用的共享帧）里缺位姿的超过 20%（严格大于，常量 `MAX_MISSING_POSE_FRACTION`）时，该窗口直接判失败：不提交重建、不重试，计入 `failed_windows`，错误信息写出缺几帧、共几帧；采集和下一个窗口照常。阈值来自办公室那次飞行（118 窗、每窗 40 帧），最差的两个窗口恰好缺 8 帧，没有窗口超过。每窗缺了几帧记在 journal 的 `window_pending`、`window_succeeded`（判失败时在 `window_failed`）事件里；`/diagnostics` 和 Web 状态的 `missing_pose_frames` 是会话累计数，每帧只算一次，共享帧不在相邻两窗重复计数。这条判据数的是采集时没关联上位姿的帧；机体到相机的外参缺失或机体坐标系名配错时，`pose_valid` 仍为真而所有帧都放不进地图，不由它发现。
 
 ## 2. 融合
 
@@ -158,6 +162,17 @@ python3 -m drone3d_onboard.export \
 - `cache/depth_m.npy`、`good.npy`：同帧序的米制深度与过滤前基础掩码，可用于复核融合和未体素化观测评测。
 
 导出校验原正式记录、快照、预测摘要与当前完整地图修订。没有定位位姿的帧（例如早于 FAST-LIO 首个位姿）不导出，按窗记入融合信息的 `frames_without_pose`。整段 CameraInfo 的 K、D、宽高必须一致，个别帧采集时没关联到 CameraInfo 就用这份共享值，帧号记入 manifest 的 `camera_info_shared_for_frames`。外参须全段一致、图像须为 CameraInfo 分辨率、时间偏移须在采集端施加，实际值写入 manifest。目标目录存在则拒绝覆盖；manifest 最后写入，失败的半包不能作为完成交付使用。
+
+会话不会自动清理，磁盘只由 `min_free_disk_gb` 红线兜底。一个会话在磁盘上的目录（`<sid>` 为会话 ID）：
+
+- 输入快照：各采集 profile 的 `snapshot_root/cs-<sid>-w<窗号>-<16 位十六进制>`；
+- worker 结果：重建 profile 的 `result_root/cs-<sid>-w<窗号>-…`，含 `predictions.npz`；
+- 正式记录：连续会话 `result_root/sessions/<sid>/window-NNNN/`；
+- 地图后端输出：`result_root/g4/<sid>/`（`backend_profile.json`、`latest.json`、`revisions/`）；
+- 共享帧缓存：连续会话 `result_root` 同级的 `frame_pool/<sid>/`，会话停止时清空图像；
+- 会话日志：`journal_root/<sid>.jsonl`。
+
+导出读前四类，不读共享帧缓存和会话日志；落地 BA 只读交付包。`manifest.json` 最后写，并且是写完整之后一次改名发布的：导出命令正常退出、交付目录里有 `manifest.json`，这个交付包就是完整的，之后整个会话都可以手工删除；没有 `manifest.json` 的交付目录是没导完的，不能当作依据。快照、worker 结果和正式记录是源数据，删掉其中任何一类，这个会话就不能再导出，也不能重跑地图后端。地图后端输出可以由这三类重算，重算要用同一份 `backend_profile.json`（就在这个目录里，导出也读它）。已有的完整交付包独立可用。
 
 ## 4. 落地全局 BA
 

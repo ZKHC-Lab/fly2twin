@@ -1,9 +1,9 @@
-"""B0's assumed-camera-height scale, not a measured metric reference."""
+"""Phone preset's assumed-camera-height scale, not a measured metric reference."""
 import numpy as np
 
 
 def camera_height_scale(c2w, points, camera_height_m):
-    """Fit the B0 floor plane and return SfM-to-assumed-metres scale and diagnostics."""
+    """Fit the floor plane and return SfM-to-assumed-metres scale and diagnostics."""
     centers = c2w[:, :3, 3]
     center = np.median(centers, axis=0)
     radius = np.percentile(np.linalg.norm(centers-center, axis=1), 95)
@@ -34,7 +34,8 @@ def camera_height_scale(c2w, points, camera_height_m):
         count = int(np.sum(residual < threshold))
         if best is None or count > best[0]:
             best = (count, n.copy(), float(d))
-    assert best is not None
+    if best is None:
+        raise ValueError('No floor plane found below the cameras; camera-height scale needs a visible floor')
     _, n, d = best
     for _ in range(3):
         inliers = candidate[np.abs(candidate @ n+d) < threshold]

@@ -1,6 +1,6 @@
 # G4 算法基线与 ROS 移植规范
 
-> 本文是 2026-10-07 的 G4 图配准（`g4_placement: graph`，每窗一个 Sim(3)）移植规范和核验记录。当前机载主线改用逐帧位姿放置（`g4_placement: frame_pose`），见[机载融合与交付包](../src/drone3d_reconstruction_core/docs/ONBOARD_V1.md)；图配准仍是配置模板的默认值，代码保留。文中的“当前”指 2026-10-07 的代码，其中三处之后已经改掉：ROS 调用已传入拟合排除池（§3.2）；输入适配器接受宽高为 16 倍数的分辨率，不限于 384×288（§4 的表）；`G4MapBackend` 的配置改为构造参数传入，顶层包改为惰性导入（§4、§9.2）。后两项的经过见[长窗分组](LONG_WINDOW_GROUPING.md)。
+> 本文是 2026-10-07 的 G4 图配准（`g4_placement: graph`，每窗一个 Sim(3)）移植规范和核验记录。当前机载主线改用逐帧位姿放置（`g4_placement: frame_pose`），见[机载融合与交付包](../src/drone3d_reconstruction_core/docs/ONBOARD_V1.md)；图配准已于 2026-11-23 删除，代码可从提交 `f0c0aa3` 恢复；文中指向已删源码的链接改为文件名。文中的“当前”指 2026-10-07 的代码，其中三处之后已经改掉：ROS 调用已传入拟合排除池（§3.2）；输入适配器接受宽高为 16 倍数的分辨率，不限于 384×288（§4 的表）；`G4MapBackend` 的配置改为构造参数传入，顶层包改为惰性导入（§4、§9.2）。后两项的经过见[长窗分组](LONG_WINDOW_GROUPING.md)。
 
 状态：基线找回与源码核验版，2026-10-07。对象：用户认可的 G4 总体布局；本轮没有修改 ROS 生产实现、启动推理或替换基准。代码审计起点 `27bacf9`。本文件属于**技术规范（Spec）**，同时给出算法依据、接口约束、差异和验收方法。未决方案可另立 RFC，实施后的关键选择可记为 ADR；本项目不用含义不明确的 OPC 作为文档名。
 
@@ -67,7 +67,7 @@ flowchart LR
 
 E1 使用 1000 次三点 RANSAC、5 次内点重估，正尺度、非退化支持；最少 30 个 fit 点、共识比例至少 0.3。按“共享帧→网格”两级 bootstrap 200 次，至少 160 次有效，检查 7 维可观测性，协方差加 `0.001² I` 下限。采样/RANSAC种子 `20260915+j`，bootstrap 再加 1000。协方差是在右扰动坐标中计算，并按源窗深度归一化平移。该相邻边的数值准入并未使用0.02/3px回环几何门槛；不得在移植时偷偷加门槛、删除原边后仍称原算法。
 
-原 run_02 优先复用历史记录的 `0.03×目标共享深度中位数` 阈值；当前默认从此次掩码交集重新计算。F000→F001 的历史对拍两者恰巧同值 **0.014139644801616669**，不代表已证明全部边一致。恢复需显式记录阈值来源，并逐边对拍。[当前 registration.py](../src/drone3d_reconstruction_core/src/g4_backend/registration.py)
+原 run_02 优先复用历史记录的 `0.03×目标共享深度中位数` 阈值；当前默认从此次掩码交集重新计算。F000→F001 的历史对拍两者恰巧同值 **0.014139644801616669**，不代表已证明全部边一致。恢复需显式记录阈值来源，并逐边对拍。当前 registration.py（`registration.py`，已删除）
 
 ### 3.3 定位因子与整图优化
 
@@ -79,7 +79,7 @@ E1 使用 1000 次三点 RANSAC、5 次内点重估，正尺度、非退化支�
 
 各视觉分量先用定位初始化；没有位置的分量只保留局部规范，弱基线不能强行塞进全局。冻结图有三个视觉分量 24＋13＋1，缺 F023→F024、F036→F037 两条边；602 个位置因子仍让三分量在数值上可解，F037 人工待定状态并未因此消失。
 
-当前求解为右增量 `S=S_base·Exp(delta)`；SciPy `least_squares(method='trf', tr_solver='exact', x_scale='jac')`，稠密有限差分，`max_nfev=200`（不计数值Jacobian的额外残差调用），三项容差 `1e-8`，logscale 增量界 ±12；当前默认无墙钟上限。这不是200次调用或实时延迟保证。每次地图更新重解完整当前图。位置来自 FAST-LIO 的历史基准与该定位来源相关，不是独立激光表面真值；原始激光点、传感器深度不进入 G4 数值核心。[当前 graph.py](../src/drone3d_reconstruction_core/src/g4_backend/graph.py) · [localization.py](../src/drone3d_reconstruction_core/src/g4_backend/localization.py)
+当前求解为右增量 `S=S_base·Exp(delta)`；SciPy `least_squares(method='trf', tr_solver='exact', x_scale='jac')`，稠密有限差分，`max_nfev=200`（不计数值Jacobian的额外残差调用），三项容差 `1e-8`，logscale 增量界 ±12；当前默认无墙钟上限。这不是200次调用或实时延迟保证。每次地图更新重解完整当前图。位置来自 FAST-LIO 的历史基准与该定位来源相关，不是独立激光表面真值；原始激光点、传感器深度不进入 G4 数值核心。当前 graph.py（`graph.py`，已删除） · `localization.py`（已删除）
 
 ### 3.4 点云、轨迹和状态
 
@@ -94,10 +94,10 @@ E1 使用 1000 次三点 RANSAC、5 次内点重估，正尺度、非退化支�
 | 职责 | 当前正式代码 | 历史依据 / 替换时必须保持的合同 |
 |---|---|---|
 | 类型、局部尺度与反投影 | [types.py](../src/drone3d_reconstruction_core/src/g4_backend/types.py)、[geometry.py](../src/drone3d_reconstruction_core/src/g4_backend/geometry.py) | 原 G0 geometry；帧身份、精度、Z深度、K像素约定 |
-| 共享采样、E1与协方差 | [registration.py](../src/drone3d_reconstruction_core/src/g4_backend/registration.py) | run_02 adjacent/core；采样池、分区、排除、种子、阈值、边方向 |
-| 定位因子选取 | [localization.py](../src/drone3d_reconstruction_core/src/g4_backend/localization.py) | run_02 graph.py的localization()；同钟、光心、缺测、唯一所有权、块权重；纯函数也支持显式传入外参 |
+| 共享采样、E1与协方差 | `registration.py`（已删除） | run_02 adjacent/core；采样池、分区、排除、种子、阈值、边方向 |
+| 定位因子选取 | `localization.py`（已删除） | run_02 graph.py的localization()；同钟、光心、缺测、唯一所有权、块权重；纯函数也支持显式传入外参 |
 | ROS机体定位转光心 | [odom_local.py](../src/drone3d_reconstruction_core/src/drone3d_reconstruction_core/odom_local.py)、[static_camera.py](../src/drone3d_reconstruction_core/src/drone3d_reconstruction_core/static_camera.py)，由input_adapter调用 | 明确TF方向、RGB时间插值及杆臂；当前ROS链在这里先形成光心，再交核心选因子 |
-| Sim(3)与图优化 | [sim3.py](../src/drone3d_reconstruction_core/src/g4_backend/sim3.py)、[graph.py](../src/drone3d_reconstruction_core/src/g4_backend/graph.py) | run_02 core/graph；右增量、目标函数、初值、停止及分量判据 |
+| Sim(3)与图优化 | [sim3.py](../src/drone3d_reconstruction_core/src/g4_backend/sim3.py)、`graph.py`（已删除） | run_02 core/graph；右增量、目标函数、初值、停止及分量判据 |
 | 读取并校验模型结果 | [g4/input_adapter.py](../src/drone3d_reconstruction_core/src/drone3d_reconstruction_core/g4/input_adapter.py) | snapshot v4、全部帧、哈希、外参来源；只接受 Omega 384×288 |
 | 缓存与完整地图修订 | [g4/map_backend.py](../src/drone3d_reconstruction_core/src/drone3d_reconstruction_core/g4/map_backend.py) | 原始预测不可覆盖；源配置绑定；失败保留旧地图 |
 | 子进程生命周期 | [g4/backend_process.py](../src/drone3d_reconstruction_core/src/drone3d_reconstruction_core/g4/backend_process.py) | CPU 后台、归属清楚、停止/恢复行为可观测 |

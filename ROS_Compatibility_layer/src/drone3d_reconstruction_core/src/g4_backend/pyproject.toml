@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "drone3d-g4-backend"
 version = "0.1.0"
-description = "ROS-independent extraction of the frozen VGGT-Omega G4 backend"
+description = "ROS-independent per-frame placement core of the VGGT-Omega map backend"
 requires-python = ">=3.8"
 dependencies = ["numpy>=1.20", "scipy>=1.7"]
 

@@ -13,7 +13,7 @@ python -m pip install -e '.[train]'
 recon run --config my_scene.yaml --through fuse
 ```
 
-将预设合入自己的场景配置并填写输入路径：[无人机](../configs/drone_with_poses.yaml)、[手机视频](../configs/phone_video.yaml)、[S380](../configs/s380.yaml)、[纯图像](../configs/image_only.yaml)。手机预设为 B0（GLOMAP 位姿、假设相高 1.4 m、Omega 深度与融合），使用同一 `recon run` 分阶段命令；位姿插槽与手机训练评测口径见[输入契约](docs/INPUTS.md)。
+将预设合入自己的场景配置并填写输入路径：[无人机](../configs/drone_with_poses.yaml)、[手机视频](../configs/phone_video.yaml)、[S380](../configs/s380.yaml)、[纯图像](../configs/image_only.yaml)。手机预设把无人机方法用在手机视频上（GLOMAP 位姿、假设相高 1.4 m、Omega 深度与融合），使用同一 `recon run` 分阶段命令；位姿插槽与手机训练评测口径见[输入契约](docs/INPUTS.md)。
 
 ## 文档
 

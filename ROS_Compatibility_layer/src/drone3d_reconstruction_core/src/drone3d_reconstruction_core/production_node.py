@@ -52,7 +52,6 @@ NODE_NAME = "reconstruct_production_node"
 DEFAULT_DIAGNOSTICS_TOPIC = "/diagnostics"
 DEFAULT_DIAGNOSTICS_PERIOD_SEC = 1.0
 DEFAULT_ACTION_NAME = "reconstruct_segment"
-PROFILE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 DECIMAL_BYTES_RE = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 
 # 必填字符串参数（安全相关，全部显式）
@@ -65,7 +64,6 @@ _REQUIRED_STR_KEYS = (
     "checkpoint_sha256",
     "result_root",
     "profile_name",
-    "required_device_sku",
     "algorithm_revision",
     "ros_revision",
     "load_mode",
@@ -153,15 +151,11 @@ def load_runtime_params(params: Mapping[str, Any]) -> ProductionRuntimeParams:
     )
 
 
-def load_production_config(
-    params: Mapping[str, Any],
-    *,
-    sku_probe: Callable[[Mapping[str, Any]], str] | None = None,
-) -> ProductionConfig:
+def load_production_config(params: Mapping[str, Any]) -> ProductionConfig:
     """从显式节点参数构造不可变生产配置。
 
-    每个安全相关值都是必填的。缺失键、错误类型与画像/设备 SKU 不匹配
-    都会在 Action 服务端构造前抛出 ProductionNodeConfigError。
+    每个安全相关值都是必填的。缺失键与错误类型都会在 Action 服务端构造前
+    抛出 ProductionNodeConfigError。
     """
     if not isinstance(params, Mapping):
         raise ProductionNodeConfigError("node parameters must be a mapping")
@@ -258,16 +252,6 @@ def load_production_config(
             )
     values["resource_limits"] = ResourceLimits(**parsed_resource_limits)
 
-    # 设备 SKU 门禁：实际设备与画像要求不一致则拒绝启动服务端
-    actual_device_sku = (sku_probe or _configured_device_sku)(params)
-    required_device_sku = values["required_device_sku"]
-    if actual_device_sku != required_device_sku:
-        raise ProductionNodeConfigError(
-            "device SKU mismatch: profile requires "
-            f"{required_device_sku!r}, configured actual device SKU is "
-            f"{actual_device_sku!r}"
-        )
-
     try:
         return ProductionConfig(**values)
     except TypeError as error:
@@ -276,12 +260,6 @@ def load_production_config(
         ) from error
     except ProductionConfigError:
         raise
-
-
-def _configured_device_sku(params: Mapping[str, Any]) -> str:
-    """读取节点参数中的实际设备 SKU（安全标识符）。"""
-    value = _required(params, "device_sku")
-    return _safe_identifier(value, "device_sku")
 
 
 def _controller_factory_for(config: ProductionConfig):
@@ -319,18 +297,14 @@ class DiagnosticsState:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self.config: ProductionConfig | None = None
-        self.actual_device_sku: str | None = None
         self.not_ready_error: str | None = None
         self.last_terminal: dict[str, Any] | None = None
         self.last_finished: dict[str, Any] | None = None
 
-    def set_config(
-        self, config: ProductionConfig, actual_device_sku: str
-    ) -> None:
-        """登记有效配置与 SKU，清除 not-ready 错误。"""
+    def set_config(self, config: ProductionConfig) -> None:
+        """登记有效配置，清除 not-ready 错误。"""
         with self._lock:
             self.config = config
-            self.actual_device_sku = actual_device_sku
             self.not_ready_error = None
 
     def set_not_ready(self, error: BaseException) -> None:
@@ -390,7 +364,6 @@ class DiagnosticsState:
         with self._lock:
             return {
                 "config": self.config,
-                "actual_device_sku": self.actual_device_sku,
                 "not_ready_error": self.not_ready_error,
                 "last_terminal": dict(self.last_terminal)
                 if self.last_terminal is not None
@@ -502,12 +475,7 @@ class ProductionNode:
             else:
                 self._config = config
                 try:
-                    self._state.set_config(
-                        config,
-                        _safe_identifier(
-                            _required(params, "device_sku"), "device_sku"
-                        ),
-                    )
+                    self._state.set_config(config)
                     self._planner = planner_factory(config)
                     self._server = server_factory(
                         action_name=self._runtime.action_name,
@@ -657,8 +625,6 @@ def _supervisor_status(
     status.message = "ready"
     status.values = [
         _kv("profile_name", config.profile_name),
-        _kv("required_device_sku", config.required_device_sku),
-        _kv("actual_device_sku", state.get("actual_device_sku", "unavailable")),
         _kv("checkpoint_sha256", config.checkpoint_sha256),
         _kv("algorithm_revision", config.algorithm_revision),
         _kv("ros_revision", config.ros_revision),
@@ -696,6 +662,7 @@ def _job_status(
         _kv("job_id", server.get("job_id", None)),
         _kv("accepted_count", server.get("accepted_count", 0)),
         _kv("busy_rejection_count", server.get("busy_rejection_count", 0)),
+        _kv("warm_fallback_count", server.get("warm_fallback_count", 0)),
         _kv("cancel_request_count", server.get("cancel_request_count", 0)),
         _kv("terminal_attempt_count", server.get("terminal_attempt_count", 0)),
     ]
@@ -807,16 +774,6 @@ def _string_value(value: Any) -> str:
     if not isinstance(value, str) or not value or "\x00" in value:
         raise ProductionNodeConfigError(
             f"parameter must be a nonempty string without NUL: {value!r}"
-        )
-    return value
-
-
-def _safe_identifier(value: Any, label: str) -> str:
-    """要求值为安全标识符（画像名/SKU 等）。"""
-    value = _string_value(value)
-    if PROFILE_NAME_RE.fullmatch(value) is None:
-        raise ProductionNodeConfigError(
-            f"{label} must be a safe identifier: {value!r}"
         )
     return value
 

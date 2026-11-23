@@ -2,13 +2,7 @@
 import numpy as np
 import json
 import time
-import sqlite3
-from pathlib import Path
 from recon.io.common import dump
-
-def readonly(path):
-    return sqlite3.connect(Path(path).resolve().as_uri()+"?mode=ro",uri=True)
-
 from .options import known_model, pipeline_options, ba_options
 
 def build(data, database, images, out, sigma=.05):

@@ -1,20 +1,8 @@
-"""Phone camera adapter to the shared Gaussian trainer.
-
-Preprocessing: python -m recon.video.extract_frames / recon.video.sfm.
-This entry consumes their cameras.npz and undistorted images, not historical code.
-"""
-import argparse
-import subprocess
-import sys
+"""Phone camera data for the shared Gaussian trainer: bounded image cache and normalization."""
 from functools import lru_cache
-from pathlib import Path
-from types import SimpleNamespace
 import cv2
 import numpy as np
-import torch
-import yaml
 from .normalization import normalize
-from recon.io.common import dump
 
 
 class Images:
@@ -42,15 +30,8 @@ class Images:
         return cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB), frame
 
 
-def load_data(out, width=1600, cache_frames=32):
-    with np.load(out / 'cameras.npz', allow_pickle=False) as z:
-        data = dict(z)
-    images = Images(out / 'undistorted', data['frame_ids'], width, cache_frames)
-    return prepare_data(data, images), images
-
-
 def prepare_data(data, images):
-    """Shared phone numeric preparation for historical and staged entry points."""
+    """Normalize phone cameras and sparse points; scale K to the cached image width."""
     norm = normalize(data)
     center, scale = np.array(norm['center']), norm['p95_radius']
     c2w = data['c2w'].astype(np.float32).copy()
@@ -67,45 +48,3 @@ def prepare_data(data, images):
                 width=images.width, height=images.height, image_cache_frames=images.get.cache_info().maxsize)
     return data
 
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--out', type=Path, required=True)
-    parser.add_argument('--config', type=Path, required=True)
-    parser.add_argument('--eval-only', action='store_true')
-    parser.add_argument('--video', type=Path, help='optionally run extraction and SfM before training')
-    args = parser.parse_args()
-    cfg = yaml.safe_load(args.config.read_text())
-    settings = cfg['train']
-    if args.video:
-        if args.eval_only:
-            parser.error('--video and --eval-only cannot be combined')
-        for module, section, extra in [('extract_frames', 'extract', ['--video', str(args.video)]),
-                                        ('sfm', 'sfm', [])]:
-            command=[sys.executable, '-m', f'recon.video.{module}', '--out', str(args.out), *extra]
-            for key,value in cfg.get(section,{}).items():
-                command.extend(['--'+key.replace('_','-'), str(value)])
-            subprocess.run(command,check=True)
-    torch.set_num_threads(4); cv2.setNumThreads(1)
-    data, images = load_data(args.out, settings.get('max_width', 1600), settings.get('image_cache_frames', 32))
-    gs = args.out / 'gs'; gs.mkdir(exist_ok=True)
-    dump(gs / 'normalization.json', data['normalization'])
-    data['c2w'] = torch.from_numpy(data['c2w']).cuda()
-    data['K'] = torch.from_numpy(data['K']).cuda()
-    lookup = {int(frame): i for i, frame in enumerate(data['frame_ids'])}
-    if not args.eval_only:
-        from recon.gaussian.train import train
-        train(data, gs, None, lambda frame,w,h: images.get(lookup[frame])[0], settings)
-    checkpoint = torch.load(gs/'final.pt', map_location='cpu', weights_only=False)
-    splats = {k:v.cuda() for k,v in checkpoint['splats'].items()}
-    from .evaluation import evaluate
-    evaluation = cfg.get('eval', {})
-    options = SimpleNamespace(omega_dir=None, depth_conf_percentile=50, floater_ratio=.7,
-                              aligned_steps=evaluation.get('alignment_steps', 200),
-                              aligned_width=evaluation.get('aligned_width', 960), aligned_colour=True)
-    with torch.no_grad():
-        evaluate(splats, data, images, checkpoint['stats'], gs, options)
-
-
-if __name__ == '__main__':
-    main()

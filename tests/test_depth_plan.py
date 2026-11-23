@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_t17_windows_exact():
     path = ROOT / 'Data/experiments/office_gs_02_20261019/T17/omega512/kf_T15A8/windows.json'
     if not path.exists():
-        pytest.skip('T17 local experiment is not distributed with the repository')
+        pytest.skip('office_gs_02 reference windows are local data, not distributed with the repository')
     reference = json.loads(path.read_text())
     assert plan_windows(reference['keyframes']) == reference['windows']
 

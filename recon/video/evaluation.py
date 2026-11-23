@@ -168,7 +168,6 @@ def aligned_evaluation(splats, data, images, out, steps, width, fit_colour=False
                 pose = se3_exp(twist)[None] @ c2w
                 prediction, _, _ = render(splats, pose, K, size[0], size[1])
                 rgb = prediction[..., :3] * colour[:3][None, None, :] + colour[3:][None, None, :]
-                fitted = dict(rgb=rgb)
                 aligned_values = score(rgb)
                 pose_only = score(prediction)
             rows.append(dict(index=index, frame=frame, fixed=fixed_values, aligned=aligned_values,

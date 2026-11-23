@@ -39,9 +39,6 @@ from .capture_node import (
     load_runtime_params,
 )
 from .continuous_session import (
-    WINDOW_SEMANTICS_NEW,
-    WINDOW_SEMANTICS_TOTAL,
-    _WINDOW_SEMANTICS,
     ContinuousConfig,
     ContinuousSession,
     JobStatus,
@@ -54,13 +51,10 @@ from .continuous_session import (
     ReconstructionBackend,
     SESSION_FATAL_OOM,
     SESSION_MEMORY_PAUSED,
-    SESSION_ALIGNMENT_PAUSED,
     SESSION_IDLE,
-    cleanup_stale_snapshots,
 )
-from .storage_retention import StoragePolicy, prune_storage
-from .pipeline_service import CameraRole
-from .pipeline_service_node import ActionlibReconstructClient
+from .action_types import CameraRole
+from .reconstruct_action_client import ActionlibReconstructClient
 
 NODE_NAME = "continuous_session_node"
 DEFAULT_SERVICE_NAME = "/continuous_session/command"
@@ -117,7 +111,7 @@ class ActionlibContinuousCaptureClient:
         self._client.cancel_goal()
 
     def outcome(self):
-        from .pipeline_service import (
+        from .action_types import (
             ACTION_CANCELLED,
             ACTION_FAILED,
             ACTION_SUCCEEDED,
@@ -289,17 +283,6 @@ class ContinuousSessionNode:
         else:
             self._config = config
             try:
-                cleanup_stale_snapshots(config)
-                if config.alignment_backend not in ("shared_point_sim3_A", "global_g4"):
-                    prune_storage(
-                        result_root=config.result_root,
-                        worker_result_root=config.expected_result_root,
-                        journal_root=config.journal_root,
-                        snapshot_roots=tuple(
-                            role.capture_config.snapshot_root for role in config.roles
-                        ),
-                        policy=_storage_policy(config),
-                    )
                 self._core = ContinuousSession(
                     config,
                     capture_client_factory=self._capture_client_factory,
@@ -461,65 +444,11 @@ class ContinuousSessionNode:
                     message += "; resident model weights released"
                 except Exception as error:
                     code, message = 3, "session stopped but GPU release failed: " + str(error)
-            if code == 0 and self._config.alignment_backend not in ("shared_point_sim3_A", "global_g4"):
-                cleanup = prune_storage(
-                    result_root=self._config.result_root,
-                    worker_result_root=self._config.expected_result_root,
-                    journal_root=self._config.journal_root,
-                    snapshot_roots=tuple(
-                        role.capture_config.snapshot_root
-                        for role in self._config.roles
-                    ),
-                    policy=_storage_policy(self._config),
-                )
-                if cleanup["errors"]:
-                    message += "; storage cleanup warning: " + "; ".join(
-                        cleanup["errors"]
-                    )
         elif command == ContinuousSessionCommandRequest.GET_STATUS:
             code, message = 0, "status"
-        elif command == ContinuousSessionCommandRequest.SET_PARAMS and request.reconstruction_mode:
-            code, message = 5, "reconstruction_mode is fixed for the session; stop and start a new session"
         elif command == ContinuousSessionCommandRequest.SET_PARAMS:
-            code, message = self._core.set_params(
-                sample_fps=(
-                    float(request.sample_fps) if request.sample_fps > 0 else None
-                ),
-                window_frames=(
-                    int(request.window_frames) if request.window_frames > 0 else None
-                ),
-                overlap_frames=(
-                    int(request.overlap_frames)
-                    if request.set_overlap_frames
-                    else None
-                ),
-                queue_mode=request.queue_mode or None,
-                queue_capacity=(
-                    int(request.queue_capacity) if request.queue_capacity > 0 else None
-                ),
-                max_retries=(
-                    int(request.max_retries) if request.set_max_retries else None
-                ),
-                keep_snapshot_on_success=(
-                    bool(request.keep_snapshot_on_success)
-                    if request.set_keep_snapshot
-                    else None
-                ),
-                save_sensor_depth=(
-                    bool(request.save_sensor_depth)
-                    if request.set_save_sensor_depth
-                    else None
-                ),
-                inference_resolution=(
-                    int(request.inference_resolution)
-                    if request.set_inference_resolution
-                    else None
-                ),
-                worker_timeout_sec=(
-                    float(request.worker_timeout_sec)
-                    if request.set_worker_timeout
-                    else None
-                ),
+            code, message = 5, (
+                "session parameters are fixed; stop and start a session with another profile"
             )
         else:
             code, message = 1, f"unknown command {command}"
@@ -578,6 +507,16 @@ def _expected_reconstruction_field(params: Mapping[str, Any], key: str) -> str:
     return value
 
 
+# minimum_total_frames only acted under new_frames and is ignored like any other extra key.
+_REMOVED_KEYS = {
+    "window_frame_semantics": "total_frames",
+    "window_plan_path": "",
+    "threshold_table_path": "",
+    "threshold_group": "",
+    "fit_exclusion_source": "",
+}
+
+
 def load_continuous_config(
     params: Mapping[str, Any],
     *,
@@ -586,40 +525,31 @@ def load_continuous_config(
 ) -> ContinuousConfig:
     if not isinstance(params, Mapping):
         raise ContinuousNodeConfigError("node parameters must be a mapping")
-    if params.get("alignment_backend") == "shared_point_sim3_A":
-        method_label = "A"
-        expected = params.get("expected_reconstruction") or {}
-        for name, value in (
-            ("image_resolution", 384), ("frame_group_size", 120),
-            ("aggregator_frame_chunk_size", 10), ("load_mode", "max_size"),
-            ("checkpoint_sha256", "c02da418b18bb01d0392598d3f6147366bcde1bb70fd08a5e3bf7925b0667934"),
-        ):
-            if expected.get(name) != value:
-                raise ContinuousNodeConfigError(f"{method_label} requires expected_reconstruction/{name}={value}")
-    # 两种语义都必须与 frame_group_size 精确对齐，否则 worker 会静默抽帧；
-    # 该字段与后端无关，因此无条件解析。
-    semantics = str(params.get("window_frame_semantics", WINDOW_SEMANTICS_TOTAL))
-    if semantics not in _WINDOW_SEMANTICS:
-        raise ContinuousNodeConfigError(
-            f"window_frame_semantics must be one of {_WINDOW_SEMANTICS!r}"
-        )
-    expected = params.get("expected_reconstruction") or {}
-    default_backend = "global_g4" if expected.get("backend", "omega") == "omega" else "odom_pose_constrained_sim3"
-    if params.get("alignment_backend", default_backend) == "global_g4":
-        for name, value in (("aggregator_frame_chunk_size", 10), ("load_mode", "max_size")):
-            if expected.get(name) != value:
-                raise ContinuousNodeConfigError(f"G4 requires expected_reconstruction/{name}={value}")
-        resolution = expected.get("image_resolution")
-        if isinstance(resolution, bool) or not isinstance(resolution, int) or resolution <= 0 or resolution % 16:
-            raise ContinuousNodeConfigError("G4 requires expected_reconstruction/image_resolution to be a multiple of 16")
-        total = _positive_integer(params.get("initial_window_frames", 16), "initial_window_frames")
-        if semantics == WINDOW_SEMANTICS_NEW:
-            total += _nonnegative_integer(params.get("initial_overlap_frames", 0), "initial_overlap_frames")
-        if expected.get("frame_group_size") != total:
+    # 部署机上的旧配置可能还留着已删功能（分窗清单、图配准）的键：取中性值时忽略，
+    # 取了别的值就报错，不能悄悄按另一套配置运行。
+    for key, neutral in _REMOVED_KEYS.items():
+        if key in params and params[key] != neutral:
             raise ContinuousNodeConfigError(
-                "G4 frame_group_size must equal the model input frames "
-                f"({total} for window_frame_semantics={semantics}; no subsampling)"
+                f"{key}={params[key]!r} selects a removed feature; delete the key"
             )
+    expected = params.get("expected_reconstruction") or {}
+    alignment_backend = str(params.get("alignment_backend", "global_g4"))
+    if alignment_backend != "global_g4":
+        raise ContinuousNodeConfigError(
+            f"alignment_backend must be 'global_g4', got {alignment_backend!r}"
+        )
+    for name, value in (("aggregator_frame_chunk_size", 10), ("load_mode", "max_size")):
+        if expected.get(name) != value:
+            raise ContinuousNodeConfigError(f"G4 requires expected_reconstruction/{name}={value}")
+    resolution = expected.get("image_resolution")
+    if isinstance(resolution, bool) or not isinstance(resolution, int) or resolution <= 0 or resolution % 16:
+        raise ContinuousNodeConfigError("G4 requires expected_reconstruction/image_resolution to be a multiple of 16")
+    total = _positive_integer(params.get("initial_window_frames", 16), "initial_window_frames")
+    if expected.get("frame_group_size") != total:
+        raise ContinuousNodeConfigError(
+            "G4 frame_group_size must equal the model input frames "
+            f"({total}; no subsampling)"
+        )
     roles_param = _required(params, "roles")
     if not isinstance(roles_param, Mapping) or not roles_param:
         raise ContinuousNodeConfigError("roles must be a nonempty mapping")
@@ -691,15 +621,7 @@ def load_continuous_config(
         initial_overlap_frames=_nonnegative_integer(
             params.get("initial_overlap_frames", 0), "initial_overlap_frames"
         ),
-        window_frame_semantics=semantics,
-        minimum_total_frames=_positive_integer(
-            params.get("minimum_total_frames", 100), "minimum_total_frames"
-        ),
-        window_plan_path=str(params.get("window_plan_path", "")),
-        fit_exclusion_source=str(params.get("fit_exclusion_source", "")),
-        threshold_table_path=str(params.get("threshold_table_path", "")),
-        threshold_group=str(params.get("threshold_group", "")),
-        g4_placement=str(params.get("g4_placement", "graph")),
+        g4_placement=str(params.get("g4_placement", "frame_pose")),
         pose_time_offset_ms=_finite_number(params.get("pose_time_offset_ms", 0.0), "pose_time_offset_ms"),
         pose_time_offset_stage=str(params.get("pose_time_offset_stage", "backend")),
         frame_pose_fusion=_required_bool(params.get("frame_pose_fusion", False), "frame_pose_fusion"),
@@ -717,17 +639,6 @@ def load_continuous_config(
             _required(params, "initial_keep_snapshot_on_success"),
             "initial_keep_snapshot_on_success",
         ),
-        retention_max_sessions=_positive_integer(
-            params.get("retention_max_sessions", 3), "retention_max_sessions"
-        ),
-        retention_frame_pool_revisions=_positive_integer(
-            params.get("retention_frame_pool_revisions", 2),
-            "retention_frame_pool_revisions",
-        ),
-        retention_orphan_grace_sec=_nonnegative_finite(
-            params.get("retention_orphan_grace_sec", 86400.0),
-            "retention_orphan_grace_sec",
-        ),
         initial_inference_resolution=_optional_inference_resolution(
             params.get("initial_inference_resolution", 0)
         ),
@@ -737,29 +648,8 @@ def load_continuous_config(
         initial_reconstruction_mode=_reconstruction_mode(
             params.get("initial_reconstruction_mode", "per_window")
         ),
-        alignment_backend=str(params.get("alignment_backend", default_backend)),
+        alignment_backend=alignment_backend,
         reconstruction_backend=str((params.get("expected_reconstruction") or {}).get("backend", "omega")),
-        odom_local_enabled=_required_bool(
-            params.get("odom_local_enabled", True), "odom_local_enabled"
-        ),
-        odom_min_correspondences=_positive_integer(
-            params.get("odom_min_correspondences", 4),
-            "odom_min_correspondences",
-        ),
-        odom_min_baseline_m=_positive_finite(
-            params.get("odom_min_baseline_m", 0.1), "odom_min_baseline_m"
-        ),
-        odom_max_orientation_residual_deg=_positive_finite(
-            params.get("odom_max_orientation_residual_deg", 15.0),
-            "odom_max_orientation_residual_deg",
-        ),
-        odom_max_normalized_residual_rms=_positive_finite(
-            params.get("odom_max_normalized_residual_rms", 0.25),
-            "odom_max_normalized_residual_rms",
-        ),
-        odom_reset_jump_m=_positive_finite(
-            params.get("odom_reset_jump_m", 5.0), "odom_reset_jump_m"
-        ),
         expected_checkpoint_sha256=_expected_reconstruction_field(
             params, "checkpoint_sha256"
         ),
@@ -777,14 +667,6 @@ def load_continuous_config(
         cuda_visible_devices=str(os.environ.get("CUDA_VISIBLE_DEVICES", "")),
     )
     return config
-
-
-def _storage_policy(config: ContinuousConfig) -> StoragePolicy:
-    return StoragePolicy(
-        max_sessions=config.retention_max_sessions,
-        frame_pool_keep_revisions=config.retention_frame_pool_revisions,
-        orphan_grace_sec=config.retention_orphan_grace_sec,
-    )
 
 
 def _status_response(status, fallback_error: str) -> ContinuousSessionCommandResponse:
@@ -860,6 +742,7 @@ def assemble_continuous_diagnostics(
     message.status = [
         _server_status(config, core_snapshot, not_ready_error),
         _capture_status(core_snapshot, not_ready_error),
+        _map_backend_status(core_snapshot, not_ready_error),
         _fifo_status(core_snapshot, not_ready_error),
         _worker_status(core_snapshot, not_ready_error),
     ]
@@ -875,7 +758,7 @@ def _server_status(config, core_snapshot, not_ready_error):
         status.values = [_kv("error", status.message)]
         return status
     state = core_snapshot.get("state", SESSION_IDLE) if core_snapshot else SESSION_IDLE
-    if state in (SESSION_FATAL_OOM, SESSION_MEMORY_PAUSED, SESSION_ALIGNMENT_PAUSED):
+    if state in (SESSION_FATAL_OOM, SESSION_MEMORY_PAUSED):
         status.level = DiagnosticStatus.ERROR
     elif core_snapshot.get("disk_redline") or core_snapshot.get("worker_disk_blocked"):
         status.level = DiagnosticStatus.WARN
@@ -890,7 +773,6 @@ def _server_status(config, core_snapshot, not_ready_error):
         _kv("journal_root", config.journal_root),
         _kv("min_free_disk_gb", core_snapshot.get("min_free_disk_gb") if core_snapshot else None),
         _kv("disk_free_gb", core_snapshot.get("disk_free_gb") if core_snapshot else None),
-        _kv("map_epoch", core_snapshot.get("map_epoch") if core_snapshot else None),
         _kv("last_alignment_state", core_snapshot.get("last_alignment_state") if core_snapshot else None),
         _kv("formal_windows", core_snapshot.get("formal_windows") if core_snapshot else None),
         _kv("formal_records_root", core_snapshot.get("formal_records_root") if core_snapshot else None),
@@ -911,21 +793,36 @@ def _capture_status(core_snapshot, not_ready_error):
         _kv("window_index", core_snapshot.get("window_index", 0)),
         _kv("captured_frames", core_snapshot.get("captured_frames", 0)),
         _kv("capture_target_frames", core_snapshot.get("capture_target_frames", 0)),
-        _kv("pool_eligible_frames", core_snapshot.get("pool_eligible_frames", 0)),
-        _kv("pool_target_frames", core_snapshot.get("pool_target_frames", 0)),
-        _kv("pool_waiting_for_frames", core_snapshot.get("pool_waiting_for_frames", False)),
         _kv("capture_queue_blocked", core_snapshot.get("capture_queue_blocked", False)),
         _kv("effective_sample_fps", core_snapshot.get("effective", {}).get("sample_fps")),
         _kv("effective_window_frames", core_snapshot.get("effective", {}).get("window_frames")),
         _kv("effective_overlap_frames", core_snapshot.get("effective", {}).get("overlap_frames")),
-        _kv("alignment_backend", core_snapshot.get("alignment_backend", "odom_pose_constrained_sim3")),
-        _kv("g4_state", core_snapshot.get("g4", {}).get("state", "waiting")),
-        _kv("g4_revision", core_snapshot.get("g4", {}).get("revision", 0)),
-        _kv("g4_error", core_snapshot.get("g4", {}).get("error", "")),
-        _kv("g4_exit_code", core_snapshot.get("g4", {}).get("exit_code")),
+        _kv("alignment_backend", core_snapshot.get("alignment_backend", "global_g4")),
         _kv("model_input_frames", core_snapshot.get("model_input_frames")),
         _kv("new_input_frames", core_snapshot.get("new_input_frames")),
         _kv("shared_input_frames", core_snapshot.get("shared_input_frames")),
+    ]
+    return status
+
+
+def _map_backend_status(core_snapshot, not_ready_error):
+    """地图后端（G4 后台进程）。出错时为 ERROR；采集和重建不因此停下。"""
+    status = DiagnosticStatus()
+    status.name = "drone3d/session/map_backend"
+    if not_ready_error is not None or core_snapshot is None:
+        status.level = DiagnosticStatus.ERROR
+        status.message = not_ready_error or "unavailable"
+        return status
+    g4 = core_snapshot.get("g4", {})
+    state = g4.get("state", "waiting")
+    failed = state == "error" or g4.get("exit_code") not in (None, 0)
+    status.level = DiagnosticStatus.ERROR if failed else DiagnosticStatus.OK
+    status.message = (g4.get("error") or f"state {state}") if failed else str(state)
+    status.values = [
+        _kv("g4_state", state),
+        _kv("g4_revision", g4.get("revision", 0)),
+        _kv("g4_error", g4.get("error", "")),
+        _kv("g4_exit_code", g4.get("exit_code")),
     ]
     return status
 
@@ -976,6 +873,7 @@ def _worker_status(core_snapshot, not_ready_error):
         _kv("running_window", running["window_index"] if running else 0),
         _kv("succeeded_windows", core_snapshot.get("succeeded_windows", 0)),
         _kv("failed_windows", core_snapshot.get("failed_windows", 0)),
+        _kv("missing_pose_frames", core_snapshot.get("missing_pose_frames", 0)),
         _kv("memory_paused", core_snapshot.get("memory_paused", False)),
         _kv("oom_latched", core_snapshot.get("oom_latched", False)),
         _kv("retry_window", core_snapshot.get("retry_window")),
@@ -1022,17 +920,6 @@ def _positive_finite(value, label):
     converted = float(value)
     if not math.isfinite(converted) or converted <= 0:
         raise ContinuousNodeConfigError(f"{label} must be positive and finite")
-    return converted
-
-
-def _nonnegative_finite(value, label):
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ContinuousNodeConfigError(f"{label} must be a finite number")
-    converted = float(value)
-    if not math.isfinite(converted) or converted < 0:
-        raise ContinuousNodeConfigError(
-            f"{label} must be nonnegative and finite"
-        )
     return converted
 
 
@@ -1092,8 +979,8 @@ def _optional_worker_timeout(value):
 
 
 def _queue_mode(value):
-    if value not in (QUEUE_LOSSLESS, "realtime_latest"):
-        raise ContinuousNodeConfigError("queue mode must be lossless_fifo or realtime_latest")
+    if value != QUEUE_LOSSLESS:
+        raise ContinuousNodeConfigError("queue mode must be lossless_fifo")
     return value
 
 

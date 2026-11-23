@@ -18,7 +18,6 @@ add_action_files(
 add_service_files(
   DIRECTORY srv
   FILES
-    PipelineCommand.srv
     CaptureControl.srv
     ContinuousSessionCommand.srv
 )

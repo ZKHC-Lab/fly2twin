@@ -37,7 +37,6 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 from .formal_result import (
     scan_session_windows,
 )
-from .frame_pool import RECONSTRUCTION_MODE_FRAME_POOL, RECONSTRUCTION_MODES
 from .odom_local import (
     COORDINATE_MODEL_LOCAL_UNALIGNED,
     COORDINATE_ODOM_LOCAL_APPROX,
@@ -68,33 +67,18 @@ _COORDINATE_STATES = frozenset(
 _ALIGNED_STATES = frozenset(
     (COORDINATE_ODOM_LOCAL_APPROX,)
 )
-_QUEUE_MODES = frozenset(("lossless_fifo", "realtime_latest"))
 _COMMAND_KEYS = {
     "pause": frozenset(),
     "resume": frozenset(),
     "stop_all": frozenset(),
     "select_source": frozenset(("role",)),
-    "start_session": frozenset(("role", "reconstruction_mode")),
+    "start_session": frozenset(("role",)),
     "follow_latest": frozenset(("value",)),
     "set_preview_fps": frozenset(("value",)),
     "select_session": frozenset(("session_id",)),
-    "set_params": frozenset(
-        (
-            "sample_fps",
-            "window_frames",
-            "overlap_frames",
-            "queue_mode",
-            "queue_capacity",
-            "max_retries",
-            "keep_snapshot_on_success",
-            "save_sensor_depth",
-            "inference_resolution",
-            "worker_timeout_sec",
-        )
-    ),
 }
 _COMMANDS_THAT_FORWARD = frozenset(
-    ("pause", "resume", "stop_all", "select_source", "start_session", "set_params")
+    ("pause", "resume", "stop_all", "select_source", "start_session")
 )
 
 
@@ -497,16 +481,7 @@ def _latest_window_record(records):
     if not records:
         return None
 
-    def order(record):
-        window_index = int(record.get("window_index", 0))
-        if record.get("reconstruction_mode") != RECONSTRUCTION_MODE_FRAME_POOL:
-            return window_index, window_index
-        try:
-            return int(record.get("pool_revision", -1)), window_index
-        except (TypeError, ValueError):
-            return -1, window_index
-
-    return max(records, key=order)
+    return max(records, key=lambda record: int(record.get("window_index", 0)))
 
 
 def _record_alignment(record) -> dict:
@@ -883,84 +858,12 @@ class WebDashboardCore:
             if role not in self._config.roles:
                 raise WebDashboardError(f"unknown role {role!r}")
             args["role"] = role
-            if command == "start_session":
-                mode = payload.get("reconstruction_mode", "")
-                if not isinstance(mode, str) or (
-                    mode and mode not in RECONSTRUCTION_MODES
-                ):
-                    raise WebDashboardError(
-                        f"reconstruction_mode must be empty or one of "
-                        f"{RECONSTRUCTION_MODES!r}"
-                    )
-                args["reconstruction_mode"] = mode
         elif command == "follow_latest":
             args["value"] = _parse_bool(payload.get("value"), "value")
         elif command == "set_preview_fps":
             args["value"] = _parse_finite_positive(payload.get("value"), "value")
         elif command == "select_session":
             args["session_id"] = _parse_session_id(payload.get("session_id"))
-        elif command == "set_params":
-            if not any(key in payload for key in _COMMAND_KEYS["set_params"]):
-                raise WebDashboardError("set_params requires at least one field")
-            if "sample_fps" in payload:
-                args["sample_fps"] = _parse_finite_positive(payload["sample_fps"], "sample_fps")
-            if "window_frames" in payload:
-                args["window_frames"] = _parse_positive_int(payload["window_frames"], "window_frames")
-            if "overlap_frames" in payload:
-                value = payload["overlap_frames"]
-                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                    raise WebDashboardError(
-                        "overlap_frames must be a nonnegative integer"
-                    )
-                args["overlap_frames"] = value
-            if "queue_mode" in payload:
-                mode = payload["queue_mode"]
-                if not isinstance(mode, str) or mode not in _QUEUE_MODES:
-                    raise WebDashboardError(
-                        "queue_mode must be lossless_fifo or realtime_latest"
-                    )
-                args["queue_mode"] = mode
-            if "queue_capacity" in payload:
-                args["queue_capacity"] = _parse_positive_int(payload["queue_capacity"], "queue_capacity")
-            if "max_retries" in payload:
-                value = payload["max_retries"]
-                if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-                    raise WebDashboardError("max_retries must be a nonnegative integer")
-                args["max_retries"] = value
-            if "keep_snapshot_on_success" in payload:
-                args["keep_snapshot_on_success"] = _parse_bool(
-                    payload["keep_snapshot_on_success"], "keep_snapshot_on_success"
-                )
-            if "save_sensor_depth" in payload:
-                args["save_sensor_depth"] = _parse_bool(
-                    payload["save_sensor_depth"], "save_sensor_depth"
-                )
-            if "inference_resolution" in payload:
-                value = payload["inference_resolution"]
-                if isinstance(value, bool) or not isinstance(value, int):
-                    raise WebDashboardError(
-                        "inference_resolution must be an integer"
-                    )
-                if value != 0 and (
-                    value < 32 or value > 4096 or value % 16 != 0
-                ):
-                    raise WebDashboardError(
-                        "inference_resolution must be 0 (inherit) or a multiple "
-                        "of 16 in [32, 4096]"
-                    )
-                args["inference_resolution"] = value
-            if "worker_timeout_sec" in payload:
-                value = payload["worker_timeout_sec"]
-                if isinstance(value, bool) or not isinstance(value, (int, float)):
-                    raise WebDashboardError(
-                        "worker_timeout_sec must be a finite number"
-                    )
-                value = float(value)
-                if not math.isfinite(value) or value < 0:
-                    raise WebDashboardError(
-                        "worker_timeout_sec must be 0.0 or positive finite"
-                    )
-                args["worker_timeout_sec"] = value
         full = {"command": command}
         full.update(args)
         return full
@@ -1160,14 +1063,12 @@ class WebDashboardCore:
             "window_index": diagnostics.get("window_index", 0),
             "captured_frames": diagnostics.get("captured_frames", 0),
             "capture_target_frames": diagnostics.get("capture_target_frames", 0),
-            "pool_eligible_frames": diagnostics.get("pool_eligible_frames", 0),
-            "pool_target_frames": diagnostics.get("pool_target_frames", 0),
-            "pool_waiting_for_frames": diagnostics.get("pool_waiting_for_frames", False),
             "pending_windows": diagnostics.get("pending_windows", 0),
             "running_window": diagnostics.get("running_window"),
             "worker_running_active": bool(diagnostics.get("worker_running_active")),
             "succeeded_windows": diagnostics.get("succeeded_windows", 0),
             "failed_windows": diagnostics.get("failed_windows", 0),
+            "missing_pose_frames": diagnostic_int("missing_pose_frames"),
             "memory_paused": bounded_text("memory_paused").lower() == "true",
             "oom_latched": bounded_text("oom_latched").lower() == "true",
             "retry_window": diagnostic_int("retry_window"),
@@ -1213,7 +1114,6 @@ class WebDashboardCore:
             "service_wall_time_sec": diagnostics.get("service_wall_time_sec"),
             "service_budget_sec": diagnostics.get("service_budget_sec"),
             "aux_coverage": bounded_text("aux_coverage"),
-            "map_epoch": diagnostics.get("map_epoch", 0),
             "last_alignment_state": diagnostics.get(
                 "last_alignment_state", COORDINATE_MODEL_LOCAL_UNALIGNED
             ),
@@ -1269,13 +1169,6 @@ class WebDashboardCore:
                     "pending": bool(alignment.get("pending", False)),
                     "config_digest": record.get("config_digest", ""),
                     "reconstruction_mode": record.get("reconstruction_mode", ""),
-                    "pool_revision": record.get("pool_revision"),
-                    "pool_epoch": record.get("pool_epoch"),
-                    "pool_size": record.get("pool_size"),
-                    "pool_selected_indices": record.get("pool_selected_indices"),
-                    "confidence_summary": record.get("confidence_summary")
-                    if isinstance(record.get("confidence_summary"), dict)
-                    else None,
                     "effective_config": effective if isinstance(effective, dict) else {},
                     "worker": record.get("worker") if isinstance(record.get("worker"), dict) else {},
                     "result_manifest_sha256": record.get("result_manifest_sha256", ""),
@@ -1299,39 +1192,33 @@ class WebDashboardCore:
             raise WebDashboardError("unknown session", 404)
         if not isinstance(map_id, str) or not map_id:
             raise WebDashboardError("map must be a nonempty string", 400)
-        latest = _latest_window_record(records)
-        if latest is not None and latest.get("reconstruction_mode") == RECONSTRUCTION_MODE_FRAME_POOL:
+        aligned_records = []
+        for record in records:
+            if _record_coordinate_state(record) not in _ALIGNED_STATES:
+                continue
+            if _record_alignment(record).get("map_id") != map_id:
+                continue
+            if not include_rejected and not _record_quality_passed(record):
+                continue
+            if _aligned_transform(record) is None:
+                continue
+            aligned_records.append(record)
+
+        if aligned_records:
+            selected_records = aligned_records
+            aligned = True
+            reason = _record_coordinate_state(aligned_records[-1])
+        else:
+            if _session_has_aligned_windows(records, include_rejected):
+                raise WebDashboardError("unknown map for this session", 404)
+            if any(_record_alignment(r).get("method") == "global_g4" for r in records):
+                raise WebDashboardError("G4 processing: no global map revision yet", 409)
+            latest = _latest_window_record(records)
+            if latest is None or _record_coordinate_state(latest) != COORDINATE_MODEL_LOCAL_UNALIGNED:
+                raise WebDashboardError("no displayable window for this session", 404)
             selected_records = [latest]
             aligned = False
-            reason = "frame_pool: latest reconstruction only"
-        else:
-            aligned_records = []
-            for record in records:
-                if _record_coordinate_state(record) not in _ALIGNED_STATES:
-                    continue
-                if _record_alignment(record).get("map_id") != map_id:
-                    continue
-                if not include_rejected and not _record_quality_passed(record):
-                    continue
-                if _aligned_transform(record) is None:
-                    continue
-                aligned_records.append(record)
-
-            if aligned_records:
-                selected_records = aligned_records
-                aligned = True
-                reason = _record_coordinate_state(aligned_records[-1])
-            else:
-                if _session_has_aligned_windows(records, include_rejected):
-                    raise WebDashboardError("unknown map for this session", 404)
-                if any(_record_alignment(r).get("method") == "global_g4" for r in records):
-                    raise WebDashboardError("G4 processing: no global map revision yet", 409)
-                latest = _latest_window_record(records)
-                if latest is None or _record_coordinate_state(latest) != COORDINATE_MODEL_LOCAL_UNALIGNED:
-                    raise WebDashboardError("no displayable window for this session", 404)
-                selected_records = [latest]
-                aligned = False
-                reason = _record_alignment(latest).get("reason", "") or "MODEL_LOCAL_UNALIGNED"
+            reason = _record_alignment(latest).get("reason", "") or "MODEL_LOCAL_UNALIGNED"
 
         fingerprint = tuple(
             (int(record.get("window_index", -1)), str(record.get("result_manifest_sha256", "")),
@@ -1500,9 +1387,8 @@ class WebDashboardCore:
                 world = np.asarray(data["world_points_from_depth"])
                 conf = np.asarray(data["depth_conf"])
                 images = np.asarray(data["images"])
-                is_shared_a = str(_record_alignment(record).get("method", "")).startswith("shared_point_sim3_A")
                 is_g4 = _record_alignment(record).get("method") == "global_g4"
-                depth = np.asarray(data["depth"])[..., 0] if (is_shared_a or is_g4) else None
+                depth = np.asarray(data["depth"])[..., 0] if is_g4 else None
                 g4_mask = None
                 if is_g4:
                     from scipy.ndimage import maximum_filter, minimum_filter
@@ -1630,7 +1516,7 @@ class WebDashboardCore:
                 raw_rgb = images.reshape(-1, 3)[valid_indices]
                 new_rgb = (
                     np.rint(raw_rgb * 255).clip(0, 255).astype(np.uint8)
-                    if (is_shared_a or is_g4) else _image_to_rgb_u8(raw_rgb)
+                    if is_g4 else _image_to_rgb_u8(raw_rgb)
                 )
                 windows.append(int(record.get("window_index", 0)))
                 priorities = np.concatenate((priorities, new_priorities))
@@ -2238,6 +2124,7 @@ button:disabled{opacity:.45;cursor:default}
 <header>
   <h1>无人机三维重建地面站软件</h1>
   <span class="badge" id="alignment-badge">对齐状态: --</span>
+  <span class="badge unreliable" id="g4-badge" hidden>地图后端出错，采集继续</span>
   <span class="badge" id="view-session-badge">查看: --</span>
   <span class="badge" id="live-session-badge">控制: --</span>
 </header>
@@ -2297,30 +2184,10 @@ button:disabled{opacity:.45;cursor:default}
     <h2>控制 <span class="hint" id="control-target">live session: --</span></h2>
     <div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap">
       <select id="start-role" title="新重建使用的相机角色"></select>
-      <select id="start-mode" title="新 session 的重建模式；运行中不可切换">
-        <option value="per_window">增量（逐窗对齐累计）</option>
-        <option value="frame_pool">帧数池（全局采样重建）</option>
-      </select>
       <button id="btn-start" class="primary command-control" title="在 IDLE/STOPPED 时开始新重建">开始新重建</button>
       <button id="btn-pause-resume" class="command-control" title="运行中暂停；暂停后恢复">暂停/恢复</button>
       <button id="btn-stop" class="danger command-control" title="停止采集；已采集的窗口继续重建完再结束">停止</button>
     </div>
-    <form id="params-form" novalidate>
-      <div class="muted" style="margin-bottom:4px">当前值自动填入；留空或选“不变”表示不修改该项。</div>
-      <table>
-        <tr><th>采样帧率 <span class="muted">sample_fps</span></th><td><input type="number" id="p-sample-fps" step="0.1" min="0.1" placeholder="Hz，例如 5.0"></td></tr>
-        <tr><th>每窗帧数 <span class="muted">window_frames</span></th><td><input type="number" id="p-window-frames" step="1" min="1" placeholder="例如 100"></td></tr>
-        <tr><th>重叠帧数 <span class="muted">overlap_frames</span></th><td><input type="number" id="p-overlap-frames" step="1" min="0" placeholder="0=独立窗；>0 复用上一窗尾部帧"></td></tr>
-        <tr><th>队列模式 <span class="muted">queue_mode</span></th><td><select id="p-queue-mode"><option value="">不变</option><option value="lossless_fifo">lossless_fifo（不丢帧，可能积压）</option><option value="realtime_latest">realtime_latest（只留最新）</option></select></td></tr>
-        <tr><th>队列容量 <span class="muted">queue_capacity</span></th><td><input type="number" id="p-queue-capacity" step="1" min="1" placeholder="待重建窗口上限"></td></tr>
-        <tr><th>失败重试次数 <span class="muted">max_retries</span></th><td><input type="number" id="p-max-retries" step="1" min="0" placeholder="0 = 失败即停"></td></tr>
-        <tr><th>保留成功快照 <span class="muted">keep_snapshot_on_success</span></th><td><select id="p-keep-snapshot"><option value="">不变</option><option value="true">是（保留）</option><option value="false">否（重建后清理）</option></select></td></tr>
-        <tr><th>保存传感器深度 <span class="muted">save_sensor_depth</span></th><td><select id="p-save-depth"><option value="">不变</option><option value="true">是</option><option value="false">否</option></select></td></tr>
-        <tr><th>推理分辨率 <span class="muted">inference_resolution</span></th><td><input type="number" id="p-inference-resolution" step="16" min="0" placeholder="0=继承；或 32..4096 的 16 倍数"></td></tr>
-        <tr><th>重建超时 <span class="muted">worker_timeout_sec</span></th><td><input type="number" id="p-worker-timeout" step="0.5" min="0" placeholder="秒；0=继承 profile"></td></tr>
-      </table>
-      <button type="submit" class="primary command-control">应用重建参数</button>
-    </form>
     <form id="preview-form" style="margin-top:8px">
       <label>Web 预览帧率 <span class="muted">web_preview_fps</span> <input type="number" id="p-preview-fps" step="0.5" min="0.5" max="30"></label>
       <button type="submit" class="command-control">应用预览帧率</button>
@@ -2333,7 +2200,7 @@ button:disabled{opacity:.45;cursor:default}
 var state = {selected_session:"", view_session:"", sessions:[], roles:[], preview_fps:5, formal_records:[], status:{}, diagnostics:{}};
 var stateTimer=null, stateInFlight=false, stateFailures=0, lastStateOk=0, recordsKey="", recordsInFlight=false;
 var omegaFailures=0,pcFailures=0,omegaRetryTimer=null,pcRetryTimer=null,omegaInFlight="",pcInFlight="";
-var commandInFlight=false, previewDirty=false, paramsDirty=false, modeDirty=false, mapDirty=false, rendererState="new";
+var commandInFlight=false, previewDirty=false, mapDirty=false, rendererState="new";
 var pc = {count:0, positions:null, colors:null, positionBuffer:null, colorBuffer:null, axisPositionBuffer:null, axisColorBuffer:null, bounds:null, zUp:false};
 var gl = null, glProgram=null, omegaObjectUrl="";
 var viewSession=storageGet("drone3d.view_session","");
@@ -2357,6 +2224,7 @@ function boolLabel(v){if(v===undefined||v===null||v==="")return "未接入"; if(
 function runningActive(st){return !!st.worker_running_active || (st.running_window!==undefined&&st.running_window!==null&&typeof st.running_window==="object")}
 function runningLabel(rw,active){if(rw!==undefined&&rw!==null&&typeof rw==="object"){if(rw.window_index!==undefined&&rw.window_index!==null)return "窗口 "+esc(rw.window_index); return "空闲"} if(active)return "窗口 "+esc(rw); if(rw===undefined||rw===null||rw===""||rw===0)return "空闲"; return "窗口 "+esc(rw)}
 function depthMetricsLabel(records){for(var i=(records||[]).length-1;i>=0;i--){var r=records[i]||{}; var dm=r.depth_metrics; if(dm&&typeof dm==="object"){if(dm.status==="unavailable")return "不可用: "+esc(dm.reason||r.depth_metrics_error||"计算失败"); if(dm.coverage!==undefined&&dm.abs_rel!==undefined&&dm.rmse!==undefined)return esc(dm.coverage)+" / "+esc(dm.abs_rel)+" / "+esc(dm.rmse)} if(r.depth_metrics_error)return "不可用: "+esc(r.depth_metrics_error)} return "无深度对照指标"}
+function g4Failed(g4s){return !!g4s&&(g4s.state==="error"||(g4s.exit_code!=null&&Number(g4s.exit_code)!==0))}
 function updateStatus(compact,raw){var d=(raw&&typeof raw==="object")?raw:compact; state.status=compact||{}; state.diagnostics=raw||d||{}; var v=parseDiagValues(d); var rows=[];
  function row(a,b){rows.push("<tr><th>"+a+"</th><td class='mono'>"+b+"</td></tr>")}
  var eff=(d&&d.effective)||{}; var st=d||{};
@@ -2365,26 +2233,23 @@ function updateStatus(compact,raw){var d=(raw&&typeof raw==="object")?raw:compac
  var mem=vget([v.memory_mb, v.memory, v.mem]); var gpuName=vget([v.gpu_name, v.gpu]); var gpuUtil=vget([v.gpu_util]); var temp=vget([v.temp_c, v.temp, v.temperature]);
  row("live session", fmt(st.session_id)); row("运行/暂停", fmt(st.state));
  row("本次新增采集帧 k/N", fmt(st.captured_frames)+" / "+fmt(st.capture_target_frames));
- if(st.alignment_backend==="global_g4"&&st.reconstruction_mode!=="frame_pool"){
+ if(st.alignment_backend==="global_g4"){
   row("配准方法", "G4 全局配准");
   row("G4 状态 / 地图版本",fmt((st.g4||{}).state)+" / "+fmt((st.g4||{}).revision));
   var g4s=(st.g4||{}); var g4Bad=(g4s.state==="error"||g4s.state==="stopped"||g4s.exit_code!=null);
+  var g4Badge=$("g4-badge"); g4Badge.hidden=!g4Failed(g4s); g4Badge.title=g4Failed(g4s)?String(g4s.error||("状态 "+g4s.state+" 退出码 "+g4s.exit_code))+"。窗口照常采集和重建，但没有被放进地图；落地后可以重算。":"";
   row("G4 提示",fmt(g4s.error || (g4Bad ? ("状态 "+fmtOrNA(g4s.state)+" 退出码 "+fmtOrNA(g4s.exit_code)) : (g4s.state ? "无错误" : "等待后台启动"))));
-  row("每批新增 / 共享 / 模型输入",fmt(st.new_input_frames)+" / "+fmt(st.shared_input_frames)+" / "+fmt(st.model_input_frames));
- }else if(st.alignment_backend==="shared_point_sim3_A"&&st.reconstruction_mode!=="frame_pool"){
-  row("配准方法", "共享RGB点 Sim(3)");
   row("每批新增 / 共享 / 模型输入",fmt(st.new_input_frames)+" / "+fmt(st.shared_input_frames)+" / "+fmt(st.model_input_frames));
  }else{row("重建窗口总帧", fmt(vget([(eff&&eff.window_frames), st.window_frames])));}
  row("已采集窗口", fmt(vget([st.window_index, v.window_index])));
  row("实际采样 fps", fmt(vget([(eff&&eff.sample_fps), st.sample_fps])));
- if(st.reconstruction_mode==="frame_pool")row("帧数池合格帧 / 目标",fmt(st.pool_eligible_frames)+" / "+fmt(st.pool_target_frames));
  row("窗口重叠帧", fmt(vget([(eff&&eff.overlap_frames), st.overlap_frames])));
  row("队列模式", fmt(vget([(eff&&eff.queue_mode), v.queue_mode]))); row("队列长度", fmt(st.pending_windows));
  row("项目存储总占用", fmtBytes(st.storage_total_bytes));
  row("采集快照", fmtBytes(st.storage_capture_bytes)+" · "+fmt(st.storage_capture_roots));
  row("Worker 结果", fmtBytes(st.storage_worker_bytes)+" · "+fmt(st.storage_worker_root));
  row("正式记录", fmtBytes(st.storage_formal_bytes)+" · "+fmt(st.storage_formal_root));
- row("帧数池", fmtBytes(st.storage_frame_pool_bytes)+" · "+fmt(st.storage_frame_pool_root));
+ row("共享帧缓存", fmtBytes(st.storage_frame_pool_bytes)+" · "+fmt(st.storage_frame_pool_root));
  row("会话日志", fmtBytes(st.storage_journal_bytes)+" · "+fmt(st.storage_journal_root));
  row("运行日志", fmtBytes(st.storage_runtime_log_bytes)+" · "+fmt(st.storage_runtime_log_root)+"/*.log*");
  row("ROS 日志", fmtBytes(st.storage_ros_log_bytes)+" · "+fmt(st.storage_ros_log_root));
@@ -2393,7 +2258,7 @@ function updateStatus(compact,raw){var d=(raw&&typeof raw==="object")?raw:compac
  row("队列满暂停采集", boolLabel(st.capture_queue_blocked));
  row("整窗处理耗时(秒)", fmtOrNA(st.service_wall_time_sec)); row("名义产窗间隔(秒)", fmtOrNA(st.service_budget_sec));
  row("worker 窗口", runningLabel(rw, runningActive(st))); row("worker 状态", runningActive(st)?"运行中":"空闲"); row("worker 耗时", fmtOrNA(workerTime));
- row("持续失败", fmt(vget([st.last_error, v.last_error]))); row("未恢复失败窗口数", fmt(st.failed_windows));
+ row("持续失败", fmt(vget([st.last_error, v.last_error]))); row("未恢复失败窗口数", fmt(st.failed_windows)); row("缺位姿帧（累计）", fmt(st.missing_pose_frames));
  row("失败尝试 / 人工重试",fmt(st.attempt_failures)+" / "+fmt(st.manual_retries));
  if(st.memory_paused)row("资源失败窗口",fmt(st.retry_window));
  row("辅助覆盖", fmt(vget([v.aux_coverage, v.aux])));
@@ -2410,7 +2275,7 @@ function updateStatus(compact,raw){var d=(raw&&typeof raw==="object")?raw:compac
  $("status-table").innerHTML=rows.join("");
 }
 function qualityPassed(r){return r.quality_passed!==false}
-function qualityLabel(r){if(r.alignment_method==="global_g4")return r.pending?"G4 待定":"G4 地图 v"+r.map_revision+(r.map_stale?" · 旧版本，等待新解":" · 数值可放置");if(String(r.alignment_method||"").indexOf("shared_point_sim3_A")===0)return "A 配准 · 定位门限仅诊断";if(r.component_anchor)return "锚点";var ratio=r.inlier_ratio==null?"--":Number(r.inlier_ratio).toFixed(3),rms=r.normalized_residual_rms==null?"--":Number(r.normalized_residual_rms).toFixed(3);return (qualityPassed(r)?"通过 ":"拒绝 ")+ratio+" / "+rms}
+function qualityLabel(r){if(r.alignment_method==="global_g4")return r.pending?"G4 待定":"G4 地图 v"+r.map_revision+(r.map_stale?" · 旧版本，等待新解":" · 数值可放置");if(r.component_anchor)return "锚点";var ratio=r.inlier_ratio==null?"--":Number(r.inlier_ratio).toFixed(3),rms=r.normalized_residual_rms==null?"--":Number(r.normalized_residual_rms).toFixed(3);return (qualityPassed(r)?"通过 ":"拒绝 ")+ratio+" / "+rms}
 function buildFormalTable(){var rows=[]; rows.push("<tr><th>窗口</th><th>状态</th><th>门限</th><th>方法 / 根 / 参考窗</th><th>map</th><th>原因</th></tr>");
  state.formal_records.forEach(function(r){rows.push("<tr><td>"+esc(r.window_index)+"</td><td>"+esc(r.coordinate_state)+"</td><td>"+esc(qualityLabel(r))+"</td><td>"+esc(r.alignment_method)+" / "+esc(r.root_window_index)+" / "+esc(r.reference_window_index)+"</td><td class='mono'>"+esc(r.map_id)+"</td><td class='muted'>"+esc(r.reason)+"</td></tr>")});
  $("formal-table").innerHTML=rows.join("")||"<tr><td class='muted'>无正式窗口</td></tr>"
@@ -2426,22 +2291,19 @@ function refreshStreams(){var role=currentRole(); if(streamState.initialized&&st
  $("live-depth").onerror=function(){$("live-depth").hidden=true;$("live-depth-label").textContent="实时传感器深度不可用"};
 }
 function currentRole(){return (state.status&&state.status.role)||"front"}
-function latestRecord(records){var latest=null; (records||[]).forEach(function(r){if(!latest){latest=r;return}var framePool=r.reconstruction_mode==="frame_pool",latestFramePool=latest.reconstruction_mode==="frame_pool";var current=framePool?Number(r.pool_revision):Number(r.window_index),previous=latestFramePool?Number(latest.pool_revision):Number(latest.window_index);if(!Number.isFinite(current))current=-1;if(!Number.isFinite(previous))previous=-1;if(current>previous||(current===previous&&Number(r.window_index)>Number(latest.window_index)))latest=r});return latest}
+function latestRecord(records){var latest=null; (records||[]).forEach(function(r){if(!latest){latest=r;return}var current=Number(r.window_index),previous=Number(latest.window_index);if(!Number.isFinite(current))current=-1;if(!Number.isFinite(previous))previous=-1;if(current>previous)latest=r});return latest}
 function omegaSpec(){var r=latestRecord(state.formal_records); if(!viewSession||!r)return null; var w=String(r.window_index); return {session:viewSession,window:w,key:viewSession+"|"+w+"|"+(r.result_manifest_sha256||"")}}
 function clearOmega(){if(omegaObjectUrl){URL.revokeObjectURL(omegaObjectUrl);omegaObjectUrl=""} $("omega-first-depth").hidden=true;$("omega-first-depth").removeAttribute("src"); $("omega-window-label").textContent="--"; $("omega-depth-label").textContent="等待最新窗口…"}
 function refreshOmega(spec){if(!spec)return; fetchWithTimeout("api/latest_first_depth?session="+encodeURIComponent(spec.session)+"&t="+Date.now(),{},15000).then(function(r){if(!r.ok)throw new Error("HTTP "+r.status); if(r.headers.get("X-Session")!==spec.session||r.headers.get("X-Window")!==spec.window)throw new Error("窗口已变更"); return r.blob()}).then(function(b){if(window.__omegaKey!==spec.key)return; $("omega-window-label").textContent="session/window: "+esc(spec.session)+" / "+esc(spec.window); $("omega-depth-label").textContent="已更新"; if(omegaObjectUrl)URL.revokeObjectURL(omegaObjectUrl);omegaObjectUrl=URL.createObjectURL(b);$("omega-first-depth").onload=function(){$("omega-first-depth").hidden=false};$("omega-first-depth").src=omegaObjectUrl}).catch(function(e){if(window.__omegaKey===spec.key){window.__omegaKey=""; $("omega-depth-label").textContent="不可用: "+e.message}})}
-function renderRecords(){var newest=latestRecord(state.formal_records);$("pointcloud-title").textContent=newest&&newest.reconstruction_mode==="frame_pool"?"最新重建点云":"累计点云";buildFormalTable();updateAlignmentBadge();updateStatus(state.status,state.diagnostics);updateMapOptions();var omega=omegaSpec(),omegaKey=omega?omega.key:"";if(omegaKey!==window.__omegaKey){clearTimeout(omegaRetryTimer);omegaFailures=0;omegaInFlight="";window.__omegaKey=omegaKey;clearOmega();if(omega)refreshOmega(omega)}var pcSpec=pointCloudSpec();if(pcSpec.key!==window.__pcKey){clearTimeout(pcRetryTimer);pcFailures=0;pcInFlight="";window.__pcKey=pcSpec.key; clearPointCloud(); if(pcSpec.hasRecords)refreshPointCloud(pcSpec)}}
+function renderRecords(){buildFormalTable();updateAlignmentBadge();updateStatus(state.status,state.diagnostics);updateMapOptions();var omega=omegaSpec(),omegaKey=omega?omega.key:"";if(omegaKey!==window.__omegaKey){clearTimeout(omegaRetryTimer);omegaFailures=0;omegaInFlight="";window.__omegaKey=omegaKey;clearOmega();if(omega)refreshOmega(omega)}var pcSpec=pointCloudSpec();if(pcSpec.key!==window.__pcKey){clearTimeout(pcRetryTimer);pcFailures=0;pcInFlight="";window.__pcKey=pcSpec.key; clearPointCloud(); if(pcSpec.hasRecords)refreshPointCloud(pcSpec)}}
 function refreshRecords(key){if(recordsInFlight||!viewSession)return; recordsInFlight=true; var requested=viewSession; fetchWithTimeout("api/state?include_records=1&session="+encodeURIComponent(requested),{},8000).then(function(r){if(!r.ok)throw new Error("HTTP "+r.status);return r.json()}).then(function(detail){if(requested!==viewSession)return; state.formal_records=detail.formal_records||[];recordsKey=key;renderRecords();$("session-msg").textContent="已读取 "+state.formal_records.length+" 个正式窗口"}).catch(function(e){if(requested===viewSession)$("session-msg").textContent="历史记录请求失败: "+e.message}).finally(function(){recordsInFlight=false})}
-function setParamNumber(id,value){if(value===undefined||value===null||value==="")return; var el=$(id); if(el)el.value=Number(value)}
-function setParamChoice(id,value){if(value===undefined||value===null||value==="")return; var el=$(id); if(!el)return; var text=String(value); var hit=Array.prototype.slice.call(el.options).some(function(o){return o.value===text}); if(hit)el.value=text}
-function applyEffectiveParams(eff){eff=eff||{};setParamNumber("p-sample-fps",eff.sample_fps);setParamNumber("p-window-frames",eff.window_frames);setParamNumber("p-overlap-frames",eff.overlap_frames);setParamChoice("p-queue-mode",eff.queue_mode);setParamNumber("p-queue-capacity",eff.queue_capacity);setParamNumber("p-max-retries",eff.max_retries);setParamChoice("p-keep-snapshot",eff.keep_snapshot_on_success===true||eff.keep_snapshot_on_success==="true"?"true":(eff.keep_snapshot_on_success===false||eff.keep_snapshot_on_success==="false"?"false":undefined));setParamChoice("p-save-depth",eff.save_sensor_depth===true||eff.save_sensor_depth==="true"?"true":(eff.save_sensor_depth===false||eff.save_sensor_depth==="false"?"false":undefined));setParamNumber("p-inference-resolution",eff.inference_resolution);setParamNumber("p-worker-timeout",eff.worker_timeout_sec)}
-function refreshState(){if(stateInFlight)return; stateInFlight=true; fetchWithTimeout("api/state?include_records=0",{},3000).then(function(r){if(!r.ok)throw new Error("HTTP "+r.status);return r.json()}).then(function(s){state.selected_session=s.selected_session||"";state.sessions=s.sessions||[];state.roles=s.roles||[];state.preview_fps=s.preview_fps||5;state.status=s.status||{};state.diagnostics=s.diagnostics||{}; if(!paramsDirty)applyEffectiveParams((state.status&&state.status.effective)||{}); var live=(state.status&&state.status.session_id)||""; var known=state.sessions.some(function(x){return x.session_id===viewSession}); if(viewFollowLatest||!viewSession||!known)viewSession=live||(state.sessions[0]&&state.sessions[0].session_id)||""; state.view_session=viewSession;storageSet("drone3d.view_session",viewSession); var sel=$("session-select");sel.innerHTML="";state.sessions.forEach(function(x){var o=document.createElement("option");o.value=x.session_id;o.textContent=x.session_id+" ("+x.window_count+" 窗口)";sel.appendChild(o)});sel.value=viewSession;$("follow-latest").checked=viewFollowLatest;if(!previewDirty)$("p-preview-fps").value=state.preview_fps;$("view-session-badge").textContent="查看: "+(viewSession||"--");$("live-session-badge").textContent="控制: "+(live||"--");$("control-target").textContent="live session: "+(live||"--");var available=(state.status&&Array.isArray(state.status.available_roles))?state.status.available_roles:null;var roleSel=$("start-role"),oldRole=roleSel.value||"";roleSel.innerHTML="";(state.roles.length?state.roles:["front"]).forEach(function(name){var o=document.createElement("option");var ok=!available||available.indexOf(name)>=0;o.value=name;o.textContent=name+(ok?"":"（无图像源）");o.disabled=!ok;roleSel.appendChild(o)});roleSel.value=(oldRole&&state.roles.indexOf(oldRole)>=0&&(!available||available.indexOf(oldRole)>=0))?oldRole:((available&&available[0])||(state.roles[0])||"front");updateStatus(state.status,state.diagnostics);refreshStreams(); var item=state.sessions.filter(function(x){return x.session_id===viewSession})[0]||{}; var nextKey=viewSession+"|"+(item.window_count||0)+"|"+(item.latest_window_index==null?-1:item.latest_window_index)+"|"+(item.map_revision_sha256||"");if(nextKey!==recordsKey)refreshRecords(nextKey); if(stateFailures&&$("session-msg").textContent.indexOf("state 请求失败: ")===0)$("session-msg").textContent=""; lastStateOk=Date.now();stateFailures=0}).catch(function(e){stateFailures++;$("session-msg").textContent="state 请求失败: "+e.message}).finally(function(){stateInFlight=false;scheduleState()})}
+function refreshState(){if(stateInFlight)return; stateInFlight=true; fetchWithTimeout("api/state?include_records=0",{},3000).then(function(r){if(!r.ok)throw new Error("HTTP "+r.status);return r.json()}).then(function(s){state.selected_session=s.selected_session||"";state.sessions=s.sessions||[];state.roles=s.roles||[];state.preview_fps=s.preview_fps||5;state.status=s.status||{};state.diagnostics=s.diagnostics||{}; var live=(state.status&&state.status.session_id)||""; var known=state.sessions.some(function(x){return x.session_id===viewSession}); if(viewFollowLatest||!viewSession||!known)viewSession=live||(state.sessions[0]&&state.sessions[0].session_id)||""; state.view_session=viewSession;storageSet("drone3d.view_session",viewSession); var sel=$("session-select");sel.innerHTML="";state.sessions.forEach(function(x){var o=document.createElement("option");o.value=x.session_id;o.textContent=x.session_id+" ("+x.window_count+" 窗口)";sel.appendChild(o)});sel.value=viewSession;$("follow-latest").checked=viewFollowLatest;if(!previewDirty)$("p-preview-fps").value=state.preview_fps;$("view-session-badge").textContent="查看: "+(viewSession||"--");$("live-session-badge").textContent="控制: "+(live||"--");$("control-target").textContent="live session: "+(live||"--");var available=(state.status&&Array.isArray(state.status.available_roles))?state.status.available_roles:null;var roleSel=$("start-role"),oldRole=roleSel.value||"";roleSel.innerHTML="";(state.roles.length?state.roles:["front"]).forEach(function(name){var o=document.createElement("option");var ok=!available||available.indexOf(name)>=0;o.value=name;o.textContent=name+(ok?"":"（无图像源）");o.disabled=!ok;roleSel.appendChild(o)});roleSel.value=(oldRole&&state.roles.indexOf(oldRole)>=0&&(!available||available.indexOf(oldRole)>=0))?oldRole:((available&&available[0])||(state.roles[0])||"front");updateStatus(state.status,state.diagnostics);refreshStreams(); var item=state.sessions.filter(function(x){return x.session_id===viewSession})[0]||{}; var nextKey=viewSession+"|"+(item.window_count||0)+"|"+(item.latest_window_index==null?-1:item.latest_window_index)+"|"+(item.map_revision_sha256||"");if(nextKey!==recordsKey)refreshRecords(nextKey); if(stateFailures&&$("session-msg").textContent.indexOf("state 请求失败: ")===0)$("session-msg").textContent=""; lastStateOk=Date.now();stateFailures=0}).catch(function(e){stateFailures++;$("session-msg").textContent="state 请求失败: "+e.message}).finally(function(){stateInFlight=false;scheduleState()})}
 function scheduleState(){if(stateTimer)return;var delay=stateFailures?Math.min(5000,1000*Math.pow(2,Math.min(3,stateFailures-1))):1000;stateTimer=setTimeout(function(){stateTimer=null;refreshState()},delay)}
 function updateAlignmentBadge(){var rec=null; for(var i=state.formal_records.length-1;i>=0;i--){if(state.formal_records[i].coordinate_state==="ODOM_LOCAL_APPROX"){rec=state.formal_records[i];break}} var badge=$("alignment-badge"); if(rec){var passed=qualityPassed(rec);badge.textContent=(passed?rec.coordinate_state:"配准未过门限")+" "+rec.map_id; badge.className=passed?"badge approx":"badge unreliable"} else {badge.textContent="MODEL_LOCAL_UNALIGNED"; badge.className="badge unreliable"} }
 function deletePointBuffers(){if(!gl)return;[pc.positionBuffer,pc.colorBuffer,pc.axisPositionBuffer,pc.axisColorBuffer].forEach(function(buffer){if(buffer)gl.deleteBuffer(buffer)})}
 function clearPointCloud(){deletePointBuffers();pc={count:0,positions:null,colors:null,positionBuffer:null,colorBuffer:null,axisPositionBuffer:null,axisColorBuffer:null,bounds:null,zUp:false};if(gl){gl.clearColor(0.04,0.05,0.07,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT)}if(rendererState==="ready")$("pc-badge").textContent="等待正式窗口…"}
 function updateMapOptions(){var maps=[];(state.formal_records||[]).forEach(function(r){var aligned=r.coordinate_state==="ODOM_LOCAL_APPROX";if(aligned&&r.map_id&&(includeRejected||qualityPassed(r))&&maps.indexOf(r.map_id)<0)maps.push(r.map_id)});if(!mapDirty||maps.indexOf(viewMap)<0)viewMap=maps.length?maps[maps.length-1]:"";var sel=$("map-select");sel.innerHTML="";if(!maps.length){var empty=document.createElement("option");empty.value="";empty.textContent="无可显示分量";sel.appendChild(empty)}else maps.forEach(function(map){var o=document.createElement("option");o.value=map;o.textContent=map;sel.appendChild(o)});sel.value=viewMap;sel.disabled=maps.length<2}
-function pointCloudSpec(){var records=state.formal_records||[],map=viewMap||"latest",selected=[],newest=latestRecord(records);if(newest&&newest.reconstruction_mode==="frame_pool"){map="latest";selected=[newest]}else if(viewMap){selected=records.filter(function(r){return (r.coordinate_state==="ODOM_LOCAL_APPROX")&&r.map_id===viewMap&&(includeRejected||qualityPassed(r))})}else{var latest=latestRecord(records);if(latest)selected=[latest]}var fingerprint=selected.map(function(r){return r.window_index+":"+(r.result_manifest_sha256||"")+":"+(r.map_revision_sha256||"")}).join(","); return {session:viewSession,map:map,includeRejected:includeRejected,key:viewSession+"|"+map+"|"+(includeRejected?"all":"passed")+"|"+fingerprint,hasRecords:selected.some(function(r){return r.alignment_method!=="global_g4"||!r.pending})}}
+function pointCloudSpec(){var records=state.formal_records||[],map=viewMap||"latest",selected=[];if(viewMap){selected=records.filter(function(r){return (r.coordinate_state==="ODOM_LOCAL_APPROX")&&r.map_id===viewMap&&(includeRejected||qualityPassed(r))})}else{var latest=latestRecord(records);if(latest)selected=[latest]}var fingerprint=selected.map(function(r){return r.window_index+":"+(r.result_manifest_sha256||"")+":"+(r.map_revision_sha256||"")}).join(","); return {session:viewSession,map:map,includeRejected:includeRejected,key:viewSession+"|"+map+"|"+(includeRejected?"all":"passed")+"|"+fingerprint,hasRecords:selected.some(function(r){return r.alignment_method!=="global_g4"||!r.pending})}}
 function refreshPointCloud(spec){if(!spec||!spec.hasRecords||window.__pcKey!==spec.key||pcInFlight===spec.key)return;pcInFlight=spec.key;$("pc-badge").textContent="点云加载中…";var url="api/pointcloud?session="+encodeURIComponent(spec.session)+"&map="+encodeURIComponent(spec.map)+"&include_rejected="+(spec.includeRejected?"1":"0")+"&max_points="+(window.PC_MAX_POINTS||1000000);fetchWithTimeout(url,{},30000).then(function(r){if(!r.ok)throw new Error("HTTP "+r.status); if(r.headers.get("X-Session")!==spec.session)throw new Error("session 已变更"); var aligned=r.headers.get("X-Aligned")==="1"; var original=Number(r.headers.get("X-Original-Points")||0); var displayed=Number(r.headers.get("X-Displayed-Points")||0); var sampling=r.headers.get("X-Sampling")||""; var equivalentStride=Number(r.headers.get("X-Equivalent-Stride")||0); var conf=Number(r.headers.get("X-Conf-Percentile")||0); var mapId=headerText(r,"X-Map-Id"); var reason=headerText(r,"X-Reason"); var stateName=r.headers.get("X-Coordinate-State")||""; var rejected=r.headers.get("X-Include-Rejected")==="1"; return r.arrayBuffer().then(function(buf){if(window.__pcKey===spec.key){pcFailures=0;loadPointCloud(buf,aligned,mapId,original,displayed,sampling,equivalentStride,conf,stateName,reason,rejected)}})}).catch(function(e){if(window.__pcKey===spec.key){pcFailures++;var delay=Math.min(10000,1000*Math.pow(2,Math.min(3,pcFailures-1)));$("pc-badge").textContent="点云加载失败: "+e.message+" · "+(delay/1000)+"秒后重试";clearTimeout(pcRetryTimer);pcRetryTimer=setTimeout(function(){refreshPointCloud(spec)},delay)}}).finally(function(){if(pcInFlight===spec.key)pcInFlight=""})}
 function loadPointCloud(buf,aligned,mapId,original,displayed,sampling,equivalentStride,conf,stateName,reason,rejected){if(buf.byteLength<4)throw new Error("点云响应过短");var dv=new DataView(buf),count=dv.getUint32(0,true),expected=4+count*15;if(count<1||expected!==buf.byteLength)throw new Error("点云响应长度非法");var positions=new Float32Array(count*3),colors=new Uint8Array(count*3),colorOffset=4+count*12;for(var i=0;i<count*3;i++){positions[i]=dv.getFloat32(4+i*4,true);colors[i]=dv.getUint8(colorOffset+i)}deletePointBuffers();var zUp=stateName==="ODOM_LOCAL_APPROX";pc={count:count,positions:positions,colors:colors,positionBuffer:null,colorBuffer:null,axisPositionBuffer:null,axisColorBuffer:null,bounds:null,zUp:zUp};uploadPointCloud();orbit.yaw=0.6;orbit.pitch=0.5;fitPointCloud();var sample="sampling "+esc(sampling)+" · 等效倍率 ×"+equivalentStride;var badge=$("pc-badge"),quality=stateName==="ODOM_LOCAL_APPROX"?"<span class='err'>不可靠·未经真值验证</span>":"相对尺度·非公制";if(rejected)quality+=" · <span class='err'>含未过门限窗口</span>";if(aligned){badge.innerHTML=esc(stateName)+" + <span class='mono'>"+esc(mapId)+"</span> · "+quality+" · 原始 "+original+" · 显示 "+displayed+" · "+sample+" · conf P"+conf+" · Fit=主体 / Reset=含异常全景"}else{badge.innerHTML=esc(stateName)+"（不累计）· Omega/OpenCV model-local · 原因: "+esc(reason)+" · 原始 "+original+" · 显示 "+displayed+" · "+sample+" · conf P"+conf+" · Fit=主体 / Reset=含异常全景"}$("axis-convention").textContent=zUp?"ROS odom · Z-up":"Omega/OpenCV session · Y-down"}
 function initGL(){var canvas=$("pointcloud-canvas");gl=canvas.getContext("webgl",{antialias:true,preserveDrawingBuffer:true});if(!gl){rendererState="unavailable";$("pc-badge").textContent="WebGL 不可用；请启用浏览器硬件加速";return}var vs="attribute vec3 aPos; attribute vec3 aCol; uniform mat4 uProj; uniform mat4 uView; uniform float uPointSize; varying vec3 vCol; void main(){gl_Position=uProj*uView*vec4(aPos,1.0); gl_PointSize=uPointSize; vCol=aCol;}";var fs="precision mediump float; varying vec3 vCol; void main(){gl_FragColor=vec4(vCol,1.0);}";function sh(type,src){var s=gl.createShader(type);gl.shaderSource(s,src);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw new Error("shader compile: "+gl.getShaderInfoLog(s));return s}var program=gl.createProgram();gl.attachShader(program,sh(gl.VERTEX_SHADER,vs));gl.attachShader(program,sh(gl.FRAGMENT_SHADER,fs));gl.linkProgram(program);if(!gl.getProgramParameter(program,gl.LINK_STATUS))throw new Error("program link: "+gl.getProgramInfoLog(program));glProgram={program:program,uProj:gl.getUniformLocation(program,"uProj"),uView:gl.getUniformLocation(program,"uView"),uPointSize:gl.getUniformLocation(program,"uPointSize"),aPos:gl.getAttribLocation(program,"aPos"),aCol:gl.getAttribLocation(program,"aCol")};if(glProgram.aPos<0||glProgram.aCol<0||!glProgram.uProj||!glProgram.uView||!glProgram.uPointSize)throw new Error("shader location missing");gl.useProgram(program);gl.enable(gl.DEPTH_TEST);rendererState="ready"}
@@ -2457,38 +2319,30 @@ function drawPointCloud(){if(!gl||!glProgram||rendererState!=="ready")return;var
 function matPerspective(fov,aspect,near,far){var f=1/Math.tan(fov/2),nf=1/(near-far); return [f/aspect,0,0,0, 0,f,0,0, 0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0]}
 function matLookAt(eye,center,up){var z=[eye[0]-center[0],eye[1]-center[1],eye[2]-center[2]]; var l=Math.hypot(z[0],z[1],z[2])||1; z=[z[0]/l,z[1]/l,z[2]/l]; var x=[up[1]*z[2]-up[2]*z[1],up[2]*z[0]-up[0]*z[2],up[0]*z[1]-up[1]*z[0]]; l=Math.hypot(x[0],x[1],x[2])||1; x=[x[0]/l,x[1]/l,x[2]/l]; var y=[z[1]*x[2]-z[2]*x[1],z[2]*x[0]-z[0]*x[2],z[0]*x[1]-z[1]*x[0]]; return [x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0, -(x[0]*eye[0]+x[1]*eye[1]+x[2]*eye[2]), -(y[0]*eye[0]+y[1]*eye[1]+y[2]*eye[2]), -(z[0]*eye[0]+z[1]*eye[1]+z[2]*eye[2]), 1]}
 function bindViewer(){var c=$("pointcloud-canvas"),drag=false,lx=0,ly=0;c.addEventListener("webglcontextlost",function(e){e.preventDefault();rendererState="lost";gl=null;glProgram=null;$("pc-badge").textContent="WebGL context 已丢失，等待自动恢复…"});c.addEventListener("webglcontextrestored",function(){try{initGL();uploadPointCloud();updateAxisBuffers();drawPointCloud()}catch(e){rendererState="error";$("pc-badge").textContent="WebGL 恢复失败: "+e.message}});c.addEventListener("mousedown",function(e){drag=true;lx=e.clientX;ly=e.clientY});window.addEventListener("mouseup",function(){drag=false});window.addEventListener("mousemove",function(e){if(!drag)return;orbit.yaw+=(e.clientX-lx)*0.01;orbit.pitch=Math.max(-1.4,Math.min(1.4,orbit.pitch+(e.clientY-ly)*0.01));lx=e.clientX;ly=e.clientY;drawPointCloud()});c.addEventListener("wheel",function(e){e.preventDefault();orbit.dist=Math.max(0.01,orbit.dist*Math.exp(e.deltaY*0.001));drawPointCloud()},{passive:false});window.addEventListener("resize",drawPointCloud);$("btn-fit").onclick=fitPointCloud;$("btn-reset").onclick=resetView;$("point-size").oninput=drawPointCloud}
-function refreshControls(st){var s=(st&&st.state)||""; var startable=(s==="IDLE"||s==="STOPPED"); var pausable=(s==="RUNNING"||s==="DISK_PAUSED"); var retryable=(s==="MEMORY_PAUSED"); var resumable=(s==="PAUSED"||retryable); var stoppable=(s==="RUNNING"||s==="PAUSED"||s==="DISK_PAUSED"||s==="FATAL_OOM"||s==="MEMORY_PAUSED"||s==="ALIGNMENT_PAUSED"||s==="DRAINING");var roleSel=$("start-role"),roleOk=!(roleSel.selectedOptions&&roleSel.selectedOptions[0]&&roleSel.selectedOptions[0].disabled);
- var modeSel=$("start-mode"),effectiveMode=(st&&st.reconstruction_mode)||((st&&st.effective&&st.effective.reconstruction_mode)||"");if((effectiveMode==="per_window"||effectiveMode==="frame_pool")&&(!startable||!modeDirty))modeSel.value=effectiveMode;if(!startable)modeDirty=false;modeSel.disabled=commandInFlight||!startable;var overlap=$("p-overlap-frames"),uiMode=startable?modeSel.value:effectiveMode;overlap.disabled=commandInFlight||uiMode==="frame_pool";if(uiMode==="frame_pool")overlap.value=0;
+function refreshControls(st){var s=(st&&st.state)||""; var startable=(s==="IDLE"||s==="STOPPED"); var pausable=(s==="RUNNING"||s==="DISK_PAUSED"); var retryable=(s==="MEMORY_PAUSED"); var resumable=(s==="PAUSED"||retryable); var stoppable=(s==="RUNNING"||s==="PAUSED"||s==="DISK_PAUSED"||s==="FATAL_OOM"||s==="MEMORY_PAUSED"||s==="DRAINING");var roleSel=$("start-role"),roleOk=!(roleSel.selectedOptions&&roleSel.selectedOptions[0]&&roleSel.selectedOptions[0].disabled);
  $("btn-start").disabled=commandInFlight||!startable||!roleOk;
  $("btn-pause-resume").disabled=commandInFlight||!(pausable||resumable);
  $("btn-pause-resume").textContent=retryable?"重试资源失败窗":(resumable?"恢复":(pausable?"暂停":"暂停/恢复"));
   $("btn-pause-resume").title=retryable?"只重试被资源门拒绝的那一个窗口：复用已保留输入，阈值与门禁不变；已完成的窗口不重采。":(resumable?"恢复采集":"运行中暂停；暂停后恢复");
  $("btn-stop").disabled=commandInFlight||!stoppable;
- var frozenA=st&&(st.alignment_backend==="shared_point_sim3_A"||st.alignment_backend==="global_g4")&&uiMode!=="frame_pool";
- document.querySelectorAll("#params-form input, #params-form select, #params-form button").forEach(function(element){element.disabled=commandInFlight||frozenA||(element.id==="p-overlap-frames"&&uiMode==="frame_pool")});
- $("params-form").title=frozenA?"A 配置参数固定。新增100张，共享20张，首窗共享0张。":"";
  $("btn-stop").textContent=s==="DRAINING"?"立即停止":"停止";
- $("btn-stop").title=s==="DRAINING"?"丢弃还没重建的窗口并立即停止":(frozenA?"停止采集；已采集的窗口继续重建完再结束。配准故障现场保留。":"停止采集；已采集的窗口继续重建完再结束");
+ $("btn-stop").title=s==="DRAINING"?"丢弃还没重建的窗口并立即停止":"停止采集；已采集的窗口继续重建完再结束";
 }
-function setCommandsDisabled(value){["#btn-pause-resume",".command-control"].forEach(function(selector){document.querySelectorAll(selector).forEach(function(button){button.disabled=value})});$("start-mode").disabled=value}
-function postCommand(cmd,args,timeoutMs){if(commandInFlight)return Promise.resolve({ok:false,error:"已有命令执行中"});commandInFlight=true;setCommandsDisabled(true);$("command-msg").textContent="执行中: "+cmd;var commandTimeout=timeoutMs||{"start_session":30000,"stop_all":30000,"select_source":15000,"pause":15000,"resume":15000,"set_params":15000}[cmd]||15000;return fetchWithTimeout("api/command",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(Object.assign({command:cmd},args||{}))},commandTimeout).then(function(response){return response.json().catch(function(){throw new Error("HTTP "+response.status+" 且响应不是 JSON")}).then(function(payload){if(!response.ok||!payload.ok)throw new Error(payload.error||("HTTP "+response.status));return payload})}).then(function(result){$("command-msg").textContent="OK: "+cmd+" · "+JSON.stringify(result.response||{});refreshState();return result}).catch(function(error){$("command-msg").textContent="ERR: "+cmd+" · "+error.message;return {ok:false,error:error.message}}).finally(function(){commandInFlight=false;setCommandsDisabled(false);refreshControls(state.status)})}
-function buildSetParams(){var args={}; var v; v=$("p-sample-fps").value; if(v!=="")args.sample_fps=Number(v); v=$("p-window-frames").value; if(v!=="")args.window_frames=Number(v); v=$("p-overlap-frames").value; if(!$("p-overlap-frames").disabled&&v!=="")args.overlap_frames=Number(v); v=$("p-queue-mode").value; if(v!=="")args.queue_mode=v; v=$("p-queue-capacity").value; if(v!=="")args.queue_capacity=Number(v); v=$("p-max-retries").value; if(v!=="")args.max_retries=Number(v); v=$("p-keep-snapshot").value; if(v!=="")args.keep_snapshot_on_success=(v==="true"); v=$("p-save-depth").value; if(v!=="")args.save_sensor_depth=(v==="true"); v=$("p-inference-resolution").value; if(v!==""){args.inference_resolution=Number(v);if(!Number.isInteger(args.inference_resolution)||(args.inference_resolution!==0&&(args.inference_resolution<32||args.inference_resolution>4096||args.inference_resolution%16!==0)))throw new Error("inference_resolution 必须为 0，或 [32,4096] 内的 16 倍数")} v=$("p-worker-timeout").value; if(v!=="")args.worker_timeout_sec=Number(v); return args}
+function setCommandsDisabled(value){["#btn-pause-resume",".command-control"].forEach(function(selector){document.querySelectorAll(selector).forEach(function(button){button.disabled=value})})}
+function postCommand(cmd,args,timeoutMs){if(commandInFlight)return Promise.resolve({ok:false,error:"已有命令执行中"});commandInFlight=true;setCommandsDisabled(true);$("command-msg").textContent="执行中: "+cmd;var commandTimeout=timeoutMs||{"start_session":30000,"stop_all":30000,"select_source":15000,"pause":15000,"resume":15000}[cmd]||15000;return fetchWithTimeout("api/command",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(Object.assign({command:cmd},args||{}))},commandTimeout).then(function(response){return response.json().catch(function(){throw new Error("HTTP "+response.status+" 且响应不是 JSON")}).then(function(payload){if(!response.ok||!payload.ok)throw new Error(payload.error||("HTTP "+response.status));return payload})}).then(function(result){$("command-msg").textContent="OK: "+cmd+" · "+JSON.stringify(result.response||{});refreshState();return result}).catch(function(error){$("command-msg").textContent="ERR: "+cmd+" · "+error.message;return {ok:false,error:error.message}}).finally(function(){commandInFlight=false;setCommandsDisabled(false);refreshControls(state.status)})}
 function wire(){var canvas=$("pointcloud-canvas");bindViewer();try{initGL()}catch(e){rendererState="error";gl=null;$("pc-badge").textContent="WebGL 初始化失败: "+e.message}
  $("follow-latest").addEventListener("change",function(){viewFollowLatest=this.checked;storageSet("drone3d.follow_live",viewFollowLatest?"1":"0");recordsKey="";refreshState()});
  $("map-select").addEventListener("change",function(){viewMap=this.value;mapDirty=true;renderRecords()});
  $("include-rejected").addEventListener("change",function(){includeRejected=this.checked;renderRecords()});
- $("start-mode").addEventListener("change",function(){modeDirty=true;refreshControls(state.status||{})});
  $("session-select").addEventListener("change",function(){if(!this.value)return;viewFollowLatest=false;$("follow-latest").checked=false;storageSet("drone3d.follow_live","0");viewSession=this.value;viewMap="";mapDirty=false;storageSet("drone3d.view_session",viewSession);state.formal_records=[];recordsKey="";window.__pcKey="";window.__omegaKey="";clearPointCloud();clearOmega();refreshRecords(viewSession+"|manual")});
- $("btn-start").onclick=function(){var role=$("start-role").value;var mode=$("start-mode").value; if(!role){$("command-msg").textContent="ERR: start_session · 未选择相机角色";return} if(!mode){$("command-msg").textContent="ERR: start_session · 未选择重建模式";return} postCommand("start_session",{role:role,reconstruction_mode:mode})};
+ $("btn-start").onclick=function(){var role=$("start-role").value; if(!role){$("command-msg").textContent="ERR: start_session · 未选择相机角色";return} postCommand("start_session",{role:role})};
  $("btn-pause-resume").onclick=function(){var s=(state.status&&state.status.state)||""; postCommand((s==="PAUSED"||s==="MEMORY_PAUSED")?"resume":"pause",{})};
  $("btn-stop").onclick=function(){var st=state.status||{},n=(st.pending_windows||0)+(runningActive(st)?1:0);var text=st.state==="DRAINING"?"立即停止：还没重建的 "+n+" 个窗口将被丢弃，确定吗？":"停止采集：正在采的窗口丢弃，已采集的窗口继续重建完再结束会话。确定吗？";if(window.confirm(text))postCommand("stop_all",{})};
- $("params-form").querySelectorAll("input,select").forEach(function(el){el.addEventListener("input",function(){paramsDirty=true})});
- $("params-form").addEventListener("submit",function(e){e.preventDefault();try{var args=buildSetParams();if(Object.keys(args).length)postCommand("set_params",args).then(function(result){if(result.ok)paramsDirty=false});else $("command-msg").textContent="未填写任何重建参数"}catch(error){$("command-msg").textContent="ERR: set_params · "+error.message}});
  $("p-preview-fps").addEventListener("input",function(){previewDirty=true});
  $("preview-form").addEventListener("submit",function(e){e.preventDefault();var value=Number($("p-preview-fps").value);if(Number.isFinite(value)&&value>=0.5&&value<=30)postCommand("set_preview_fps",{value:value}).then(function(result){if(result.ok)previewDirty=false});else $("command-msg").textContent="ERR: web_preview_fps 必须在 [0.5, 30]"});
  refreshState()}
-var controlPanel=$("params-form").closest(".panel"),side=document.querySelector(".three-col");
-var advanced=document.createElement("details"),summary=document.createElement("summary");summary.textContent="重建与预览参数";summary.style.cssText="cursor:pointer;color:var(--muted);font-size:12px;margin:8px 0";advanced.append(summary);controlPanel.append(advanced);advanced.append($("params-form"),$("preview-form"));side.prepend(controlPanel);
+var controlPanel=$("preview-form").closest(".panel"),side=document.querySelector(".three-col");
+var advanced=document.createElement("details"),summary=document.createElement("summary");summary.textContent="预览参数";summary.style.cssText="cursor:pointer;color:var(--muted);font-size:12px;margin:8px 0";advanced.append(summary);controlPanel.append(advanced);advanced.append($("preview-form"));side.prepend(controlPanel);
 if(window.top!==window){var nav=document.querySelector("header nav");if(nav)nav.hidden=true}
 wire();
 </script>

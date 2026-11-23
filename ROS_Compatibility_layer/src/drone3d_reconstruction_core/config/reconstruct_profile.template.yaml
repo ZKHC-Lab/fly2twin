@@ -47,7 +47,5 @@ show_cameras: false
 conf_thres: 50.0
 max_points_k: 5
 profile_name: "REPLACE_ME_PROFILE"
-required_device_sku: "REPLACE_ME_SKU"
-device_sku: "REPLACE_ME_SKU"
 algorithm_revision: "REPLACE_ME_ALGORITHM_REVISION"
 ros_revision: "REPLACE_ME_ROS_REVISION"

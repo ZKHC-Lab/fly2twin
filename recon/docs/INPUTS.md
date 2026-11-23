@@ -25,12 +25,29 @@ For `video`, prepare calls the shared phone extractor using the `extract` mappin
 
 ## Configuration reference
 
+The table lists every accepted key; `recon/config.py` holds the same list (`KEYS`). Any other top-level or section key is an error that names the key and the keys its section allows, so a misspelt `fusion.revisit` stops the run instead of silently running without it.
+
 | Key | Default / meaning |
 | --- | --- |
 | `manifest`, `video` or `delivery`, `output` | Exactly one input source and the output parent directory |
 | `exclude_frames` | Optional frame IDs dropped from the prepared manifest before splitting; see above |
 | `protocol` | `drone` (default) or `phone`; train/eval loading and scoring protocol |
-| `extract`, `sfm` | Shared video extraction and GLOMAP settings, as in the phone preset |
+| `extract.target_frames` | 300; uniform timeline bins, one sharpest frame each |
+| `extract.min_frames` | 200; lower bound on selected frames |
+| `extract.sfm_multiple` | 3; extract this many times more frames for SfM (1 disables the dense SfM set) |
+| `extract.train_subset` | `all`: train on every extracted frame; `subset`: every `sfm_multiple`-th |
+| `extract.long_edge` | 1600; long side of extracted JPEGs, px |
+| `extract.scan_width` | 640; width of the low-resolution sharpness scan |
+| `extract.quality` | 2; ffmpeg JPEG `-q:v` |
+| `extract.hdr` | `auto`, `on` or `off`; HDR tone mapping on extraction |
+| `sfm.camera_model` | `SIMPLE_RADIAL`; shared COLMAP camera model for GLOMAP |
+| `sfm.focal_factor` | 1.2; initial focal = factor × max(width, height), refined by BA |
+| `sfm.overlap` | 20; sequential matching overlap |
+| `sfm.loop_keyframes`, `sfm.loop_max_pairs`, `sfm.loop_min_gap` | 60, 600, 0 (= 2 × overlap); loop-closure keyframes (0 disables), pair cap and minimum index distance |
+| `sfm.max_features` | 8192; SIFT features per frame |
+| `sfm.peak_threshold` | 0 keeps the COLMAP default |
+| `sfm.min_model_size` | 10; smallest model GLOMAP keeps |
+| `sfm.threads` | 8; COLMAP feature, matching and mapping threads |
 | `cameras` | Optional external camera NPZ; sparse points are needed for camera-height scale fitting |
 | `body_poses`, `body_from_camera`, `time_offset_ms` | Optional body trajectory, 4×4 extrinsic and RGB query offset; default offset 0 ms |
 | `pose.provider` | `external`, `glomap` or `colmap`; inferred as external with supplied poses, otherwise colmap |
@@ -38,12 +55,14 @@ For `video`, prepare calls the shared phone extractor using the `extract` mappin
 | `pose.units` | `meters` (default) or `arbitrary`, only for external poses |
 | `pose.metric.camera_height_m` | Optional assumed median camera height to scale arbitrary provider output |
 | `pose.position_sigma_m` | 0.05; Cartesian position prior standard deviation |
-| `pose.xfeat_weights`, `pose.batch_size`, `pose.ransac_threads` | Explicit user-owned checkpoint; matching batch size 8; fundamental-matrix RANSAC on a 4-thread pool while the next batch matches (OpenCV 4.x FM_RANSAC seeds itself per call, so output is bit-identical to one thread; 2026-11-03, 1,500 R1 pairs on GPU: 134 s → 41 s, all saved arrays identical) |
+| `pose.xfeat_source` | Optional XFeat checkout, relative to the YAML file; added to the import path before `modules.xfeat` is imported, an error if it has no `modules/xfeat.py`. Without it XFeat must already be importable (`PYTHONPATH`) |
+| `pose.xfeat_weights`, `pose.batch_size`, `pose.ransac_threads` | Explicit user-owned checkpoint; matching batch size 8; fundamental-matrix RANSAC on a 4-thread pool while the next batch matches (OpenCV 4.x FM_RANSAC seeds itself per call, so output is bit-identical to one thread; 2026-11-03, 1,500 image pairs on GPU: 134 s → 41 s, all saved arrays identical) |
 | `keyframes.enabled` | False for already-selected images; enable only on candidate sequences |
 | `keyframes.translation_m`, `rotation_deg`, `max_gap_s`, `trim_static` | 0.15, 8, 2, true |
 | `selection` | Optional exact split JSON; otherwise every eighth selected frame is test |
 | `split.mode`, `split.exclude_blur` | `holdout`, true; phone uses false so all non-test frames train |
-| `normalization`, `normalization_file` | Optional fixed three-field normalization; file takes precedence |
+| `normalization`, `normalization_file` | Optional fixed three-field normalization (`normalization_center`, `meters_per_unit`, `scene_scale`); file takes precedence |
+| `normalization_cast_first` | false; drone protocol casts c2w to float32 before subtracting the normalization centre, as the reference drone run did; reproduces that run's training coordinates exactly |
 | `depth.weights`, `depth.cache` | Explicit Omega weights, or a precomputed window folder; cache bypasses inference |
 | `depth.omega_source` | Repository `third_party/vggt-omega`, located relative to the installed recon package; explicit paths are relative to the YAML file |
 | `depth.resolution` | [512,288]; first component sets inference long edge; both components must match actual model/cache output |
@@ -51,14 +70,24 @@ For `video`, prepare calls the shared phone extractor using the `extract` mappin
 | `fusion.max_points` | 300000; permitted range 4..1000000 |
 | `fusion.revisit` | false; true corrects every training frame's depth scale with surfaces that other windows also saw ([recon_core](../../recon_core/README.md), `revisit.py`) before fusing. The cached metric depth and `scales.npz` then include the correction, `scales.npz` gains `revisit_log_scale` and `report.json` a `revisit` summary. Absent or false reproduces earlier outputs exactly |
 | `train.seed`, `train.resolution` | 42, [640,360] |
-| `train.steps` | Optional; default max(30000, nearest-1000(frame_count×60)) |
-| `train.depth_lambda`, `train.aniso_lambda` | 0.1, 0.1; BEST settings |
+| `train.steps` | Optional; default max(30000, nearest-1000(frame_count×60)), or frame_count×60 with `exact_steps` |
+| `train.exact_steps` | false; true makes the default step count exactly 60 visits per training frame instead of at least 30000 |
+| `train.scale_densification` | true; densification start/stop/reset/refine steps scale with steps/30000 |
+| `train.schedule_rounding` | `truncate`; `round` rounds the scaled densification steps instead |
+| `train.sh_interval` | steps/30; steps between spherical-harmonic degree increases |
+| `train.reset_at_zero` | false; true also resets opacity at step 0, as the phone reference did |
+| `train.discard_initial_permutation` | false; true draws and discards one frame permutation before training, as the phone reference did |
+| `train.max_width`, `train.image_cache_frames` | 1600, 32; phone protocol only: training image width and decoded-frame cache size |
+| `train.depth_lambda`, `train.aniso_lambda` | 0.1, 0.1; the reference drone run's values |
 | `train.pose_opt` | false; per training camera a right-composed SE(3) residual (translation + continuous 6D rotation), identity at start; test cameras are not optimised |
 | `train.pose_lr`, `train.pose_reg` | 1e-5, 1e-6; Adam learning rate (no decay) and weight of the squared 9-value residual of the current camera; translation in normalised scene units |
 | `eval.alignment_steps` | 200; use 200 for comparison with the reported protocol |
+| `eval.aligned_width` | 960; phone protocol only: image width of the colour+pose fitted evaluation |
 | `threads` | 4 for training/evaluation CPU image operations |
 | `eval.omega_dir` | Optional phone-only historical `depth.npy`, `conf.npy`, `frame_ids.npy` prior; otherwise read raw depth-window new owners |
-| `dependency_revision` | Optional environment identifier included in the content fingerprint; change when external kernels change |
+| `dependency_revision` | Optional free-form label; no code reads it, but the whole configuration is part of the run fingerprint, so changing it starts a fresh output directory. Use it when something outside the hashed inputs changes, e.g. the installed gsplat version |
+| `export.reference_drone` | false; true reproduces the reference drone run's export: unit quaternions in `gaussians.ply`, and `preview.splat` colour and opacity truncated rather than rounded |
+| `export.name`, `export.subtitle` | Optional scene title and subtitle in `scene.json` |
 
 With `train.pose_opt`, training also writes `optimized_poses.npz` (training `frame_ids` and world `c2w`, metric input stays metric) and stores the residuals with their frame IDs under `pose` in `final.pt`; when off, nothing is created and `pose` stays `None`.
 
@@ -74,7 +103,7 @@ The stage order is **provider → metric scale (when arbitrary) → optional pri
 
 `pose.refine: ba` uses the provider output as Cartesian position priors (default σ = 0.05 m), with the existing SIFT/XFeat and prior-BA path, after any metric conversion. Provider-internal BA does not disable this independent refinement slot. GLOMAP+outer-BA and COLMAP+outer-BA wiring is covered with mocked CPU inputs; **real-scene refinement for these combinations is unverified**. For arbitrary-scale providers, supply the metric camera height before interpreting the prior σ in metres. Former cached/prior/SfM configuration values are replaced by external+none / external+ba / colmap+none; the old mode key is rejected, not translated.
 
-The B0 metric adapter in [metric.py](../poses/metric.py) assumes a median camera height; it does not measure it. It takes median camera centre, trajectory P95 radius `r`, and normalized median `-camera_y` as an up prior. Candidate points lie more than `0.1r` below the centre. Seed 42 samples up to 30000 candidates and performs 3000 three-point RANSAC trials: degenerate cross-product norm <1e-9 is skipped; normals must be within 25° of up, at least 95% of cameras above the plane, median camera height ≥`0.2r`; support is residual <`0.01r`. It chooses maximum support, refits the plane three times with PCA, then returns `camera_height_m / median_camera_height_sfm`. Translation and sparse points are multiplied in their original dtype. `pose/report.json` stores the complete `scale_assumption` diagnostic (plane, prior, thresholds, support, height percentiles, scale and `measured: false`); units become metres based on the assumption. No world-axis rotation is applied. Exact B0 scale reproduction uses NumPy 1.26.4/OpenBLAS 0.3.23.dev with `OPENBLAS_NUM_THREADS=4`, `OMP_NUM_THREADS=4` supplied by the caller. The unchanged float32 PCA products are thread-sensitive: one thread produced scale 0.6891526456574119 versus reference 0.6891526265461935; 2/4/8/16 threads reproduced every scale diagnostic field exactly. No thread setting is forced inside the adapter.
+The phone preset's metric adapter in [metric.py](../poses/metric.py) assumes a median camera height; it does not measure it. It takes median camera centre, trajectory P95 radius `r`, and normalized median `-camera_y` as an up prior. Candidate points lie more than `0.1r` below the centre. Seed 42 samples up to 30000 candidates and performs 3000 three-point RANSAC trials: degenerate cross-product norm <1e-9 is skipped; normals must be within 25° of up, at least 95% of cameras above the plane, median camera height ≥`0.2r`; support is residual <`0.01r`. It chooses maximum support, refits the plane three times with PCA, then returns `camera_height_m / median_camera_height_sfm`. Translation and sparse points are multiplied in their original dtype. `pose/report.json` stores the complete `scale_assumption` diagnostic (plane, prior, thresholds, support, height percentiles, scale and `measured: false`); units become metres based on the assumption. No world-axis rotation is applied. Exact reproduction of the phone reference scale uses NumPy 1.26.4/OpenBLAS 0.3.23.dev with `OPENBLAS_NUM_THREADS=4`, `OMP_NUM_THREADS=4` supplied by the caller. The unchanged float32 PCA products are thread-sensitive: one thread produced scale 0.6891526456574119 versus reference 0.6891526265461935; 2/4/8/16 threads reproduced every scale diagnostic field exactly. No thread setting is forced inside the adapter.
 
 ## Body poses, calibration, timestamps
 
@@ -90,19 +119,19 @@ Without a frozen split, every eighth selected frame (`7::8`) is a test frame; `s
 
 For the drone protocol, optional `normalization` mapping or `normalization_file` JSON provides `normalization_center[3]`, `meters_per_unit` and `scene_scale`. New scenes default to mean training-camera center, maximum training radius, and 1.1 times the maximum normalized camera distance from the all-camera mean. Training coordinate is `(world-center)/meters_per_unit`; export inverts it. Reproduction may freeze these three fields rather than recompute them after BA.
 
-## Phone B0 training and evaluation
+## Phone preset training and evaluation
 
-[phone_video.yaml](../../configs/phone_video.yaml) is B0, not the historical RGB-only experiment: GLOMAP + assumed camera height 1.4 m, 512×288 Omega, 40/30/10 windows, unchanged drone fusion with a 1000000-point cap, then the shared trainer with inverse-depth Pearson loss λ=0.1 and anisotropy λ=0.1. Training uses seed 42, exact N×60 steps, scaled densification with round scheduling, initial permutation discarded, and reset at zero, matching the formal B0 settings.
+[phone_video.yaml](../../configs/phone_video.yaml) applies the drone method to phone video; it is not the historical RGB-only experiment: GLOMAP + assumed camera height 1.4 m, 512×288 Omega, 40/30/10 windows, unchanged drone fusion with a 1000000-point cap, then the shared trainer with inverse-depth Pearson loss λ=0.1 and anisotropy λ=0.1. Training uses seed 42, exact N×60 steps, scaled densification with round scheduling, initial permutation discarded, and reset at zero, matching the formal phone reference run.
 
 `protocol: phone` uses the shared phone normalization: median training centre, radius guarded by `max(median+8*MAD,1.5*median)` (zero MAD replaced by half the median), P95 radius over retained centres; drop guarded outliers and registered cameras beyond five P95 radii. c2w is cast to float32 before normalization; K is scaled proportionally (no pixel-centre offset). The frame cache is bounded by `train.image_cache_frames` (preset 1200); `train.max_width` is 1600. Initialization comes from `fuse/initial.npz`, never the sparse cloud, and depth loss reads `fuse/cache`. Phone train writes its normalization sidecar. Phone export inverts this same normalization.
 
-Phone eval uses the shared phone evaluator: fixed-pose full-frame 1600-wide RGB scores; 960-wide per-test-frame colour+SE3 alignment (200 Adam steps, learning rate 1e-4); and floater fraction with confidence percentile 50 and threshold 0.7 times linearly aligned prior depth. Default prior reads each `windows.json` new-owner raw depth/confidence, including test frames. Optional `eval.omega_dir` instead reads historical depth/conf/frame_ids arrays. The B0 formal prior had an additional intrinsic ray remap and sparse-track scale; the new default is **not claimed numerically equivalent to that historical floater result**. Neither source uses the train-only zero-filled fusion test slots.
+Phone eval uses the shared phone evaluator: fixed-pose full-frame 1600-wide RGB scores; 960-wide per-test-frame colour+SE3 alignment (200 Adam steps, learning rate 1e-4); and floater fraction with confidence percentile 50 and threshold 0.7 times linearly aligned prior depth. Default prior reads each `windows.json` new-owner raw depth/confidence, including test frames. Optional `eval.omega_dir` instead reads historical depth/conf/frame_ids arrays. The formal phone reference run's prior had an additional intrinsic ray remap and sparse-track scale; the new default is **not claimed numerically equivalent to that historical floater result**. Neither source uses the train-only zero-filled fusion test slots.
 
-The historical B0 formal result was 32.616 dB fixed-pose PSNR at 1600 width and 1848645 Gaussians. Those are reference measurements, not a GPU rerun of these staged changes. `--only train` and `--only eval` input wiring is tested on synthetic CPU data with GPU training/evaluation mocked; staged GPU quality remains to be verified. Historical E2/E3 RGB-only training settings now live inside [the equivalence runner](../../scripts/equivalence.py), not the phone preset.
+The historical formal phone reference result was 32.616 dB fixed-pose PSNR at 1600 width and 1848645 Gaussians. Those are reference measurements, not a GPU rerun of these staged changes. `--only train` and `--only eval` input wiring is tested on synthetic CPU data with GPU training/evaluation mocked; staged GPU quality remains to be verified. Historical RGB-only phone training settings were kept in the equivalence runner `scripts/equivalence.py` (deleted; recover it from commit ea029bb), not in the phone preset.
 
-### B0 staged CPU acceptance (2026-10-29)
+### Phone preset staged CPU acceptance (2026-10-29)
 
-With the cached E3 GLOMAP cameras/undistorted images, B0 window predictions converted float16→float32, assumed height 1.4 m and the four-thread BLAS environment above, `recon run --through fuse` reproduced these B0 artifacts bit for bit. Bitwise equality means same dtype/shape/array bytes, with zero tolerance; cloud rows were lexicographically sorted by XYZ before comparing points and associated colours.
+With the cached GLOMAP cameras/undistorted images of the end-to-end video reproduction, the reference phone window predictions converted float16→float32, assumed height 1.4 m and the four-thread BLAS environment above, `recon run --through fuse` reproduced these reference artifacts bit for bit. Bitwise equality means same dtype/shape/array bytes, with zero tolerance; cloud rows were lexicographically sorted by XYZ before comparing points and associated colours.
 
 | Compared artifact | Size / value | Result |
 | --- | --- | --- |
@@ -114,7 +143,7 @@ With the cached E3 GLOMAP cameras/undistorted images, B0 window predictions conv
 | Sorted initialization points / colours | 934231×3 each, float32 | Bitwise identical |
 | points_at_2cm / points / voxel_m | 934231 / 934231 / 0.02 m | Exact |
 
-Real-video prepare decoded 2590 frames and selected 1200; extracted source IDs and manifest IDs exactly matched E3, and timestamps exactly matched `round(extract.time_s × 1e9)`. The staged phone loader also exactly matched the formal B0 loader's normalized c2w/K, train/test/registered indices, centre/P95/scene scale and normalization diagnostic, sorted normalized points/colours, output dimensions and one decoded/resized sample image. This acceptance ran no SfM and no GPU training/evaluation. Fresh GLOMAP in the staged adapter, GLOMAP/COLMAP plus outer prior BA, and full staged GPU quality are **not verified on real input**; the provider adapters and train/eval assembly have synthetic CPU tests.
+Real-video prepare decoded 2590 frames and selected 1200; extracted source IDs and manifest IDs exactly matched the end-to-end video reproduction, and timestamps exactly matched `round(extract.time_s × 1e9)`. The staged phone loader also exactly matched the formal phone reference loader's normalized c2w/K, train/test/registered indices, centre/P95/scene scale and normalization diagnostic, sorted normalized points/colours, output dimensions and one decoded/resized sample image. This acceptance ran no SfM and no GPU training/evaluation. Fresh GLOMAP in the staged adapter, GLOMAP/COLMAP plus outer prior BA, and full staged GPU quality are **not verified on real input**; the provider adapters and train/eval assembly have synthetic CPU tests.
 
 ## Depth cache and windows
 
@@ -139,11 +168,11 @@ K001/prediction.npz
 
 ### Depth equivalence acceptance (2026-10-29)
 
-**Verified on CPU:** the full T17 keyframe sequence produces exactly the reference `{id, idx, new}` list; the independent 1200-frame case and expanded-context tail pass. The depth adapter tests check shared loader arguments, compression, preservation of extra returned arrays, configuration path resolution and `load_windows` compatibility. The depth test file passed 6 tests; the complete CPU suite passed 60 tests.
+**Verified on CPU:** the full office_gs_02 reference keyframe sequence produces exactly the reference `{id, idx, new}` list; the independent 1200-frame case and expanded-context tail pass. The depth adapter tests check shared loader arguments, compression, preservation of extra returned arrays, configuration path resolution and `load_windows` compatibility. The depth test file passed 6 tests; the complete CPU suite passed 60 tests.
 
-**Verified on GPU:** rerunning T17 K000/K001 (40 frames each, 512×288) through the new adapter preserves `depth` and `depth_conf` bit for bit. Camera arrays have the small nonzero differences below; whole-prediction bitwise equivalence is **not** established. Measurements used NVIDIA GeForce RTX 5060 Laptop GPU, PyTorch 2.7.1+cu128, CUDA 12.8, frame chunk 10 and `max_size` preprocessing. Shared inference source SHA-256: `6f541f51ff5cc94585419860e507c004492f607fdb77aa30851cb6c843d90da0`.
+**Verified on GPU:** rerunning reference windows K000/K001 of office_gs_02 (40 frames each, 512×288) through the new adapter preserves `depth` and `depth_conf` bit for bit. Camera arrays have the small nonzero differences below; whole-prediction bitwise equivalence is **not** established. Measurements used NVIDIA GeForce RTX 5060 Laptop GPU, PyTorch 2.7.1+cu128, CUDA 12.8, frame chunk 10 and `max_size` preprocessing. Shared inference source SHA-256: `6f541f51ff5cc94585419860e507c004492f607fdb77aa30851cb6c843d90da0`.
 
-Errors are computed in float64 against the stored T17 float32 reference: absolute error `abs(new-reference)`, relative error `abs(new-reference)/abs(reference)` with 0/0 defined as 0 and nonzero/0 as infinity. Bitwise equality requires identical dtypes and identical uncompressed array bytes (not identical ZIP files); its tolerance is zero. No nonzero camera-array acceptance tolerance was specified, so these are measured discrepancies, not a claim that camera equivalence passed.
+Errors are computed in float64 against the stored float32 reference predictions: absolute error `abs(new-reference)`, relative error `abs(new-reference)/abs(reference)` with 0/0 defined as 0 and nonzero/0 as infinity. Bitwise equality requires identical dtypes and identical uncompressed array bytes (not identical ZIP files); its tolerance is zero. No nonzero camera-array acceptance tolerance was specified, so these are measured discrepancies, not a claim that camera equivalence passed.
 
 | Window | Array | Maximum absolute error | Maximum relative error | Bitwise identical |
 | --- | --- | --- | --- | --- |
@@ -163,7 +192,7 @@ Timing surrounds `run_inference` with CUDA synchronization, excluding model load
 | K000 | 4.921412346011493 | 4121.87060546875 | 4288 |
 | K001 | 4.464301345986314 | 4121.87060546875 | 4328 |
 
-**Not verified:** the cause of the camera-array differences, downstream fused geometry or training impact, full-sequence GPU equivalence, phone B0 rerun, and NX hardware equivalence. This two-window check does not establish those results.
+**Not verified:** the cause of the camera-array differences, downstream fused geometry or training impact, full-sequence GPU equivalence, phone preset rerun, and NX hardware equivalence. This two-window check does not establish those results.
 
 ### Downstream use
 
@@ -173,7 +202,7 @@ Fusion uses confidence above frame median, 3×3 relative depth span ≤3%, z in 
 
 ## Image-only limitations
 
-COLMAP sequential overlap 20, quadratic overlap enabled, no loop detection, shared OPENCV camera; intrinsics/distortion refine during BA. Reports include counts for every model, largest-model registration rate and number of additional disconnected models. Default and currently implemented policy is **reject partial registration**. Successful complete models are undistorted before depth/training. Without an external scale, exported units are arbitrary. Metric depth thresholds are then thresholds in those arbitrary units; tune/validate scale before interpreting physical geometry.
+COLMAP sequential overlap 20, quadratic overlap enabled, no loop detection, shared OPENCV camera; intrinsics/distortion refine during BA. Reports include counts for every model, largest-model registration rate and number of additional disconnected models. Partial registration is always **rejected**. Successful complete models are undistorted before depth/training. Without an external scale, exported units are arbitrary. Metric depth thresholds are then thresholds in those arbitrary units; tune/validate scale before interpreting physical geometry.
 
 ## Archive coordinates and sidecars
 
@@ -204,6 +233,6 @@ Local source annotations only; all depth acceptance values and criteria are incl
 - Reference windows and predictions: `Data/experiments/office_gs_02_20261019/T17/omega512/kf_T15A8/windows.json` and `K000/prediction.npz`, `K001/prediction.npz` beneath that folder.
 - Reference input images and checkpoint: `Data/office_gs_02_frames/inputs/rgb/%06d.png`, `Data/Model/vggt_omega_1b_512.pt`.
 - New predictions and reproducible comparison script: `Data/experiments/restructure_20261029/depth_check/` (`compare.py`, `comparison.json`, `gpu.log`, `windows.json`, and the two window folders).
-- B0 CPU references: `Data/experiments/vggt_routes_20261028/prepare_B0.py`, `B0_scale.json`, `B0_cameras.npz`, `cloud_B0.npz`, `prior_B0/`, and `B0_formal/` under that experiment directory. Historical floater input is `prior_B/` there.
-- E3 cameras/extraction reference: `open_release_repo/outputs/equivalence/e3/`（原离线包仓库的验收输出）. Real video: `Data/Room/Rec709_video_20261027_001-fix.MOV`.
+- Phone reference CPU inputs: `Data/experiments/vggt_routes_20261028/prepare_B0.py`, `B0_scale.json`, `B0_cameras.npz`, `cloud_B0.npz`, `prior_B0/`, and `B0_formal/` under that experiment directory. Historical floater input is `prior_B/` there.
+- End-to-end video reproduction cameras/extraction reference: `open_release_repo/outputs/equivalence/e3/`（原离线包仓库的验收输出）. Real video: `Data/Room/Rec709_video_20261027_001-fix.MOV`.
 - Staged CPU evidence: `Data/experiments/restructure_20261029/` contains `b0_check.yaml`, `b0_manifest.json`, `compare_b0.py`, `b0_comparison_verified.json`, `b0_metric_threads.json`, `b0_extract.yaml`, `compare_b0_extract.py`, `b0_extract_comparison.json`, `compare_b0_loading.py`, and `b0_loading_comparison.json`. The first single-thread run and its nonzero discrepancies remain in `b0_comparison.json`.

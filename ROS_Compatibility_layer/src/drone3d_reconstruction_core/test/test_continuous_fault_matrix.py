@@ -14,6 +14,8 @@ collects a JSON-serializable evidence report.
 
 from __future__ import annotations
 
+from dataclasses import replace
+import sys
 import hashlib
 import json
 import math
@@ -26,8 +28,13 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 import urllib.request
+from urllib.parse import unquote, urlsplit
 
+# The shared v4 snapshot fixture lives next to this file; catkin's nose run does not add this directory.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from snapshot_v4 import write_v4_snapshot  # noqa: E402
 from drone3d_reconstruction_core.capture import (
     CaptureConfig,
     CaptureGoalParameters,
@@ -43,7 +50,6 @@ from drone3d_reconstruction_core.continuous_session import (
     JOB_SUCCEEDED,
     JobStatus,
     QUEUE_LOSSLESS,
-    QUEUE_REALTIME_LATEST,
     ReconstructionBackend,
     SESSION_DISK_PAUSED,
     SESSION_RUNNING,
@@ -61,7 +67,7 @@ from drone3d_reconstruction_core.formal_result import (
     scan_session_windows,
     verify_result_manifest,
 )
-from drone3d_reconstruction_core.pipeline_service import (
+from drone3d_reconstruction_core.action_types import (
     ACTION_CANCELLED,
     ACTION_FAILED,
     ACTION_SUCCEEDED,
@@ -126,12 +132,6 @@ ACC_FAULT_MATRIX = {
         "id": "ACC-005",
         "row": "lossless_fifo_order",
         "title": "lossless_fifo consumes windows strictly in enqueue order with no silent drops",
-        "cpu_runnable": True,
-    },
-    "realtime_latest_drops_oldest_pending": {
-        "id": "ACC-005",
-        "row": "realtime_latest_drops_oldest_pending",
-        "title": "realtime_latest only drops the oldest PENDING window and removes its input snapshot",
         "cpu_runnable": True,
     },
     "failure_then_continue": {
@@ -298,50 +298,18 @@ def write_result_manifest(
     return hashlib.sha256(data).hexdigest()
 
 
-def write_minimal_snapshot(snapshot_dir: Path, scene_id: str, frame_count: int) -> str:
-    """Write a valid v1 snapshot and return the files_sha256.csv SHA-256."""
-    snapshot_dir.mkdir(parents=True, exist_ok=True)
-    images_dir = snapshot_dir / "images"
-    images_dir.mkdir(exist_ok=True)
-    snapshot_payload = {
-        "schema": "drone3d.reconstruction.snapshot",
-        "version": 1,
-        "status": "PASS",
-        "scene_id": scene_id,
-        "frame_count": int(frame_count),
-    }
-    snapshot_bytes = json.dumps(snapshot_payload, sort_keys=True).encode("utf-8")
-    (snapshot_dir / "snapshot.json").write_bytes(snapshot_bytes)
-    files = [
-        (
-            "snapshot.json",
-            len(snapshot_bytes),
-            hashlib.sha256(snapshot_bytes).hexdigest(),
-        )
-    ]
-    frames_lines = ["frame_index,image_path"]
-    for index in range(int(frame_count)):
-        relative = f"images/{index}.png"
-        image_bytes = f"fake-image-{index}\n".encode("utf-8")
-        image_path = snapshot_dir / relative
-        image_path.parent.mkdir(parents=True, exist_ok=True)
-        image_path.write_bytes(image_bytes)
-        frames_lines.append(f"{index},{relative}")
-        files.append(
-            (relative, len(image_bytes), hashlib.sha256(image_bytes).hexdigest())
-        )
-    frames_bytes = ("\n".join(frames_lines) + "\n").encode("utf-8")
-    (snapshot_dir / "frames.csv").write_bytes(frames_bytes)
-    files.append(
-        ("frames.csv", len(frames_bytes), hashlib.sha256(frames_bytes).hexdigest())
+def write_minimal_snapshot(snapshot_dir: Path, scene_id: str, frame_count: int, capture_config) -> str:
+    """Write a valid v4 snapshot as the capture node does and return its manifest SHA-256.
+
+    Stamps increase across windows (window w starts at 100 + 100 w seconds);
+    rolling windows rebuild their shared frames from these stamps.
+    """
+    return write_v4_snapshot(
+        snapshot_dir, scene_id, frame_count,
+        first_stamp_sec=100 + int(scene_id.rsplit("-w", 1)[1]) * 100,
+        camera_name=capture_config.camera_name, image_topic=capture_config.image_topic,
+        camera_role=capture_config.camera_role, camera_frame_id=capture_config.camera_frame_id, image_bytes=lambda index: f"fake-image-{index}\n".encode("utf-8"),
     )
-    files.sort(key=lambda item: item[0])
-    manifest_lines = ["path,size,sha256"]
-    for path, size, digest in files:
-        manifest_lines.append(f"{path},{size},{digest}")
-    manifest_bytes = ("\n".join(manifest_lines) + "\n").encode("utf-8")
-    (snapshot_dir / "files_sha256.csv").write_bytes(manifest_bytes)
-    return hashlib.sha256(manifest_bytes).hexdigest()
 
 
 class FakeCaptureClient:
@@ -391,7 +359,7 @@ class FakeCaptureClient:
     def outcome(self):
         snapshot_dir = self.snapshot_root / (self.scene_id + "-" + "a" * 16)
         manifest_sha256 = write_minimal_snapshot(
-            snapshot_dir, self.scene_id, self.max_frames
+            snapshot_dir, self.scene_id, self.max_frames, self.role.capture_config
         )
         if self.snapshot_payload is not None:
             (snapshot_dir / "payload.bin").write_bytes(self.snapshot_payload)
@@ -507,6 +475,15 @@ class SourceStaleCaptureClient(FakeCaptureClient):
         self._ready.set()
 
 
+def _snapshot_frame_count(snapshot_uri) -> int:
+    """The worker reconstructs every frame of the submitted snapshot."""
+    try:
+        frames = Path(unquote(urlsplit(snapshot_uri).path)) / "frames.csv"
+        return max(1, len(frames.read_text().splitlines()) - 1)
+    except (OSError, TypeError, ValueError):
+        return 1
+
+
 class FakeBackend(ReconstructionBackend):
     """Deterministic backend whose first job can block or fail."""
 
@@ -571,6 +548,7 @@ class FakeBackend(ReconstructionBackend):
 
     def collect_result(self, job_id):
         job = self.jobs[job_id]
+        frame_count = _snapshot_frame_count(job["snapshot_uri"])
         if job["state"] == JOB_SUCCEEDED:
             return ReconstructActionOutcome(
                 action_state=ACTION_SUCCEEDED,
@@ -583,14 +561,14 @@ class FakeBackend(ReconstructionBackend):
                 ),
                 result_manifest_sha256=self.result_manifest_sha256 or ("b" * 64),
                 scene_glb_uri="",
-                frame_count=1,
+                frame_count=frame_count,
                 wall_time_sec=0.1,
                 camera_role=self.role.role,
                 camera_topic=self.role.capture_config.image_topic,
                 camera_frame_id=self.role.capture_config.camera_frame_id,
                 snapshot_manifest_sha256=job["manifest_sha256"],
                 result_scene_id=job_id,
-                result_actual_frame_count=1,
+                result_actual_frame_count=frame_count,
             )
         if job["state"] == JOB_CANCELLED:
             return ReconstructActionOutcome(
@@ -687,6 +665,7 @@ class FormalGateBackend(ReconstructionBackend):
     def collect_result(self, job_id):
         index = self.submitted.index(job_id)
         job = self.jobs[job_id]
+        frame_count = _snapshot_frame_count(job["snapshot_uri"])
         corrupt = self.corrupt_first and index == 0
         path = self.worker_root / (
             f"corrupt-{index}" if corrupt else f"valid-{index}"
@@ -695,7 +674,7 @@ class FormalGateBackend(ReconstructionBackend):
             path,
             scene_id=job_id,
             snapshot_sha=job["manifest_sha256"],
-            frame_count=1,
+            frame_count=frame_count,
             camera_role=self.role.role,
             camera_topic=self.role.capture_config.image_topic,
             camera_frame_id=self.role.capture_config.camera_frame_id,
@@ -709,14 +688,14 @@ class FormalGateBackend(ReconstructionBackend):
             result_manifest_uri=path.as_uri(),
             result_manifest_sha256=manifest_sha,
             scene_glb_uri="",
-            frame_count=1,
+            frame_count=frame_count,
             wall_time_sec=0.1,
             camera_role=self.role.role,
             camera_topic=self.role.capture_config.image_topic,
             camera_frame_id=self.role.capture_config.camera_frame_id,
             snapshot_manifest_sha256=job["manifest_sha256"],
             result_scene_id=job_id,
-            result_actual_frame_count=1,
+            result_actual_frame_count=frame_count,
         )
 
 
@@ -747,7 +726,7 @@ class FaultMatrixBed:
         self,
         *,
         initial_sample_fps: float = 1.0,
-        initial_window_frames: int = 1,
+        initial_window_frames: int = 6,
         initial_queue_mode: str = QUEUE_LOSSLESS,
         initial_queue_capacity: int = 8,
         initial_max_retries: int = 0,
@@ -766,12 +745,14 @@ class FaultMatrixBed:
         front_role = CameraRole(
             role="front",
             capture_action="/front/capture_segment",
-            capture_config=make_capture_config(self.root, "front"),
+            capture_config=replace(make_capture_config(self.root, "front"),
+                                   odometry_association="interpolate"),
         )
         down_role = CameraRole(
             role="down",
             capture_action="/down/capture_segment",
-            capture_config=make_capture_config(self.root, "down"),
+            capture_config=replace(make_capture_config(self.root, "down"),
+                                   odometry_association="interpolate"),
         )
         self.front_root = Path(front_role.capture_config.snapshot_root)
         self.config = ContinuousConfig(
@@ -787,13 +768,15 @@ class FaultMatrixBed:
             capture_wait_margin_sec=1.0,
             reconstruct_wait_timeout_sec=reconstruct_wait_timeout_sec,
             stop_timeout_sec=2.0,
-            reconstruct_frame_group_size=8,
+            reconstruct_frame_group_size=initial_window_frames,
             initial_sample_fps=initial_sample_fps,
             initial_window_frames=initial_window_frames,
+            initial_overlap_frames=5,
+            initial_inference_resolution=384,
             initial_queue_mode=initial_queue_mode,
             initial_queue_capacity=initial_queue_capacity,
             initial_max_retries=initial_max_retries,
-            initial_keep_snapshot_on_success=False,
+            initial_keep_snapshot_on_success=True,
             expected_checkpoint_sha256=CHECKPOINT_SHA if with_expected_authenticity else "",
             expected_checkpoint_path=CHECKPOINT_PATH if with_expected_authenticity else "",
             expected_result_root=str(self.worker_results) if with_expected_authenticity else "",
@@ -806,6 +789,17 @@ class FaultMatrixBed:
         self.capture_clients = []
         self.backends = []
         self._real_gate_default = with_expected_authenticity
+        # A succeeded window starts the G4 background process; stand in for one
+        # whose map already holds every formal window.
+        g4_process = mock.MagicMock()
+        g4_process.process.poll.return_value = None
+        g4_process.status.return_value = {"state": "ready", "window_count": 1 << 30,
+                                          "published_windows": []}
+        self._g4_patch = mock.patch(
+            "drone3d_reconstruction_core.continuous_session.G4BackendProcess",
+            return_value=g4_process,
+        )
+        self._g4_patch.start()
 
     def close(self):
         for service in reversed(self.services):
@@ -814,6 +808,7 @@ class FaultMatrixBed:
             except BaseException:
                 pass
         self.services.clear()
+        self._g4_patch.stop()
         self.temp.cleanup()
 
     def make_session(
@@ -1199,84 +1194,6 @@ def scenario_lossless_fifo_order():
         bed.close()
 
 
-def scenario_realtime_latest_drops_oldest_pending():
-    bed = FaultMatrixBed(
-        initial_queue_mode=QUEUE_REALTIME_LATEST,
-        initial_queue_capacity=1,
-    )
-    try:
-        role = bed.config.roles[0]
-        backend = FakeBackend(role, block_first=True)
-        w1_blocked = BlockingCaptureClient(role, bed.front_root)
-        w2_blocked = BlockingCaptureClient(role, bed.front_root)
-        calls = [0]
-
-        def capture_factory(_role):
-            calls[0] += 1
-            if calls[0] == 2:
-                return w1_blocked
-            if calls[0] == 3:
-                return w2_blocked
-            return FakeCaptureClient(role, bed.front_root)
-
-        service = bed.make_session(
-            capture_factory=capture_factory,
-            backend_factory=lambda: backend,
-        )
-        code, _ = service.select_source("front")
-        assert code == 0
-        code, _ = service.start_session("")
-        assert code == 0
-        bed.wait_until(
-            lambda: len(backend.submitted) == 1
-            and backend.submitted[0].endswith("-w0"),
-            timeout=10.0,
-        )
-        assert w1_blocked.goal_sent.wait(3.0)
-        w1_blocked.release()
-        bed.wait_until(
-            lambda: any(
-                event.get("event") == "window_pending"
-                and event.get("window_index") == 1
-                for event in bed.journal_events()
-            ),
-            timeout=10.0,
-        )
-        assert w2_blocked.goal_sent.wait(3.0)
-        service.pause()  # stop the capture loop from creating windows beyond w2
-        w2_blocked.release()
-        bed.wait_until(lambda: service.get_status().dropped_windows == 1, timeout=10.0)
-        dropped = [
-            event for event in bed.journal_events()
-            if event.get("event") == "window_dropped"
-        ]
-        assert len(dropped) == 1
-        assert dropped[0].get("window_index") == 1, "only the oldest PENDING window may be dropped"
-        dropped_scene = dropped[0]["scene_id"]
-        assert not any(
-            path.name.startswith(dropped_scene + "-")
-            for path in bed.front_root.iterdir()
-        ), "dropped window snapshot was not removed"
-        backend.release_first.set()
-        backend.jobs[backend.submitted[0]]["state"] = JOB_SUCCEEDED
-        bed.wait_until(
-            lambda: any(wid.endswith("-w2") for wid in backend.submitted),
-            timeout=10.0,
-        )
-        assert not any(wid.endswith("-w1") for wid in backend.submitted), (
-            "dropped window must never be submitted"
-        )
-        assert service.get_status().dropped_windows == 1
-        return _evidence(
-            "realtime_latest dropped only the oldest PENDING window (w1) and deleted its snapshot",
-            [event for event in bed.journal_events() if event.get("event") in ("window_pending", "window_dropped", "window_succeeded")],
-            dropped_scene=dropped_scene,
-            submitted=[wid for wid in backend.submitted],
-        )
-    finally:
-        bed.close()
-
-
 def scenario_failure_then_continue():
     bed = FaultMatrixBed()
     try:
@@ -1312,7 +1229,13 @@ def scenario_failure_then_continue():
         ]
         assert not retained, "terminal failed window snapshot must be removed"
         service.stop_all(discard_queue=True)
-        assert not any(bed.front_root.iterdir()), "stop_all must leave no snapshots"
+        kept = {
+            Path(unquote(urlsplit(record.snapshot_uri).path))
+            for record in service._windows if record.state == "SUCCEEDED"
+        }
+        assert kept and set(bed.front_root.iterdir()) == kept, (
+            "stop_all must leave only the snapshots G4 keeps for succeeded windows"
+        )
         return _evidence(
             "ordinary failure kept its journal diagnosis, removed its snapshot, and did not block later windows",
             [event for event in events if event.get("event") in ("window_failed", "window_pending", "window_succeeded", "session_stop")],
@@ -1643,7 +1566,6 @@ SCENARIOS = {
     "worker_watchdog_timeout_cancel": scenario_worker_watchdog_timeout_cancel,
     "disk_redline_pause_resume": scenario_disk_redline_pause_resume,
     "lossless_fifo_order": scenario_lossless_fifo_order,
-    "realtime_latest_drops_oldest_pending": scenario_realtime_latest_drops_oldest_pending,
     "failure_then_continue": scenario_failure_then_continue,
     "formal_gate_rejects_corrupt_result": scenario_formal_gate_rejects_corrupt_result,
     "stop_all_cleanup_no_orphan": scenario_stop_all_cleanup_no_orphan,

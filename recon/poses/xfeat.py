@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """User-installed XFeat dense/refined matching, fixed pixel-space RANSAC."""
+import sys
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import numpy as np
 from recon.io.common import dump
@@ -16,7 +18,16 @@ def match(data,images,pairs,path,settings):
     import cv2
     import torch
     # XFeat must be installed by the user; no torch.hub download or main-branch fallback.
-    from modules.xfeat import XFeat
+    source=settings.get('xfeat_source')
+    if source:
+        if not (Path(source)/'modules'/'xfeat.py').is_file():
+            raise FileNotFoundError(f'pose.xfeat_source has no modules/xfeat.py: {source}')
+        sys.path.insert(0,source)
+    import modules.xfeat
+    # An earlier import in this process wins over sys.path: never match with another checkout than the configured one.
+    if source and Path(modules.xfeat.__file__).resolve()!=(Path(source)/'modules'/'xfeat.py').resolve():
+        raise ImportError(f'pose.xfeat_source is {source} but modules.xfeat is already imported from {modules.xfeat.__file__}')
+    XFeat=modules.xfeat.XFeat
     cv2.setNumThreads(1);cv2.setRNGSeed(0)
     model=XFeat(weights=settings['xfeat_weights'],top_k=4096)
     batch_size=int(settings.get('batch_size',8))

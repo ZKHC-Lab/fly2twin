@@ -122,7 +122,6 @@ class ProductionConfig:
     conf_thres: float
     max_points_k: int
     profile_name: str
-    required_device_sku: str
     algorithm_revision: str
     ros_revision: str
     warm_worker_enabled: bool = False
@@ -270,13 +269,6 @@ class ProductionConfig:
             or not _PROFILE_NAME_RE.fullmatch(self.profile_name)
         ):
             raise ProductionConfigError("profile_name must be a safe identifier")
-        if (
-            not isinstance(self.required_device_sku, str)
-            or not _PROFILE_NAME_RE.fullmatch(self.required_device_sku)
-        ):
-            raise ProductionConfigError(
-                "required_device_sku must be a safe nonempty identifier"
-            )
         for name in ("algorithm_revision", "ros_revision"):
             value = getattr(self, name)
             if not isinstance(value, str) or not value:
@@ -1236,9 +1228,7 @@ class ProductionCompletionVerifier:
                 "has_odometry": self._snapshot.has_odometry,
             },
             "selected_frames": selected_frames,
-            "frame_stamps_available": bool(
-                self._snapshot.snapshot_version >= 2
-            ),
+            "frame_stamps_available": True,
             "actual_frame_count": len(selected_frames),
             "image_geometry": {"width": width, "height": height},
             "camera_role": self._snapshot.camera_role,
@@ -1255,7 +1245,6 @@ class ProductionCompletionVerifier:
                 "backend": config.backend,
                 "mode": "independent",
                 "name": config.profile_name,
-                "required_device_sku": config.required_device_sku,
                 "image_resolution": config.image_resolution,
                 "frame_group_size": config.frame_group_size,
                 "aggregator_frame_chunk_size": config.aggregator_frame_chunk_size,

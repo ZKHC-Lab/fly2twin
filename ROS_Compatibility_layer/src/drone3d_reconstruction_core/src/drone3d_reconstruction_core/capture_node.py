@@ -137,18 +137,16 @@ def load_capture_config(params: Mapping[str, Any]) -> CaptureConfig:
     values["tf_topic"] = _optional_topic(params, "tf_topic")
     values["tf_static_topic"] = _optional_topic(params, "tf_static_topic")
     values["save_sensor_depth"] = _required_bool(params, "save_sensor_depth")
-    values["odometry_association"] = params.get("odometry_association", "previous")
-    values["pose_time_offset_ms"] = _finite_number(params.get("pose_time_offset_ms", 0.0), "pose_time_offset_ms")
-    values["pose_interpolation_wait_ms"] = _finite_number(
-        params.get("pose_interpolation_wait_ms", 500.0), "pose_interpolation_wait_ms"
-    )
-    for key, default in (("keyframe_min_translation_m", 0.0), ("keyframe_min_rotation_deg", 0.0),
-                         ("keyframe_max_interval_sec", 2.0)):
-        values[key] = _finite_number(params.get(key, default), key)
-    values["handoff_buffer_frames"] = _integer(params.get("handoff_buffer_frames", 0), "handoff_buffer_frames")
-    values["handoff_buffer_max_bytes"] = _integer(
-        params.get("handoff_buffer_max_bytes", 128 * 1024 * 1024), "handoff_buffer_max_bytes"
-    )
+    # Optional keys: an absent key leaves the CaptureConfig field default in force.
+    if "odometry_association" in params:
+        values["odometry_association"] = params["odometry_association"]
+    for key in ("pose_time_offset_ms", "pose_interpolation_wait_ms", "keyframe_min_translation_m",
+                "keyframe_min_rotation_deg", "keyframe_max_interval_sec"):
+        if key in params:
+            values[key] = _finite_number(params[key], key)
+    for key in ("handoff_buffer_frames", "handoff_buffer_max_bytes"):
+        if key in params:
+            values[key] = _integer(params[key], key)
     body_frame_id = _optional_string(params, "body_frame_id")
     values["body_frame_id"] = body_frame_id
     values["tf_relevant_frames"] = tuple(
@@ -442,6 +440,10 @@ def _input_status(config, server, not_ready):
                 kv("selected_frames", session["selected_frames"]),
                 kv("odometry_gaps", session["odometry_gaps"]),
                 kv("odometry_regressions", session["odometry_regressions"]),
+                kv("auxiliary_errors", session.get("auxiliary_errors", 0)),
+                kv("auxiliary_dropped", session.get("auxiliary_dropped", 0)),
+                kv("tf_dropped", session.get("tf_dropped", 0)),
+                kv("last_auxiliary_error", session.get("last_auxiliary_error", "")),
                 kv("source_stale", session["source_stale"]),
                 kv("source_stale_entries", session["source_stale_entries"]),
                 kv("zero_stamp_count", session["zero_stamp_count"]),

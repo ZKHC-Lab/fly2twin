@@ -12,7 +12,6 @@ Output: <out>/frames/<source_frame>.jpg plus <out>/extract.json.
 """
 import argparse
 import json
-import shutil
 import subprocess
 import sys
 import time

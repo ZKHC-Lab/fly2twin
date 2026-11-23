@@ -25,7 +25,6 @@ from drone3d_reconstruction_core.continuous_web import (
     WebDashboardCore,
     WebDashboardError,
     WebRoleInfo,
-    _latest_window_record,
 )
 
 SESSION_RE = r"s[0-9a-f]{16}"
@@ -278,7 +277,9 @@ class WebDashboardServerTest(unittest.TestCase):
             directory.mkdir(parents=True)
             transform = dict(scale=1., rotation=np.eye(3).tolist(), translation=[dx,0,0])
             revision = dict(session_id=session, revision=number, replacement="complete_map",
-                reference_frame_id="odom", windows=[dict(window_id=0, included_in_global_preview=True,
+                placement="frame_pose", reference_frame_id="odom", windows=[dict(window_id=0,
+                included_in_global_preview=True, placement="frame_pose", depth_scale=1.,
+                intrinsics=np.eye(3).tolist(), frame_poses=[dict(rotation=np.eye(3).tolist(), center=[dx,0,0])],
                 prediction_to_map=transform, global_frame_status="localized", source=dict(
                 result_manifest_sha256=record["result_manifest_sha256"], snapshot_manifest_sha256=snapshot_sha,
                 shared_prefix=0, frame_ids=[0], gauge=1.))])
@@ -347,7 +348,7 @@ class WebDashboardServerTest(unittest.TestCase):
             if frame_depth_scales is not None:
                 window["frame_depth_scales"] = frame_depth_scales
             revision = dict(session_id=session, revision=1, replacement="complete_map",
-                            reference_frame_id="odom", windows=[window])
+                            placement="frame_pose", reference_frame_id="odom", windows=[window])
             data = json.dumps(revision).encode()
             (directory / "revision.json").write_bytes(data)
             (root / "latest.json").write_text(json.dumps(dict(path=str(directory),
@@ -390,8 +391,6 @@ class WebDashboardServerTest(unittest.TestCase):
         self.assertNotIn("__omegaTimer", text)
         self.assertIn("function pointCloudSpec()", text)
         self.assertIn("function latestRecord(records)", text)
-        self.assertIn("modeDirty=true", text)
-        self.assertIn('modeSel.disabled=commandInFlight||!startable', text)
         self.assertIn("selected.map(function(r)", text)
         self.assertIn("window.__pcKey===spec.key", text)
         self.assertIn('r.headers.get("X-Session")!==spec.session', text)
@@ -403,41 +402,6 @@ class WebDashboardServerTest(unittest.TestCase):
         payload = json.loads(body.decode("utf-8"))
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["service"], "drone3d-continuous-web")
-
-    def test_latest_frame_pool_record_uses_pool_revision(self):
-        records = [
-            {
-                "window_index": 0,
-                "reconstruction_mode": "frame_pool",
-                "pool_revision": 1,
-            },
-            {
-                "window_index": 1,
-                "reconstruction_mode": "frame_pool",
-                "pool_revision": 0,
-            },
-        ]
-        self.assertEqual(_latest_window_record(records)["pool_revision"], 1)
-
-    def test_frame_pool_pointcloud_only_uses_latest_revision_even_with_old_map(self):
-        session = _session_id("pool-latest-only")
-        world = np.array([[[[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]]]], dtype=np.float32)
-        images = np.ones((1, 1, 2, 3), dtype=np.float32) * 0.5
-        conf = np.ones((1, 1, 2), dtype=np.float32) * 100
-        map_id = session + "-m0"
-        for index in (0, 1):
-            self._write_formal_window(session, index, self._aligned_alignment(map_id),
-                                     world + index * 10, images, conf)
-            path = self.sessions_root / session / f"window-{index:04d}" / "provenance.json"
-            provenance = json.loads(path.read_text())
-            provenance.update(reconstruction_mode="frame_pool", pool_revision=index)
-            path.write_text(json.dumps(provenance, sort_keys=True))
-        core = WebDashboardCore(self._config(conf_percentile=0.0))
-        for requested_map in ("latest", map_id):
-            result = core.build_point_cloud(session, requested_map, 100)
-            self.assertEqual(result["windows"], [1])
-            self.assertEqual(result["coordinate_state"], COORDINATE_MODEL_LOCAL_UNALIGNED)
-            np.testing.assert_allclose(result["xyz"], (world + 10).reshape(-1, 3))
 
     def test_state_follow_latest_and_manual_selection(self):
         session_new = _session_id("new")
@@ -538,7 +502,7 @@ class WebDashboardServerTest(unittest.TestCase):
         self._post(core, {"command": "set_preview_fps", "value": -1.0}, expect=400)
         self._post(core, {"command": "follow_latest", "value": "yes"}, expect=400)
 
-    def test_start_session_reconstruction_mode_forwarding(self):
+    def test_start_session_forwards_only_the_role(self):
         sent = []
 
         def send_command(command):
@@ -548,107 +512,20 @@ class WebDashboardServerTest(unittest.TestCase):
         core = self._start_core(
             WebDashboardCore(self._config(), send_command=send_command)
         )
-        self._post(
-            core,
-            {
-                "command": "start_session",
-                "role": "front",
-                "reconstruction_mode": "frame_pool",
-            },
-            expect=200,
-        )
-        self.assertEqual(sent[-1]["reconstruction_mode"], "frame_pool")
         self._post(core, {"command": "start_session", "role": "front"}, expect=200)
-        self.assertEqual(sent[-1]["reconstruction_mode"], "")
-        self._post(
-            core,
-            {
-                "command": "start_session",
-                "role": "front",
-                "reconstruction_mode": "magic",
-            },
-            expect=400,
-        )
-
-    def test_set_params_validation_and_forward(self):
-        sent = []
-
-        def send_command(command):
-            sent.append(command)
-            return {"ok": True, "error": ""}
-
-        core = self._start_core(WebDashboardCore(self._config(), send_command=send_command))
-        status, _headers, body = self._post(
-            core,
-            {
-                "command": "set_params",
-                "sample_fps": 2.0,
-                "window_frames": 4,
-                "overlap_frames": 2,
-                "queue_mode": "realtime_latest",
-                "queue_capacity": 3,
-                "max_retries": 0,
-                "keep_snapshot_on_success": False,
-            },
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(sent[-1]["sample_fps"], 2.0)
-        self.assertEqual(sent[-1]["overlap_frames"], 2)
-        self.assertEqual(sent[-1]["max_retries"], 0)
-
-        # No fields -> reject.
-        self._post(core, {"command": "set_params"}, expect=400)
-        # Bad queue_mode -> reject.
-        self._post(
-            core, {"command": "set_params", "queue_mode": "magic"}, expect=400
-        )
-        # bool for max_retries -> reject.
-        self._post(
-            core, {"command": "set_params", "max_retries": True}, expect=400
-        )
-        self._post(
-            core, {"command": "set_params", "overlap_frames": -1}, expect=400
-        )
+        self.assertEqual(sent[-1]["command"], "start_session")
+        self.assertEqual(sent[-1]["role"], "front")
+        self.assertNotIn("reconstruction_mode", sent[-1])
+        # 重建模式只有一种，Web 不再接受这个参数；带上它按未知字段拒绝，不会被悄悄忽略。
+        for mode in ("per_window", "frame_pool"):
+            self._post(
+                core,
+                {"command": "start_session", "role": "front", "reconstruction_mode": mode},
+                expect=400,
+            )
+        self.assertEqual(len(sent), 1)
 
     # ------------------------------------------------------------------
-    def test_set_params_new_hot_tune_fields_forwarding(self):
-        sent = []
-
-        def send_command(command):
-            sent.append(command)
-            return {"ok": True, "error": ""}
-
-        core = self._start_core(WebDashboardCore(self._config(), send_command=send_command))
-        status, _headers, body = self._post(
-            core,
-            {
-                "command": "set_params",
-                "save_sensor_depth": True,
-                "inference_resolution": 256,
-                "worker_timeout_sec": 60.0,
-            },
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(sent[-1]["save_sensor_depth"], True)
-        self.assertEqual(sent[-1]["inference_resolution"], 256)
-        self.assertEqual(sent[-1]["worker_timeout_sec"], 60.0)
-
-        self._post(
-            core,
-            {"command": "set_params", "inference_resolution": 31},
-            expect=400,
-        )
-        self._post(
-            core,
-            {"command": "set_params", "worker_timeout_sec": -1.0},
-            expect=400,
-        )
-        self._post(
-            core,
-            {"command": "set_params", "save_sensor_depth": "yes"},
-            expect=400,
-        )
-
     def test_state_formal_records_expose_depth_metrics(self):
         session = _session_id("depthmetrics")
         world = np.zeros((1, 1, 1, 3), dtype=np.float32)
@@ -742,19 +619,18 @@ class WebDashboardServerTest(unittest.TestCase):
         # 热调生效时应约 3.0s。
         self.assertGreater(sum(sleeps), 2.5)
 
-    def test_queue_mode_form_unchanged_option_and_build_set_params(self):
+    def test_page_has_view_controls_and_no_session_param_form(self):
         core = self._start_core(WebDashboardCore(self._config()))
         _status, _headers, body = self._get(core, "/")
         html = body.decode("utf-8")
-        self.assertIn('<option value="">不变</option>', html)
-        self.assertIn("function buildSetParams", html)
-        self.assertIn('id="p-overlap-frames"', html)
+        self.assertNotIn("params-form", html)
+        self.assertNotIn("set_params", html)
+        self.assertIn('id="preview-form"', html)
         self.assertIn('id="include-rejected"', html)
         self.assertIn('id="map-select"', html)
         self.assertIn("本次新增采集帧 k/N", html)
         self.assertIn("st.capture_target_frames", html)
-        self.assertIn('if(v!=="")args.queue_mode=v', html)
-        self.assertIn("if(Object.keys(args).length)postCommand", html)
+        self._post(core, {"command": "set_params", "sample_fps": 2.0}, expect=400)
 
     def test_pointcloud_merge_math_two_aligned_windows(self):
         session = _session_id("pc")
@@ -1513,6 +1389,47 @@ class G4HintRowDisplayTests(unittest.TestCase):
         self.assertNotIn("esc(g4s.error", row)
 
 
+class G4FailureBadgeTests(unittest.TestCase):
+    """顶栏的“地图后端出错”徽标：只在后端真的失败时出现，正常停止不算。"""
+
+    def setUp(self):
+        from drone3d_reconstruction_core.continuous_web import _dashboard_html
+        self.html = _dashboard_html()
+
+    def test_badge_is_in_the_page_and_hidden_by_default(self):
+        self.assertIn('<span class="badge unreliable" id="g4-badge" hidden>', self.html)
+        self.assertIn('g4Badge.hidden=!g4Failed(g4s)', self.html)
+
+    def test_g4_failed_predicate(self):
+        import shutil
+        import subprocess
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node is not available to evaluate the dashboard script")
+        predicate = [line for line in self.html.splitlines()
+                     if line.startswith("function g4Failed(")]
+        self.assertEqual(len(predicate), 1)
+        cases = [
+            (None, False),
+            ({}, False),
+            ({"state": "optimizing"}, False),
+            ({"state": "ready", "revision": 4}, False),
+            ({"state": "stopped", "exit_code": 0}, False),
+            ({"state": "error", "error": "G4 background start failed: OSError: x"}, True),
+            ({"state": "error", "exit_code": -9}, True),
+            ({"state": "error", "exit_code": None}, True),
+        ]
+        script = "\n".join([
+            predicate[0],
+            "var cases=%s;" % json.dumps([case for case, _ in cases]),
+            "process.stdout.write(JSON.stringify(cases.map(g4Failed)));",
+        ])
+        done = subprocess.run([node, "-e", script], capture_output=True, text=True,
+                              timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(json.loads(done.stdout), [expected for _, expected in cases])
+
+
 class PauseResumeControlGatingTests(unittest.TestCase):
     """MEMORY_PAUSED 必须在 Web 上给出人工重试按钮；FATAL_OOM 保持禁用。"""
 
@@ -1533,11 +1450,10 @@ class PauseResumeControlGatingTests(unittest.TestCase):
         end = next(index for index in range(start, len(lines))
                    if lines[index].startswith("function setCommandsDisabled("))
         body = "\n".join(lines[start:end])
-        elements = {}
         script = "\n".join([
             "function $(id){return elements[id]||(elements[id]={disabled:false,textContent:'',title:'',"
             "selectedOptions:[{disabled:false}],value:'',style:{}})}",
-            "var elements={};var commandInFlight=false;var modeDirty=false;",
+            "var elements={};var commandInFlight=false;",
             "function esc(s){return String(s)}",
             "var document={querySelectorAll:function(){return []}};",
             body,
@@ -1561,8 +1477,8 @@ class PauseResumeControlGatingTests(unittest.TestCase):
         self.assertEqual(self.control_state({"state": "PAUSED"})["text"], "恢复")
         self.assertEqual(self.control_state({"state": "RUNNING"})["text"], "暂停")
 
-    def test_oom_and_alignment_pause_never_offer_resume(self):
-        for status in ("FATAL_OOM", "ALIGNMENT_PAUSED", "IDLE"):
+    def test_oom_pause_never_offers_resume(self):
+        for status in ("FATAL_OOM", "IDLE"):
             state = self.control_state({"state": status})
             self.assertTrue(state["disabled"], status)
             self.assertNotEqual(state["text"], "重试资源失败窗")

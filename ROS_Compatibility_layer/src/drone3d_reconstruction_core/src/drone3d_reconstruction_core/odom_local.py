@@ -1,53 +1,22 @@
-"""ODOM_LOCAL_APPROX：窗口级 Omega 相机轨迹与 odom 参考轨迹的 Sim(3) 近似对齐。
+"""坐标状态常量与里程计轨迹的共用工具。
 
-本模块只做"可计算性检查 + 质量门禁后的近似对齐"，绝不宣称测量精度：
-- 用逐帧相机姿态确定旋转，再由相机位置估计尺度和平移；
-- 参考轨迹基线、姿态残差、归一化位置残差均通过门限时标记
-  ``ODOM_LOCAL_APPROX``；
-- 任一条件不满足时回退 ``MODEL_LOCAL_UNALIGNED`` 并给出明确原因；
-- 结果始终携带 ``unreliable=true``（近似、不可靠、未经真值验证）。
-
-输入：
-- :class:`~drone3d_reconstruction_core.snapshot_validator.ValidatedSnapshot`
-  （v4 snapshot 的逐帧完整 Odometry payload 与 tf.json 条目）
-- Omega result 目录中的 ``predictions.npz``（``extrinsic`` 为 N×3×4）
-
-输出：:class:`OdomLocalAlignment`（含 scale/rotation/translation/residual）。
+- ``COORDINATE_MODEL_LOCAL_UNALIGNED`` / ``COORDINATE_ODOM_LOCAL_APPROX``：
+  正式记录与 Web 使用的坐标状态；
+- :func:`valid_sim3_alignment`：校验正式记录里的 Sim(3) 对齐载荷；
+- :func:`_reference_camera_positions`：由逐帧完整 Odometry 计算参考相机轨迹
+  （G4 输入读取使用）；
+- :func:`_extract_transform`：把 tf.json 条目转成刚体变换。
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import numpy as np
 
 COORDINATE_MODEL_LOCAL_UNALIGNED = "MODEL_LOCAL_UNALIGNED"
 COORDINATE_ODOM_LOCAL_APPROX = "ODOM_LOCAL_APPROX"
-
-
-@dataclass(frozen=True)
-class OdomLocalAlignment:
-    """一次窗口对齐结果（可计算性门禁之后的只读产物）。"""
-
-    coordinate_state: str
-    reference_frame_id: str
-    correspondence_count: int
-    scale: float | None
-    rotation: list[list[float]] | None
-    translation: list[float] | None
-    residual_rms: float | None
-    reason: str
-    reference_first_position: tuple[float, float, float] | None = None
-    reference_last_position: tuple[float, float, float] | None = None
-    reference_first_stamp: tuple[int, int] | None = None
-    reference_last_stamp: tuple[int, int] | None = None
-    reference_baseline_m: float | None = None
-    orientation_residual_deg: float | None = None
-    normalized_residual_rms: float | None = None
-    reference_samples: tuple[dict, ...] = ()
 
 
 def _finite_float(value: Any, label: str) -> float:
@@ -102,10 +71,6 @@ def _quaternion_to_rotation(qx: float, qy: float, qz: float, qw: float) -> np.nd
     )
 
 
-def _invert_transform(rotation: np.ndarray, translation: np.ndarray):
-    return rotation.T, -(rotation.T @ translation)
-
-
 def _extract_transform(tf_entry: dict) -> tuple[np.ndarray, np.ndarray]:
     """把 tf.json 条目转成 T_parent_child（child 坐标映射到 parent）。"""
     translation = tf_entry["translation"]
@@ -125,47 +90,6 @@ def _extract_transform(tf_entry: dict) -> tuple[np.ndarray, np.ndarray]:
         _finite_float(rotation["w"], "tf.rotation.w"),
     )
     return r, t
-
-
-def _resolve_body_camera_transform(
-    tf_entries: tuple[dict, ...],
-    body_frame_id: str | None,
-    camera_frame_id: str | None,
-) -> tuple[np.ndarray, np.ndarray] | None:
-    """从 tf.json 解析 T_body_camera（child=camera, parent=body）。"""
-    if not body_frame_id or not camera_frame_id:
-        return None
-    static_entries = [entry for entry in tf_entries if entry.get("static")]
-
-    def _find(entries):
-        for entry in entries:
-            parent = entry.get("parent_frame_id")
-            child = entry.get("child_frame_id")
-            if parent == body_frame_id and child == camera_frame_id:
-                return _extract_transform(entry)
-            if parent == camera_frame_id and child == body_frame_id:
-                rotation, translation = _extract_transform(entry)
-                return _invert_transform(rotation, translation)
-        return None
-
-    # 静态 TF 优先；没有命中时回退到全部 TF（动态外参仍然合法）。
-    resolved = _find(static_entries)
-    if resolved is not None:
-        return resolved
-    return _find(tf_entries)
-
-
-def _camera_centers_from_extrinsic(extrinsic: np.ndarray) -> np.ndarray:
-    """由 Omega extrinsic（world→camera，3×4）计算相机光心在世界系的位置。"""
-    if extrinsic.ndim == 2:
-        extrinsic = extrinsic[None, :, :]
-    if extrinsic.ndim != 3 or extrinsic.shape[1:] != (3, 4):
-        raise ValueError("extrinsic must have shape (N,3,4)")
-    rotation = extrinsic[:, :3, :3]
-    translation = extrinsic[:, :3, 3]
-    # camera = R @ world + t  =>  world = R^T @ (camera - t)；
-    # 光心 camera=(0,0,0) 时 world = -R^T @ t
-    return -np.einsum("nij,nj->ni", np.transpose(rotation, (0, 2, 1)), translation)
 
 
 def _reference_camera_positions(
@@ -263,240 +187,6 @@ def _reference_camera_positions(
         reference_frame_id,
         tuple(stamps) if stamps else None,
     )
-
-
-def _project_rotation(matrix: np.ndarray) -> np.ndarray:
-    """Project a 3x3 matrix to the nearest proper rotation."""
-    u, _singular, vt = np.linalg.svd(matrix)
-    correction = np.eye(3)
-    if np.linalg.det(u @ vt) < 0:
-        correction[2, 2] = -1.0
-    return u @ correction @ vt
-
-
-def _rotation_angle_deg(rotation: np.ndarray) -> float:
-    cosine = float(np.clip((np.trace(rotation) - 1.0) * 0.5, -1.0, 1.0))
-    return float(np.degrees(np.arccos(cosine)))
-
-
-def _pose_constrained_sim3(
-    source_positions: np.ndarray,
-    source_world_to_camera: np.ndarray,
-    target_positions: np.ndarray,
-    target_camera_to_world: np.ndarray,
-    *,
-    min_reference_baseline_m: float,
-) -> tuple[float, np.ndarray, np.ndarray, float, float, float]:
-    """Fit model->odom Sim(3), taking rotation from matched camera attitudes."""
-    rotations = np.matmul(target_camera_to_world, source_world_to_camera)
-    rotation = _project_rotation(np.sum(rotations, axis=0))
-    angular_errors = np.asarray(
-        [_rotation_angle_deg(rotation.T @ candidate) for candidate in rotations]
-    )
-    orientation_residual = float(np.sqrt(np.mean(angular_errors * angular_errors)))
-
-    target_centered = target_positions - np.mean(target_positions, axis=0)
-    rotated_source = (rotation @ source_positions.T).T
-    source_centered = rotated_source - np.mean(rotated_source, axis=0)
-    reference_baseline = float(
-        np.max(np.linalg.norm(target_positions - target_positions[0], axis=1))
-    )
-    if reference_baseline < float(min_reference_baseline_m):
-        raise ValueError(
-            f"reference trajectory baseline {reference_baseline:.6g} m is below "
-            f"{float(min_reference_baseline_m):.6g} m"
-        )
-    denominator = float(np.sum(source_centered * source_centered))
-    if denominator <= 1e-12:
-        raise ValueError("model trajectory is degenerate")
-    scale = float(np.sum(source_centered * target_centered) / denominator)
-    if not np.isfinite(scale) or scale <= 1e-12:
-        raise ValueError("pose-constrained Sim(3) scale is not finite/positive")
-    translation = np.mean(target_positions, axis=0) - scale * np.mean(
-        rotated_source, axis=0
-    )
-    transformed = scale * rotated_source + translation
-    residual = float(
-        np.sqrt(np.mean(np.sum((transformed - target_positions) ** 2, axis=1)))
-    )
-    if not np.isfinite(residual):
-        raise ValueError("pose-constrained Sim(3) residual is not finite")
-    return (
-        scale,
-        rotation,
-        translation,
-        residual,
-        reference_baseline,
-        orientation_residual,
-    )
-
-
-
-
-def _fallback(reason: str) -> OdomLocalAlignment:
-    return OdomLocalAlignment(
-        coordinate_state=COORDINATE_MODEL_LOCAL_UNALIGNED,
-        reference_frame_id="",
-        correspondence_count=0,
-        scale=None,
-        rotation=None,
-        translation=None,
-        residual_rms=None,
-        reason=reason,
-    )
-
-
-def align_window(
-    snapshot: Any,
-    predictions_path: Path,
-    *,
-    min_correspondences: int = 4,
-    selected_frame_indices: Sequence[int] | None = None,
-    min_reference_baseline_m: float = 0.1,
-    max_orientation_residual_deg: float = 15.0,
-    max_normalized_residual_rms: float = 0.25,
-) -> OdomLocalAlignment:
-    """执行一个窗口的可计算性检查与 Sim(3) 近似对齐。
-
-    任何缺失/退化/非有限输入都回退 MODEL_LOCAL_UNALIGNED，绝不抛异常。
-
-    ``selected_frame_indices`` 给出每个模型帧对应的 snapshot 帧序号
-    （Omega 输入做均匀抽帧后模型帧序号与 snapshot 帧序号不再相同）。
-    长度与模型帧数不一致或未提供时，退回旧行为：模型帧序号 ==
-    snapshot 帧序号。
-    """
-    try:
-        body_camera = _resolve_body_camera_transform(
-            tuple(snapshot.tf_entries or ()),
-            getattr(snapshot, "body_frame_id", None),
-            getattr(snapshot, "camera_frame_id", None),
-        )
-        if body_camera is None:
-            return _fallback("missing T_body_camera transform in snapshot tf.json")
-        body_camera_rotation, body_camera_translation = body_camera
-        (
-            indices,
-            reference_positions,
-            reference_rotations,
-            reference_frame_id,
-            odom_stamps,
-        ) = (
-            _reference_camera_positions(
-                snapshot, body_camera_rotation, body_camera_translation
-            )
-        )
-        if odom_stamps is not None and len(odom_stamps) > 1:
-            previous = None
-            for stamp in odom_stamps:
-                if previous is not None and stamp < previous:
-                    return _fallback("odometry stamp reset inside window")
-                previous = stamp
-        if not predictions_path.is_file():
-            return _fallback(f"missing predictions.npz: {predictions_path}")
-        try:
-            with np.load(str(predictions_path), allow_pickle=False) as archive:
-                if "extrinsic" not in archive:
-                    return _fallback("predictions.npz has no extrinsic")
-                extrinsic = archive["extrinsic"]
-        except Exception as error:
-            return _fallback(f"predictions.npz unreadable: {type(error).__name__}")
-        model_positions = _camera_centers_from_extrinsic(extrinsic)
-        if model_positions.shape[0] < min_correspondences:
-            return _fallback(
-                "not enough model frames for Sim(3) correspondences"
-            )
-        if (
-            selected_frame_indices is not None
-            and len(selected_frame_indices) == model_positions.shape[0]
-        ):
-            model_indices = selected_frame_indices
-        else:
-            # 旧调用路径没有选中帧清单，只能假设模型帧序号 == snapshot 帧序号。
-            model_indices = range(model_positions.shape[0])
-        valid = []
-        model_rotations = np.asarray(extrinsic, dtype=np.float64)[:, :3, :3]
-        for position, model_rotation, snapshot_index in zip(
-            model_positions, model_rotations, model_indices
-        ):
-            matches = np.where(indices == snapshot_index)[0]
-            if matches.size == 1:
-                valid.append(
-                    (
-                        position,
-                        model_rotation,
-                        reference_positions[matches[0]],
-                        reference_rotations[matches[0]],
-                    )
-                )
-        if len(valid) < min_correspondences:
-            return _fallback(
-                f"only {len(valid)} frame(s) have both model and odom camera poses"
-            )
-        source = np.asarray([item[0] for item in valid], dtype=np.float64)
-        source_rotations = np.asarray([item[1] for item in valid], dtype=np.float64)
-        target = np.asarray([item[2] for item in valid], dtype=np.float64)
-        target_rotations = np.asarray([item[3] for item in valid], dtype=np.float64)
-        if not np.all(np.isfinite(source)) or not np.all(np.isfinite(target)):
-            return _fallback("model or odom trajectory contains non-finite values")
-        (
-            scale,
-            rotation,
-            translation,
-            residual,
-            reference_baseline,
-            orientation_residual,
-        ) = _pose_constrained_sim3(
-            source,
-            source_rotations,
-            target,
-            target_rotations,
-            min_reference_baseline_m=min_reference_baseline_m,
-        )
-        normalized_residual = residual / reference_baseline
-        if orientation_residual > float(max_orientation_residual_deg):
-            return _fallback(
-                f"camera orientation residual {orientation_residual:.3f} deg exceeds "
-                f"{float(max_orientation_residual_deg):.3f} deg"
-            )
-        if normalized_residual > float(max_normalized_residual_rms):
-            return _fallback(
-                f"normalized trajectory residual {normalized_residual:.6g} exceeds "
-                f"{float(max_normalized_residual_rms):.6g}"
-            )
-        reference_positions_all = reference_positions
-        return OdomLocalAlignment(
-            coordinate_state=COORDINATE_ODOM_LOCAL_APPROX,
-            reference_frame_id=reference_frame_id,
-            correspondence_count=len(valid),
-            scale=scale,
-            rotation=rotation.tolist(),
-            translation=translation.tolist(),
-            residual_rms=residual,
-            reason="",
-            reference_first_position=tuple(
-                float(item) for item in reference_positions_all[0]
-            ),
-            reference_last_position=tuple(
-                float(item) for item in reference_positions_all[-1]
-            ),
-            reference_first_stamp=(
-                tuple(odom_stamps[0]) if odom_stamps else None
-            ),
-            reference_last_stamp=(
-                tuple(odom_stamps[-1]) if odom_stamps else None
-            ),
-            reference_baseline_m=reference_baseline,
-            reference_samples=tuple(
-                {"stamp": list(stamp), "position": position.tolist()}
-                for stamp, position in zip(odom_stamps, reference_positions_all)
-            ),
-            orientation_residual_deg=orientation_residual,
-            normalized_residual_rms=normalized_residual,
-        )
-    except Exception as error:
-        return _fallback(
-            f"alignment failed: {type(error).__name__}: {error}"
-        )
 
 
 def valid_sim3_alignment(alignment: Any) -> bool:

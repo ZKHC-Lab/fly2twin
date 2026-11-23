@@ -128,9 +128,7 @@ def main(argv=None) -> int:
             continuous = yaml.safe_load(Path(args.continuous_profile).read_text())
             if not isinstance(continuous, dict):
                 raise RuntimeError("continuous profile must be a mapping")
-            method = continuous.get("alignment_backend", "global_g4" if profile.get("backend", "omega") == "omega" else "odom_pose_constrained_sim3")
-            if method == "global_g4":
-                _check_g4_dependencies()
+            _check_g4_dependencies()
         module_path = _cuda_preflight_module_path()
         _run_worker_preflight(profile, module_path)
     except BaseException as error:
@@ -148,9 +146,7 @@ def _check_g4_dependencies() -> None:
         match = re.match(r"^(\d+)\.(\d+)", module.__version__)
         if match is None or tuple(map(int, match.groups())) < minimum:
             raise RuntimeError(f"G4 requires {module.__name__}>={minimum[0]}.{minimum[1]} in ROS Python; found {module.__version__}")
-    from g4_backend import solve_g4
-    if not callable(solve_g4):
-        raise RuntimeError("G4 core is unavailable in ROS Python")
+    import g4_backend  # noqa: F401  the map backend core must import in ROS Python
 
 
 if __name__ == "__main__":

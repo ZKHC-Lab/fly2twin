@@ -1,6 +1,6 @@
 # 长窗分组（100/120 与尾窗规则）
 
-> 本文说明可选的 100/120 长窗分组（`window_frame_semantics: new_frames`，配合 G4 图配准）及其 2026-10-08 的移植核验，不是当前机载主线。主线是 40 帧窗、5 帧共享和逐帧位姿放置，见[机载融合与交付包](../src/drone3d_reconstruction_core/docs/ONBOARD_V1.md)。
+> 历史文档。本文说明的 100/120 长窗分组（`window_frame_semantics: new_frames`、登记的窗口清单，配合 G4 图配准）及其 2026-10-08 的移植核验，2026-11-23 已随图配准一起删除，代码可从提交 `f0c0aa3` 恢复；下文“正式 ROS 代码里”“实现位置”指删除前的代码，正文未改。现行做法是 40 帧窗、5 帧共享和逐帧位姿放置，见[机载融合与交付包](../src/drone3d_reconstruction_core/docs/ONBOARD_V1.md)。
 
 本文描述正式 ROS 代码里的**长窗分组**：新增帧数语义、登记式计划、
 逐边阈值来源、非 fit 观测排除池，以及方法身份。本文自含结论与数值，不依赖读者打开任何
@@ -32,8 +32,7 @@
 | 采集目标 | `window_frames − overlap` | `window_frames` |
 | 上限约束 | `window_frames ≤ frame_group_size` | `window_frames + overlap_frames ≤ frame_group_size` |
 
-`new_frames` 只在 `alignment_backend: global_g4` 上生效；用在别的后端会**报错拒绝**，
-不会被静默忽略。上限不足同样被拒绝（`frame_group_size` 不够时不用均匀抽帧凑），
+上限不足会被**报错拒绝**（`frame_group_size` 不够时不用均匀抽帧凑），
 共享帧不足时中止该窗并保留现场，不缩小共享前缀。
 
 ```yaml
@@ -200,10 +199,10 @@ threshold_table_path: ""            # 历史阈值表；留空 = 逐边重算
 
 | 文件 | 职责 |
 |---|---|
-| [window_plan.py](../src/drone3d_reconstruction_core/src/g4_backend/window_plan.py) | 分组计划、推导规则、登记清单加载与校验、计划对拍 |
+| `window_plan.py`（已删除） | 分组计划、推导规则、登记清单加载与校验、计划对拍 |
 | [types.py](../src/drone3d_reconstruction_core/src/g4_backend/types.py) | `WINDOWED_METHOD_ID`、`ThresholdPolicy`、`SharedPairs.threshold_source` |
-| [registration.py](../src/drone3d_reconstruction_core/src/g4_backend/registration.py) | 阈值来源记录、排除池计数与来源标记 |
-| [graph.py](../src/drone3d_reconstruction_core/src/g4_backend/graph.py) | 求解结果携带方法身份 |
+| `registration.py`（已删除） | 阈值来源记录、排除池计数与来源标记 |
+| `graph.py`（已删除） | 求解结果携带方法身份 |
 | [map_backend.py](../src/drone3d_reconstruction_core/src/drone3d_reconstruction_core/g4/map_backend.py) | 显式配置注入、排除池装配、登记计划逐窗核对、修订记录 |
 | [backend_process.py](../src/drone3d_reconstruction_core/src/drone3d_reconstruction_core/g4/backend_process.py) | 后台进程按会话给出的 profile 构造后端 |
 | [continuous_session.py](../src/drone3d_reconstruction_core/src/drone3d_reconstruction_core/continuous_session.py) | `new_frames` 语义、尾窗规则、计划驱动与诊断 |

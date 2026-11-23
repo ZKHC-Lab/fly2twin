@@ -30,7 +30,7 @@
 
 融合按帧拆成 `frame_points`（单帧多视一致性检查后的点）、`frame_image` / `frame_colors`（颜色）和 `cloud_from_frames`（2 cm 体素与自适应放大）；`colored_cloud` 依次调用它们。机载在线点云用这些函数做按帧增量（`drone3d_onboard.session.SessionFusion`）。
 
-已验证（2026-10-29，E1 无人机 V1.0 输入：670 帧、23 个窗口、512×288）：
+已验证（2026-10-29，无人机 V1.0 参考输入：670 帧、23 个窗口、512×288）：
 
 | 项目 | 结果 |
 | --- | --- |
@@ -59,10 +59,11 @@
 | office_gs_04，落地 BA 位姿、离线分窗、512×288 | 2935 / 116 | 2.92 / 6.74 → 2.74 / 4.64 cm | 87.7% → 93.9% | 48.8 / 62.0% → 47.1 / 61.4% | 347 s |
 
 - 五次采集的 P90 都下降 15–34%，5 cm 内的比例提高 6–9 个百分点；完整度变化在 ±0.5 个百分点以内（01 提高约 2 个百分点）。落地 BA 那一行的 5 cm 完整度降 1.6 个百分点：重复的表面层合并后，表面变薄。
-- office_gs_04 的两行“原”值与该场景已公开的数字一致（机载 3.3 / 11.2 cm，落地 BA 后 2.9 / 6.8 cm）。叠加在 BA 位姿之上仍然有效：BA 修位姿，这一步修每帧的尺度。
+- office_gs_04 的两行“原”值就是该场景最初公开的数字（机载 3.3 / 11.2 cm，落地 BA 后 2.9 / 6.8 cm）。叠加在 BA 位姿之上仍然有效：BA 修位姿，这一步修每帧的尺度。
 - 各帧修正量的绝对值中位数 0.6–1.4%，最大 5–12%。
 - 用时是台式机（6 线程，空闲）测的。office_gs_03 的 57 s 里，取成员点约 14 s，匹配和求解约 44 s（每个窗口每轮要对其他窗口的点建一次最近邻树）。NX 上未测。
 - 产品路径复核：office_gs_04 的机载记录用 `drone3d_onboard.export` 重新导出，`cloud.ply` 为 864,610 点、体素 4.59 cm，用 `recon lidar-distance` 评测为 P50 3.02 / P90 7.32 cm、5 cm 内 81.1%（原交付 880,636 点、4.86 cm、3.32 / 11.17 cm、71.5%）。同一台机器同样状态下，整个导出不开这一步 581 s，开启 863 s；不开时的 `cloud.ply` 与原交付逐字节相同。离线一侧，office_gs_04 落地 BA 的运行目录用 `recon.pipeline.fuse` 加 `fusion.revisit: true` 重做融合阶段，`initial.npz` 为 839,215 点、体素 4.09 cm，评测为 P50 2.73 / P90 4.65 cm、5 cm 内 91.4%（原结果 850,318 点、2.92 / 6.77 cm、84.1%）；融合阶段共 702 s，其中这一步 347 s。
+- 结果表的来源（2026-11-20）：同一份机载记录先用现行代码按逐帧尺度重解地图，再导出。不开这一步 `cloud.ply` 为 870,700 点、P50 3.06 / P90 8.31 cm、5 cm 内 79.4%，与 [机载文档](../ROS_Compatibility_layer/src/drone3d_reconstruction_core/docs/ONBOARD_V1.md) 里逐帧尺度的数字相同；开启为 867,172 点、体素 4.38 cm、P50 2.92 / P90 6.14 cm、5 cm 内 85.7%，这是开源说明结果表里机载一行的 2.9 / 6.1 cm。落地 BA 一行的 2.7 / 4.7 cm 是上一条里离线融合的 2.73 / 4.65 cm。这份记录的窗口是 10 帧共享，现行采集配置是 5 帧共享，没有用新配置重新采过。
 
 **边界**（已知，未解决）：
 
@@ -84,6 +85,6 @@ ROS 构建通过 `ROS_Compatibility_layer/src/drone3d_reconstruction_core/src/re
 
 ## 证据索引
 
-- E1 对比脚本与结果：Data/experiments/restructure_20261029/m1_e1_equivalence.py、m1_e1_equivalence.json；2026-11-03 体素提速复验 Data/experiments/onboard_20261103/e1_fuse_equivalence.py 与 jobs/e1-fuse-eq/out.log
-- E1 参照输出：open_release_repo/outputs/equivalence/e1/（原离线包仓库的验收输出）
+- 无人机参考输入的对比脚本与结果：Data/experiments/restructure_20261029/m1_e1_equivalence.py、m1_e1_equivalence.json；2026-11-03 体素提速复验 Data/experiments/onboard_20261103/e1_fuse_equivalence.py 与 jobs/e1-fuse-eq/out.log
+- 无人机参考输出：open_release_repo/outputs/equivalence/e1/（原离线包仓库的验收输出）
 - 回访约束：Data/experiments/whitebox_20261112/ 的 REPORT.md（“不用学习，按窗口对齐”起的各节）、window_align_delivery.py（模式 core）、jobs/core-check/out.log、runs/wa_real/core_*.json、export_check/（产品路径导出与评测）；各采集的雷达图在 Data/experiments/capture_gap_20261112/map_0{1,2,3}.npz、whitebox_20261112/runs/wa_real/map_ctrl_wall_01.npz、promo_20261029/lidar_eval/lidar_reference_clean.npz

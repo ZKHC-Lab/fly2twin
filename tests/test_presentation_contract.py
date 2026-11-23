@@ -157,20 +157,3 @@ def test_drone_reference_export_quantization(scene_inputs):
     rows=np.fromfile(out/'preview.splat',dtype=[('xyz','<f4',3),('scale','<f4',3),('rgba','u1',4),('quat','u1',4)])
     assert (rows['rgba'][:,3]==127).all()
     np.testing.assert_array_equal(rows['scale'],np.full((2,3),2.))
-
-
-def test_phone_reference_export_format(tmp_path):
-    import torch
-    from recon.video.render_roam import export_ply,export_splat
-    splats=dict(means=torch.tensor([[0.,0,0],[1.,0,0]]),scales=torch.tensor([[0.,0,0],[1.,1,1]]),
-                quats=torch.tensor([[2.,0,0,0],[0.,3,0,0]]),opacities=torch.zeros(2),
-                sh0=torch.zeros(2,1,3),shN=torch.arange(90,dtype=torch.float32).reshape(2,15,3))
-    export_ply(splats,tmp_path/'model.ply')
-    v=read_ply(tmp_path/'model.ply')
-    assert len(v.dtype.names)==62 and v['rot_0'][0]==2
-    assert v['f_rest_1'][0]==3
-    export_splat(splats,tmp_path/'model.splat',.02,0)
-    rows=np.fromfile(tmp_path/'model.splat',dtype=[('xyz','<f4',3),('scale','<f4',3),('rgba','u1',4),('quat','u1',4)])
-    assert rows['xyz'][0,0]==1
-    assert (rows['rgba']==127).all()
-    np.testing.assert_array_equal(rows['quat'][0],[128,255,128,128])

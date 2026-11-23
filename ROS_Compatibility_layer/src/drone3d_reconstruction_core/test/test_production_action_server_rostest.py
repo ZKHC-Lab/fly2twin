@@ -28,6 +28,9 @@ from drone3d_reconstruction_msgs.msg import (
     ReconstructSegmentResult,
 )
 
+# The shared v4 snapshot fixture lives next to this file; catkin's nose run does not add this directory.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from snapshot_v4 import write_v4_snapshot  # noqa: E402
 from drone3d_reconstruction_core import (
     ProductionConfig,
     ProductionPlanner,
@@ -53,43 +56,12 @@ def sha256_bytes(data):
 
 def make_snapshot(snapshots_root, scene_id="prod-e2e", frame_count=3):
     scene = snapshots_root / scene_id
-    images = scene / "images"
-    images.mkdir(parents=True)
-    image_relatives = []
-    for index in range(frame_count):
-        relative = f"images/frame_{index:03d}.png"
-        path = scene.joinpath(*Path(relative).parts)
-        path.write_bytes(f"image bytes {scene_id} {index}".encode("utf-8"))
-        image_relatives.append(relative)
-    snapshot_bytes = json.dumps(
-        {
-            "schema": "drone3d.reconstruction.snapshot",
-            "version": 1,
-            "status": "PASS",
-            "scene_id": scene_id,
-            "frame_count": frame_count,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    (scene / "snapshot.json").write_bytes(snapshot_bytes)
-    frame_lines = ["frame_index,image_path"]
-    for index, relative in enumerate(image_relatives):
-        frame_lines.append(f"{index},{relative}")
-    frames_bytes = ("\n".join(frame_lines) + "\n").encode("utf-8")
-    (scene / "frames.csv").write_bytes(frames_bytes)
-    manifest_rows = {"snapshot.json": snapshot_bytes, "frames.csv": frames_bytes}
-    for relative in image_relatives:
-        manifest_rows[relative] = (
-            scene.joinpath(*Path(relative).parts).read_bytes()
-        )
-    lines = ["path,size,sha256"]
-    for relative in sorted(manifest_rows):
-        data = manifest_rows[relative]
-        lines.append(f"{relative},{len(data)},{sha256_bytes(data)}")
-    manifest_bytes = ("\n".join(lines) + "\n").encode("utf-8")
-    (scene / "files_sha256.csv").write_bytes(manifest_bytes)
-    return str(scene), hashlib.sha256(manifest_bytes).hexdigest()
+    digest = write_v4_snapshot(
+        scene, scene_id, frame_count,
+        image_paths=[f"images/frame_{index:03d}.png" for index in range(frame_count)],
+        image_bytes=lambda index: f"image bytes {scene_id} {index}".encode("utf-8"),
+    )
+    return str(scene), digest
 
 
 def fake_omega_script(script_path):
@@ -267,7 +239,6 @@ class ProductionActionServerRostest(unittest.TestCase):
             conf_thres=50.0,
             max_points_k=5,
             profile_name="local_docker_test_candidate",
-            required_device_sku="docker_test_candidate",
             algorithm_revision="e2e-algorithm-revision",
             ros_revision="e2e-ros-revision",
         )

@@ -21,7 +21,6 @@ catkin_package(
 catkin_install_python(PROGRAMS
   scripts/reconstruct_production_node.py
   scripts/capture_production_node.py
-  scripts/camera_pipeline_service_node.py
   scripts/continuous_session_node.py
   scripts/continuous_production_preflight.py
   scripts/continuous_web_node.py
@@ -70,11 +69,8 @@ if(CATKIN_ENABLE_TESTING)
   catkin_add_nosetests(test/test_frame_pool.py)
   catkin_add_nosetests(test/test_job_controller.py)
   catkin_add_nosetests(test/test_odom_local.py)
-  catkin_add_nosetests(test/test_shared_point_sim3.py)
-  catkin_add_nosetests(test/test_shared_point_backend.py)
   catkin_add_nosetests(test/test_runtime_memory_guard.py)
-  catkin_add_nosetests(test/test_pipeline_service.py)
-  catkin_add_nosetests(test/test_pipeline_service_node.py)
+  catkin_add_nosetests(test/test_reconstruct_action_client.py)
   catkin_add_nosetests(test/test_production.py)
   catkin_add_nosetests(test/test_production_node.py)
   catkin_add_nosetests(test/test_reconstruct_action_server.py)

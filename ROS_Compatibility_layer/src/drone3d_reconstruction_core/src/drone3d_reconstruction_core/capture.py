@@ -52,6 +52,7 @@ from .result_transaction import (
     allocate_result_transaction,
 )
 from .snapshot_validator import (
+    FRAME_COLUMNS_V4,
     MAX_TF_ENTRIES,
     SNAPSHOT_SCHEMA,
     SNAPSHOT_VERSION,
@@ -66,24 +67,6 @@ _CAMERA_FRAME_ID = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_/.-]{0,126}\Z")
 _TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 # 支持的 ROS 图像编码（cv2 以 BGR 语义编码 PNG）
 _SUPPORTED_ENCODINGS = ("bgr8", "rgb8")
-# frames.csv 的列定义（与快照 v2/v3 schema 对应）
-_FRAME_COLUMNS = (
-    "frame_index",
-    "image_path",
-    "stamp_sec",
-    "stamp_nsec",
-    "pose_valid",
-    "pose_delta_ms",
-    "odometry_gap_ms",
-)
-# v4 frames.csv 在 v2/v3 列之后增加完整辅助数据文件与关联时间差
-_FRAME_COLUMNS_V4 = _FRAME_COLUMNS + (
-    "auxiliary_path",
-    "camera_info_delta_ms",
-    "odometry_delta_ms",
-    "depth_path",
-    "depth_delta_ms",
-)
 # 深度原始字节的元数据安全编码（ROS sensor_msgs/Image.encoding 值）
 _DEPTH_ENCODING = re.compile(r"[A-Za-z0-9_]{1,32}\Z")
 
@@ -94,7 +77,7 @@ class CaptureConfigError(ValueError):
 
 @dataclass(frozen=True)
 class CaptureConfig:
-    """显式采集配置；不含任何内嵌默认值。
+    """显式采集配置。只有末尾几个可选项带默认值，默认值只写在这里。
 
     所有路径/话题/阈值都在 __post_init__ 中 preflight 校验：
     snapshot_root 必须是规范化的真实目录（拒绝符号链接遍历），
@@ -1289,7 +1272,7 @@ class SnapshotWriter:
             frame_rows.append(row)
         _write_csv(
             self.staging_path / "frames.csv",
-            _FRAME_COLUMNS_V4,
+            FRAME_COLUMNS_V4,
             frame_rows,
             config.snapshot_limits.max_metadata_bytes,
         )
@@ -1370,8 +1353,8 @@ class CaptureSession:
 
     所有回调入口（on_image / on_odometry / on_camera_info / check_deadline）
     都持有内部锁，保证采集状态（帧数、错误、封存结果）跨线程一致。
-    封存只发生一次：要么帧数达标（_sealed_by_frames），要么超时
-    （_sealed_by_deadline），要么失败（error 非空）。
+    封存只发生一次：要么帧数达标，要么超时（_sealed_by_deadline），
+    要么失败（error 非空）。
     """
 
     def __init__(
@@ -1443,7 +1426,6 @@ class CaptureSession:
         self.superseded_images = 0
         self.paused = False
         self._pause_remaining_sec: float | None = None
-        self._sealed_by_frames = False
         self._sealed_by_deadline = False
         self._source_state_callback = source_state_callback
         self.source_stale = False
@@ -1607,7 +1589,6 @@ class CaptureSession:
             except BaseException:
                 pass
         if self.writer.frame_count >= self.goal.max_frames:
-            self._sealed_by_frames = True
             self._finish_success_locked()
 
     def _flush_pending_frames_locked(self):
@@ -1858,13 +1839,6 @@ class CaptureSession:
             return
         self.error = error
         self.done.set()
-
-    @property
-    def terminal_reason(self) -> str:
-        """本次采集的终态原因：max_frames / max_duration / error / cancelled。"""
-        if self.sealed is not None:
-            return "max_frames" if self._sealed_by_frames else "max_duration"
-        return "error" if self.error is not None else "cancelled"
 
     def snapshot(self) -> dict[str, Any]:
         """线程安全的采集诊断快照（供 /diagnostics 使用）。"""

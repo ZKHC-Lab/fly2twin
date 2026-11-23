@@ -619,6 +619,7 @@ class ReconstructActionServerTest(unittest.TestCase):
         self.wait_events(goal, 1)
         self.assertEqual(controller.start_warm_calls, 1)
         self.assertEqual(controller.start_calls, 1)
+        self.assertEqual(server.diagnostics_snapshot()["warm_fallback_count"], 1)
         self.assertEqual(controller.start_commands, [plan.command])
         controller.finish()
         self.wait_events(goal, 2)

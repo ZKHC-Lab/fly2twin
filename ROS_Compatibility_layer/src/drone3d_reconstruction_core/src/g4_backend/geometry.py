@@ -31,20 +31,6 @@ def from_prediction(window_id, frame_ids, timestamps_ns, depth, confidence, intr
                           intrinsics, rotations, centers, shared_prefix, rgb_hashes, gauge)
 
 
-def unproject_pixels(window, frame_index, pixels):
-    """Back-project integer model pixels; source frame identity is caller-owned."""
-    uv = np.asarray(pixels)
-    if uv.ndim != 2 or uv.shape[1] != 2 or not np.isfinite(uv).all() or not np.equal(uv, np.floor(uv)).all():
-        raise ValueError("shared-pixel unprojection expects integer Nx2 model pixels")
-    uv = uv.astype(int)
-    h, w = window.depth.shape[1:]
-    if not 0 <= frame_index < len(window.frame_ids) or np.any(uv < 0) or np.any(uv[:, 0] >= w) or np.any(uv[:, 1] >= h):
-        raise ValueError("pixel or frame index out of range")
-    depth = window.depth[frame_index, uv[:, 1], uv[:, 0]]
-    q = (np.c_[uv, np.ones(len(uv))]@np.linalg.inv(window.intrinsics[frame_index]).T)*depth[:, None]
-    return q@window.rotations[frame_index].T+window.centers[frame_index], depth
-
-
 def resize_intrinsics(intrinsics, source_size, target_size):
     """Pinhole resize with pixel-center convention; sizes are (width, height)."""
     sw, sh = source_size

@@ -53,3 +53,46 @@ def test_parallel_ransac_matches_one_thread(tmp_path, monkeypatch):
     assert 0 < len(outputs[0]['pair_indices']) < len(pairs)
     for key, value in outputs[0].items():
         assert np.array_equal(value, outputs[1][key]), key
+
+
+def test_xfeat_source_is_imported(tmp_path, monkeypatch):
+    checkout = tmp_path / 'accelerated_features'
+    (checkout / 'modules').mkdir(parents=True)
+    (checkout / 'modules' / '__init__.py').touch()
+    (checkout / 'modules' / 'xfeat.py').write_text(
+        'class XFeat:\n    def __init__(self, weights, top_k):\n        raise RuntimeError("loaded from checkout")\n')
+    monkeypatch.delitem(sys.modules, 'modules', raising=False)
+    monkeypatch.delitem(sys.modules, 'modules.xfeat', raising=False)
+    monkeypatch.setattr(sys, 'path', list(sys.path))
+    from recon.poses.xfeat import match
+    with pytest.raises(RuntimeError, match='loaded from checkout'):
+        match(dict(image_names=[]), tmp_path, np.empty((0, 2), int), tmp_path / 'x.npz',
+              dict(xfeat_weights='unused', xfeat_source=str(checkout)))
+
+
+def test_xfeat_source_conflicting_with_an_imported_checkout_fails(tmp_path, monkeypatch):
+    def checkout(name):
+        root = tmp_path / name
+        (root / 'modules').mkdir(parents=True)
+        (root / 'modules' / '__init__.py').touch()
+        (root / 'modules' / 'xfeat.py').write_text(
+            'class XFeat:\n    def __init__(self, weights, top_k):\n        raise RuntimeError("%s")\n' % name)
+        return root
+    first, second = checkout('first'), checkout('second')
+    monkeypatch.delitem(sys.modules, 'modules', raising=False)
+    monkeypatch.delitem(sys.modules, 'modules.xfeat', raising=False)
+    monkeypatch.setattr(sys, 'path', list(sys.path))
+    from recon.poses.xfeat import match
+    arguments = dict(image_names=[]), tmp_path, np.empty((0, 2), int), tmp_path / 'x.npz'
+    with pytest.raises(RuntimeError, match='first'):
+        match(*arguments, dict(xfeat_weights='unused', xfeat_source=str(first)))
+    # Same process, another checkout configured: the cached import must not be used silently.
+    with pytest.raises(ImportError, match='already imported from ' + str(first)):
+        match(*arguments, dict(xfeat_weights='unused', xfeat_source=str(second)))
+
+
+def test_xfeat_source_without_module_fails(tmp_path):
+    from recon.poses.xfeat import match
+    with pytest.raises(FileNotFoundError, match='pose.xfeat_source has no modules/xfeat.py: ' + str(tmp_path)):
+        match(dict(image_names=[]), tmp_path, np.empty((0, 2), int), tmp_path / 'x.npz',
+              dict(xfeat_weights='unused', xfeat_source=str(tmp_path)))

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""BEST numerical loop: float32 cameras, shuffled epochs, optional camera fitting."""
+"""Gaussian training loop: float32 cameras, shuffled epochs, optional camera fitting."""
 from dataclasses import asdict
 from functools import lru_cache
 import json
@@ -13,7 +13,7 @@ import gsplat
 from .strategy import BaselineStrategy
 from fused_ssim import fused_ssim
 from .render import initialize, render
-from .losses import anisotropy
+from .losses import anisotropy, inverse_depth_pearson
 from .schedule import schedule
 from recon.io.common import dump
 
@@ -112,10 +112,7 @@ def train(data, out, folder, image, settings):
             mask = torch.from_numpy(mask).cuda()
             prior_d = torch.from_numpy(d).cuda()
             rendered = prediction[0, ..., 3] * data['meters_per_unit']
-            x, y = rendered[mask].clamp_min(1e-6).reciprocal(), prior_d[mask].reciprocal()
-            x, y = x - x.mean(), y - y.mean()
-            corr = (x*y).sum() / (x.square().sum()*y.square().sum()).sqrt().clamp_min(1e-12)
-            depth_loss = 1 - corr
+            depth_loss = inverse_depth_pearson(rendered, prior_d, mask)
         aniso_loss = anisotropy(splats["scales"])
         loss = rgb_loss + depth_lambda * depth_loss + settings.get("aniso_lambda", .1) * aniso_loss
         if camera is not None:

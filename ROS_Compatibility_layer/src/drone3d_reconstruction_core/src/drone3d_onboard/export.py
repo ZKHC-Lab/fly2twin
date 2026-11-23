@@ -1,6 +1,7 @@
 """Export a retained frame_pose session without ROS or a running master."""
 import argparse
 import json
+import os
 from pathlib import Path
 import numpy as np
 from .common import dump, digest
@@ -90,7 +91,11 @@ def export_session(records_root, session_id, destination, capture_profile, max_p
         pose_time_offset_stage='capture', backend_additional_offset_ms=0,
         pose_offset_policy='Deduplicated dense LIO interpolation at RGB + pose_time_offset_ms; frames without a bracketing pose are not exported',
         hashes={str(p.relative_to(destination)):digest(p) for p in files})
-    dump(destination/'manifest.json', manifest)
+    # Published last and in one step: a package with manifest.json is whole, one without it is not.
+    # Deleting the source session after export relies on this (ONBOARD_V1.md, section 3).
+    temporary = destination/'manifest.json.tmp'
+    dump(temporary, manifest)
+    os.replace(temporary, destination/'manifest.json')
     return manifest
 
 

@@ -1,4 +1,4 @@
-# M4：激光雷达参照地图与点云误差评测
+# 激光雷达参照地图与点云误差评测
 
 2026-10-30 · 面向离线重建维护者
 
@@ -33,7 +33,7 @@ recon lidar-reference --bag recording.bag --out reference.npz \
 
 ## 参照生成参数与顺序
 
-算法移植自 T25 原语及 T31 prepare/global_reference，默认参数保持原值：
+算法移植自早期研究脚本（雷达参照生成，以及流式点云评测的 prepare/global_reference，来源见文末），默认参数保持原值：
 
 1. 扫描占据统计：全部扫描的有限点、传感器距离 ≥0.5 m，每扫描每 10 cm 传感器体素计一次，无距离上限。出现扫描数 ≥ceil(0.2×全部扫描数) 的体素视为传感器固定体素。
 2. 里程计按 header 时间稳定排序；同时间戳不同 position/quaternion 报错。距上个保留位姿 <150 ms 且完整 position/quaternion 完全相同则移除。纯旋转不会因位置未变而被删。
@@ -42,7 +42,7 @@ recon lidar-reference --bag recording.bag --out reference.npz \
 5. 世界 5 cm 体素按 `floor(world/.05)` 编码。每扫描每体素保留最早合格真实点，不取质心；键在 float64 坐标上计算，代表点随后存 float32。float32 舍入可能跨体素边界，不据存储点重新计算键。
 6. 同世界体素必须存在一对扫描，**同时**满足中点时间差 ≥10 s、世界雷达原点间距 ≥1 m。不是独立时间/空间极值判据。稳定排序后保留最早合格扫描的代表点，输出按体素键升序；见证扫描对也保留原搜索次序。
 
-资源限制由调用者设置，导入模块不改线程或 CUDA 环境。16221 扫描的内部 ID 使用 uint16 降低内存，更多扫描使用 int32；输出见证仍为 int32，不改变数值或顺序。重访搜索通过稳定排序索引访问原数组，避免物化排序后的键和扫描 ID 副本，搜索次序与原实现相同。与旧脚本相比，省去准备 NPZ 往返、绘图、移除点缓存及硬编码磁盘守卫；保留 T31 对已去重轨迹的第二次构造。传感器刚性变换保留先加 offset 再旋转的浮点运算次序。
+资源限制由调用者设置，导入模块不改线程或 CUDA 环境。16221 扫描的内部 ID 使用 uint16 降低内存，更多扫描使用 int32；输出见证仍为 int32，不改变数值或顺序。重访搜索通过稳定排序索引访问原数组，避免物化排序后的键和扫描 ID 副本，搜索次序与原实现相同。与旧脚本相比，省去准备 NPZ 往返、绘图、移除点缓存及硬编码磁盘守卫；保留原评测对已去重轨迹的第二次构造。传感器刚性变换保留先加 offset 再旋转的浮点运算次序。
 
 ## 已验证数字与验收判据
 
@@ -69,7 +69,7 @@ office04 的 <5/10/20 cm 比例分别为 0.840714885489899 / 0.9528811574022895 
 
 ### CPU 测试
 
-在装好 recon 依赖（含 gsplat）的环境里运行 `CUDA_VISIBLE_DEVICES='' python -m pytest -q -p no:cacheprovider tests recon_core/tests`，实测 98 passed（4.16 s）。[M4 合成测试](../../tests/test_lidar_eval.py) 覆盖分位数与严格阈值、世界 z 边界及空层、无效点输入、CustomMsg 字节解析、位姿去重/冲突/禁止外推、联合重访与索引等价、合成 Reader 的完整生成与自定义话题/外参、PLY CLI 和缺少可选依赖报错；不依赖真实 bag。
+在装好 recon 依赖（含 gsplat）的环境里运行 `CUDA_VISIBLE_DEVICES='' python -m pytest -q -p no:cacheprovider tests recon_core/tests`，实测 98 passed（4.16 s）。[合成测试](../../tests/test_lidar_eval.py) 覆盖分位数与严格阈值、世界 z 边界及空层、无效点输入、CustomMsg 字节解析、位姿去重/冲突/禁止外推、联合重访与索引等价、合成 Reader 的完整生成与自定义话题/外参、PLY CLI 和缺少可选依赖报错；不依赖真实 bag。
 
 ## 适用范围
 

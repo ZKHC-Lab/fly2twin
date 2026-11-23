@@ -1,22 +1,20 @@
 """ROS 无关的连续 session 调度器与磁盘 FIFO 核心。
 
-需求基线见
-`docs/reports/single-nx-continuous-gap-audit/single-nx-continuous-gap-audit.md`。
-本模块只实现其中的连续调度与磁盘 FIFO 子集：
+本模块实现连续调度与磁盘 FIFO：
 
   - 复用现有 Capture/Reconstruct Action（由注入的客户端/后端适配）；
   - 连续窗口：首窗 N 帧，后续复用上一窗尾部 overlap_frames 帧；
   - 采集循环与单 worker 消费循环解耦；
   - 磁盘 FIFO：内存只存小状态，快照文件全部留在磁盘；
-  - `lossless_fifo` / `realtime_latest` 两种队列模式；
-  - max_retries、pause/resume、stop_all、磁盘红线、重启清理。
+  - `lossless_fifo` 无损队列：满时暂停新采集，不丢窗口；
+  - max_retries、pause/resume、stop_all、磁盘红线。
 
 本模块不导入 rospy/actionlib；ROS 适配在 continuous_session_node.py。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 import hashlib
 import json
 import math
@@ -28,20 +26,12 @@ import stat
 import threading
 import time
 from types import SimpleNamespace
-from typing import Any, Callable, Mapping
+from typing import Any, Callable
 from urllib.parse import unquote, unquote_to_bytes, urlsplit
 
 from .capture import CaptureConfig, CaptureError, validate_capture_goal
 from .depth_metrics import compute_first_frame_depth_metrics
-from .frame_pool import (
-    RECONSTRUCTION_MODE_FRAME_POOL,
-    RECONSTRUCTION_MODE_PER_WINDOW,
-    RECONSTRUCTION_MODES,
-    FramePool,
-    FramePoolCapacityError,
-    FramePoolConfig,
-    FramePoolError,
-)
+from .frame_pool import FramePool, FramePoolConfig, FramePoolError
 from .formal_result import (
     FORMAL_RECORD_SCHEMA,
     FORMAL_RECORD_SCHEMA_VERSION,
@@ -52,15 +42,11 @@ from .formal_result import (
 from .odom_local import (
     COORDINATE_MODEL_LOCAL_UNALIGNED,
     COORDINATE_ODOM_LOCAL_APPROX,
-    align_window,
 )
 from .snapshot_validator import validate_snapshot
-from .storage_retention import prune_frame_pool_revisions
-from .odom_local import valid_sim3_alignment
-from .shared_point_backend import BACKEND_A, BACKEND_ODOM, align as align_shared_points
 from .g4.backend_process import BACKEND_G4, G4BackendProcess
 
-from .pipeline_service import (
+from .action_types import (
     ACTION_SUCCEEDED,
     CameraRole,
     CaptureActionOutcome,
@@ -74,7 +60,6 @@ SESSION_PAUSED = "PAUSED"
 SESSION_DISK_PAUSED = "DISK_PAUSED"
 SESSION_FATAL_OOM = "FATAL_OOM"
 SESSION_MEMORY_PAUSED = "MEMORY_PAUSED"
-SESSION_ALIGNMENT_PAUSED = "ALIGNMENT_PAUSED"
 SESSION_STOPPING = "STOPPING"
 SESSION_STOPPED = "STOPPED"
 # STOP with queued windows: capture has stopped, the queue is still being reconstructed.
@@ -104,18 +89,17 @@ WINDOW_RUNNING = "RUNNING"
 WINDOW_SUCCEEDED = "SUCCEEDED"
 WINDOW_FAILED = "FAILED"
 WINDOW_CANCELLED = "CANCELLED"
-WINDOW_BUFFERED = "BUFFERED"
 
 QUEUE_LOSSLESS = "lossless_fifo"
-QUEUE_REALTIME_LATEST = "realtime_latest"
-_QUEUE_MODES = (QUEUE_LOSSLESS, QUEUE_REALTIME_LATEST)
 _DISK_REDLINE_ERROR = "disk redline reached; new capture paused"
 
-# window_frames 的两种语义。total_frames 是既有增量语义；
-# new_frames 是移植的长窗分组语义（模型输入 = 新增帧 + 共享帧）。
-WINDOW_SEMANTICS_TOTAL = "total_frames"
-WINDOW_SEMANTICS_NEW = "new_frames"
-_WINDOW_SEMANTICS = (WINDOW_SEMANTICS_TOTAL, WINDOW_SEMANTICS_NEW)
+RECONSTRUCTION_MODE_PER_WINDOW = "per_window"
+RECONSTRUCTION_MODES = (RECONSTRUCTION_MODE_PER_WINDOW,)
+
+# 一个窗口送去重建的帧里，没有关联上位姿（pose_valid 为假）的帧所占比例的上限；
+# 严格大于时该窗口判失败、不提交重建。维护者 2026-11-23 决定：办公室那次飞行
+# （118 窗、每窗 40 帧）里最差的两个窗口恰好缺 8 帧即 20%，没有窗口超过。
+MAX_MISSING_POSE_FRACTION = 0.2
 
 JOB_PENDING = "PENDING"
 JOB_RUNNING = "RUNNING"
@@ -167,22 +151,8 @@ class ContinuousConfig:
     initial_max_retries: int
     initial_keep_snapshot_on_success: bool
     initial_overlap_frames: int = 0
-    # 窗口帧数语义：total_frames 表示 window_frames 已含共享帧；
-    # new_frames 表示 window_frames 只是新增帧，模型输入为 新增＋共享。
-    # 新增分组只用中性命名，方法身份由后端 profile 显式给出。
-    window_frame_semantics: str = WINDOW_SEMANTICS_TOTAL
-    # 长窗分组的计算参数（仅 new_frames 语义使用）。
-    minimum_total_frames: int = 100
-    # 登记式窗口分组清单；给出时逐窗核对帧清单，缺失时按分组规则推导。
-    window_plan_path: str = ""
-    # 保留的非 fit 观测表（帧号→模型像素）与逐边历史阈值表。
-    fit_exclusion_source: str = ""
-    threshold_table_path: str = ""
-    # 历史阈值表含多个分组（例如 G0/G1）时必须显式选择，不能让最后一条静默生效。
-    threshold_group: str = ""
-    # 全局配准的放置方式：graph = 原 G4 图优化（每窗一个 Sim(3)）；
-    # frame_pose = 每帧用外部定位位姿，VGGT 只提供深度与每窗尺度。
-    g4_placement: str = "graph"
+    # 窗口放置方式：只有 frame_pose（每帧用外部定位位姿，VGGT 只提供深度与尺度）。
+    g4_placement: str = "frame_pose"
     # frame_pose 下位姿取在 RGB 时间 + 偏移（毫秒）。
     pose_time_offset_ms: float = 0.0
     pose_time_offset_stage: str = "backend"
@@ -193,23 +163,12 @@ class ContinuousConfig:
     g4_frame_scales: bool = False
     # 源图像分辨率下的标定内参 {width, height, fx, fy, cx, cy}；为空时用快照 CameraInfo。
     camera_intrinsics: dict | None = None
-    retention_max_sessions: int = 3
-    retention_frame_pool_revisions: int = 2
-    retention_orphan_grace_sec: float = 86400.0
     # 0 = inherit reconstruct profile (do not override the worker command)
     initial_inference_resolution: int = 0
     # 0.0 = inherit reconstruct profile worker timeout
     initial_worker_timeout_sec: float = 0.0
-    # 重建模式：per_window（现有增量，默认）或 frame_pool（采样区全局重建）。
-    # 只在 start_session 时冻结，运行中不可热调。
+    # 重建模式：只有 per_window（逐窗增量）。只在 start_session 时冻结。
     initial_reconstruction_mode: str = RECONSTRUCTION_MODE_PER_WINDOW
-    # 增量模式使用 ODOM_LOCAL_APPROX；帧数池模式始终跳过对齐。
-    odom_local_enabled: bool = True
-    odom_min_correspondences: int = 4
-    odom_min_baseline_m: float = 0.1
-    odom_max_orientation_residual_deg: float = 15.0
-    odom_max_normalized_residual_rms: float = 0.25
-    odom_reset_jump_m: float = 5.0
     # 正式结果真实性门禁期望值。production 节点必须从 reconstruct profile
     # 注入（expected_reconstruction），core 允许为空以支撑注入假门禁的
     # 非正式单元测试；真实门禁在期望缺失时必然拒绝成功终态。
@@ -220,7 +179,7 @@ class ContinuousConfig:
     expected_ros_revision: str = ""
     worker_python: str = ""
     cuda_visible_devices: str = ""
-    alignment_backend: str = BACKEND_ODOM
+    alignment_backend: str = BACKEND_G4
     reconstruction_backend: str = "omega"
 
     def __post_init__(self) -> None:
@@ -237,43 +196,21 @@ class ContinuousConfig:
         from .backend_spec import validate_independent_request
         validate_independent_request(self.reconstruction_backend, self.initial_window_frames,
                                      self.initial_inference_resolution)
-        if self.alignment_backend not in (BACKEND_ODOM, BACKEND_A, BACKEND_G4):
-            raise ContinuousConfigError("unknown alignment_backend")
-        if self.alignment_backend == BACKEND_G4:
-            if self.reconstruction_backend != "omega":
-                raise ContinuousConfigError("G4 requires the Omega reconstruction backend")
-            if (self.initial_overlap_frames < 5 or self.initial_window_frames <= self.initial_overlap_frames
-                    or self.initial_inference_resolution <= 0 or self.initial_inference_resolution % 16
-                    or self.initial_queue_mode != QUEUE_LOSSLESS
-                    or not self.initial_keep_snapshot_on_success):
-                raise ContinuousConfigError("G4 requires >=5 shared frames, a larger total window, a 16-multiple resolution "
-                                            "(384/448/512), lossless_fifo and retained snapshots")
-            for role in self.roles:
-                if role.capture_config.odometry_association != "interpolate":
-                    raise ContinuousConfigError("G4 requires RGB-time interpolated localization")
-        if self.alignment_backend == BACKEND_A:
-            profile_name = "A"
-            if (
-                self.initial_window_frames != 100 or self.initial_overlap_frames != 20
-                or self.reconstruct_frame_group_size != 120
-                or self.initial_inference_resolution != 384
-                or self.initial_sample_fps != 5.0
+        if self.alignment_backend != BACKEND_G4:
+            raise ContinuousConfigError(
+                f"alignment_backend must be {BACKEND_G4!r}, got {self.alignment_backend!r}"
+            )
+        if self.reconstruction_backend != "omega":
+            raise ContinuousConfigError("G4 requires the Omega reconstruction backend")
+        if (self.initial_overlap_frames < 5 or self.initial_window_frames <= self.initial_overlap_frames
+                or self.initial_inference_resolution <= 0 or self.initial_inference_resolution % 16
                 or self.initial_queue_mode != QUEUE_LOSSLESS
-                or self.initial_max_retries != 0
-            ):
-                raise ContinuousConfigError(
-                    f"{profile_name} fixes 5 Hz, 100 new frames, 20 shared frames, model limit 120, "
-                    "resolution 384, lossless_fifo and zero automatic retries"
-                )
-            for role in self.roles:
-                capture = role.capture_config
-                if (
-                    capture.odometry_association != "interpolate"
-                    or capture.pose_interpolation_wait_ms != 500.0
-                    or capture.pose_gap_max_ms != 500.0
-                    or capture.snapshot_limits.max_frame_count < 120
-                ):
-                    raise ContinuousConfigError(f"{profile_name} requires 500 ms interpolation and 120-frame snapshots")
+                or not self.initial_keep_snapshot_on_success):
+            raise ContinuousConfigError("G4 requires >=5 shared frames, a larger total window, a 16-multiple resolution "
+                                        "(384/448/512), lossless_fifo and retained snapshots")
+        for role in self.roles:
+            if role.capture_config.odometry_association != "interpolate":
+                raise ContinuousConfigError("G4 requires RGB-time interpolated localization")
         if not isinstance(self.roles, tuple) or not self.roles:
             raise ContinuousConfigError("roles must be a nonempty tuple")
         seen = set()
@@ -342,48 +279,14 @@ class ContinuousConfig:
         _validate_overlap_frames(
             self.initial_overlap_frames, self.initial_window_frames
         )
-        if self.window_frame_semantics not in _WINDOW_SEMANTICS:
-            raise ContinuousConfigError(
-                f"window_frame_semantics must be one of {_WINDOW_SEMANTICS!r}"
-            )
-        if (
-            isinstance(self.minimum_total_frames, bool)
-            or not isinstance(self.minimum_total_frames, int)
-            or self.minimum_total_frames <= 0
-        ):
-            raise ContinuousConfigError("minimum_total_frames must be a positive integer")
-        if self.window_frame_semantics == WINDOW_SEMANTICS_NEW:
-            if self.alignment_backend != BACKEND_G4:
-                # 静默忽略一种显式给出的语义比拒绝更糟。
-                raise ContinuousConfigError(
-                    "new_frames semantics is defined for the global placement backend only"
-                )
-            if self.minimum_total_frames <= self.initial_overlap_frames:
-                # 该下限只在 new_frames 语义下参与尾窗规则；total_frames 会话
-                # 不受它约束，不能因为一个无效字段拒绝原本合法的配置。
-                raise ContinuousConfigError(
-                    "minimum_total_frames must exceed initial_overlap_frames under new_frames semantics"
-                )
-            # The model receives 新增＋共享 帧，因此上限必须容纳两者之和。
-            if self.initial_window_frames + self.initial_overlap_frames > self.reconstruct_frame_group_size:
-                raise ContinuousConfigError(
-                    "new_frames semantics needs frame_group_size >= window_frames + overlap_frames; "
-                    "no silent subsampling"
-                )
-            if self.initial_inference_resolution != 384:
-                raise ContinuousConfigError("new_frames semantics is defined for the 384-wide model input")
-        for name in ("window_plan_path", "fit_exclusion_source", "threshold_table_path", "threshold_group"):
-            value = getattr(self, name)
-            if not isinstance(value, str):
-                raise ContinuousConfigError(f"{name} must be a string path or empty")
         if type(self.frame_pose_fusion) is not bool:
             raise ContinuousConfigError("frame_pose_fusion must be a bool")
         if self.pose_time_offset_stage not in ("capture", "backend"):
             raise ContinuousConfigError("pose_time_offset_stage must be capture or backend")
-        if self.g4_placement not in ("graph", "frame_pose"):
-            raise ContinuousConfigError("g4_placement must be graph or frame_pose")
-        if self.g4_placement == "frame_pose" and self.alignment_backend != BACKEND_G4:
-            raise ContinuousConfigError("g4_placement=frame_pose needs alignment_backend global_g4")
+        if self.g4_placement != "frame_pose":
+            raise ContinuousConfigError(
+                f"g4_placement must be 'frame_pose', got {self.g4_placement!r} (graph placement was removed)"
+            )
         if (
             isinstance(self.pose_time_offset_ms, bool)
             or not isinstance(self.pose_time_offset_ms, (int, float))
@@ -398,21 +301,17 @@ class ContinuousConfig:
             or self.g4_cross_window_weight < 0
         ):
             raise ContinuousConfigError("g4_cross_window_weight must be finite and nonnegative")
-        if self.g4_cross_window_weight > 0 and (
-            self.g4_placement != "frame_pose" or self.pose_time_offset_stage != "capture"
-        ):
+        if self.g4_cross_window_weight > 0 and self.pose_time_offset_stage != "capture":
             raise ContinuousConfigError(
-                "g4_cross_window_weight needs g4_placement=frame_pose and pose_time_offset_stage=capture"
+                "g4_cross_window_weight needs pose_time_offset_stage=capture"
             )
         if type(self.g4_frame_scales) is not bool:
             raise ContinuousConfigError("g4_frame_scales must be a bool")
         if self.g4_frame_scales and (
-            self.g4_placement != "frame_pose" or self.pose_time_offset_stage != "capture"
-            or self.g4_cross_window_weight > 0
+            self.pose_time_offset_stage != "capture" or self.g4_cross_window_weight > 0
         ):
             raise ContinuousConfigError(
-                "g4_frame_scales needs g4_placement=frame_pose, pose_time_offset_stage=capture "
-                "and g4_cross_window_weight=0"
+                "g4_frame_scales needs pose_time_offset_stage=capture and g4_cross_window_weight=0"
             )
         if self.camera_intrinsics is not None:
             keys = {"width", "height", "fx", "fy", "cx", "cy"}
@@ -424,10 +323,6 @@ class ContinuousConfig:
                 raise ContinuousConfigError(
                     "camera_intrinsics needs finite width, height, fx, fy, cx, cy with positive size and focal length"
                 )
-        if self.initial_queue_mode not in _QUEUE_MODES:
-            raise ContinuousConfigError(
-                f"initial_queue_mode must be one of {_QUEUE_MODES!r}"
-            )
         if (
             isinstance(self.initial_queue_capacity, bool)
             or not isinstance(self.initial_queue_capacity, int)
@@ -443,19 +338,6 @@ class ContinuousConfig:
         if type(self.initial_keep_snapshot_on_success) is not bool:
             raise ContinuousConfigError(
                 "initial_keep_snapshot_on_success must be a bool"
-            )
-        for name in ("retention_max_sessions", "retention_frame_pool_revisions"):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ContinuousConfigError(f"{name} must be a positive integer")
-        if (
-            isinstance(self.retention_orphan_grace_sec, bool)
-            or not isinstance(self.retention_orphan_grace_sec, (int, float))
-            or not math.isfinite(float(self.retention_orphan_grace_sec))
-            or self.retention_orphan_grace_sec < 0
-        ):
-            raise ContinuousConfigError(
-                "retention_orphan_grace_sec must be a nonnegative finite number"
             )
         _validate_inference_resolution(
             self.initial_inference_resolution, "initial_inference_resolution"
@@ -484,42 +366,6 @@ class ContinuousConfig:
                 ),
                 role,
                 self.capture_wait_margin_sec,
-            )
-        if type(self.odom_local_enabled) is not bool:
-            raise ContinuousConfigError("odom_local_enabled must be a bool")
-        if (
-            isinstance(self.odom_min_correspondences, bool)
-            or not isinstance(self.odom_min_correspondences, int)
-            or self.odom_min_correspondences < 4
-        ):
-            raise ContinuousConfigError(
-                "odom_min_correspondences must be an integer >= 4"
-            )
-        for name in (
-            "odom_min_baseline_m",
-            "odom_max_orientation_residual_deg",
-            "odom_max_normalized_residual_rms",
-        ):
-            value = getattr(self, name)
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
-                or value <= 0
-            ):
-                raise ContinuousConfigError(f"{name} must be positive and finite")
-        if self.odom_max_orientation_residual_deg > 180:
-            raise ContinuousConfigError(
-                "odom_max_orientation_residual_deg must be <= 180"
-            )
-        if (
-            isinstance(self.odom_reset_jump_m, bool)
-            or not isinstance(self.odom_reset_jump_m, (int, float))
-            or not math.isfinite(float(self.odom_reset_jump_m))
-            or self.odom_reset_jump_m < 0
-        ):
-            raise ContinuousConfigError(
-                "odom_reset_jump_m must be a nonnegative finite number"
             )
         for name in ("expected_checkpoint_sha256",):
             value = getattr(self, name)
@@ -571,8 +417,6 @@ def _validate_worker_timeout(value: Any, label: str) -> None:
         raise ContinuousConfigError(f"{label} must be a finite number")
     converted = float(value)
     if not _finite(converted) or converted < 0:
-        raise ContinuousConfigError(f"{label} must be 0.0 or positive finite")
-    if converted != 0.0 and converted <= 0:
         raise ContinuousConfigError(f"{label} must be 0.0 or positive finite")
 
 
@@ -752,9 +596,10 @@ class WindowRecord:
     capture_goal_frames: int = 0
     new_frame_count: int = 0
     overlap_frame_count: int = 0
-    # 长窗分组为该窗口计划的新增帧数与共享帧数（total_frames 语义下为 0）。
-    planned_new_frames: int = 0
-    planned_shared_frames: int = 0
+    # 送去重建的帧（含复用的共享帧）里没有位姿的帧数；窗口判定用它。
+    missing_pose_frames: int = 0
+    # 其中本窗新采的帧。会话累计只加这一部分，共享帧不重复计数。
+    new_missing_pose_frames: int = 0
     window_frame_ids: list[int] = field(default_factory=list)
     model_frame_ids: list[int] = field(default_factory=list)
     worker_result_manifest_uri: str = ""
@@ -769,16 +614,9 @@ class WindowRecord:
     alignment: dict | None = None
     formal_result_uri: str = ""
     formal_provenance_sha256: str = ""
-    pool_imported: bool = False
-    pool_epoch: int = -1
-    pool_revision: int = -1
-    pool_size: int = 0
-    pool_selected_indices: list[int] = field(default_factory=list)
-    pool_confidence_summary: dict[str, Any] = field(default_factory=dict)
     capture_generation: int = 0
     captured_frame_ids: list[int] = field(default_factory=list)
     done: threading.Event = field(default_factory=threading.Event)
-    shared_reference_candidate: Any = field(default=None, repr=False)
     # 人工恢复历史：资源门拒绝后由操作者显式重试的次数与每次的拒绝原因。
     manual_retries: int = 0
     guard_failures: list[str] = field(default_factory=list)
@@ -810,11 +648,10 @@ class SessionStatus:
     fifo_bytes: int = 0
     fifo_oldest_wait_sec: float | None = None
     disk_free_gb: float = 0.0
-    map_epoch: int = 0
     last_alignment_state: str = COORDINATE_MODEL_LOCAL_UNALIGNED
     formal_windows: int = 0
     reconstruction_mode: str = RECONSTRUCTION_MODE_PER_WINDOW
-    alignment_backend: str = BACKEND_ODOM
+    alignment_backend: str = BACKEND_G4
 
 
 class ContinuousSession:
@@ -832,15 +669,6 @@ class ContinuousSession:
         result_gate: Callable[..., Any] | None = None,
         result_publisher: Callable[..., Any] | None = None,
     ) -> None:
-        if not isinstance(config, ContinuousConfig):
-            raise TypeError("config must be ContinuousConfig")
-        config.preflight()
-        if not callable(capture_client_factory) or not callable(backend_factory):
-            raise TypeError("client/backend factories must be callable")
-        if result_gate is not None and not callable(result_gate):
-            raise TypeError("result_gate must be callable")
-        if result_publisher is not None and not callable(result_publisher):
-            raise TypeError("result_publisher must be callable")
         self._config = config
         self._capture_client_factory = capture_client_factory
         self._backend_factory = backend_factory
@@ -850,13 +678,8 @@ class ContinuousSession:
             result_publisher if result_publisher is not None else publish_formal_record
         )
         self._worker_disk_blocked = False
-        self._pool_capacity_blocked = False
         self._fifo_bytes = 0
         self._fatal_oom = False
-        self._map_epoch = 0
-        self._odom_reference_frame_id: str | None = None
-        self._last_odom_position: tuple[float, float, float] | None = None
-        self._last_odom_stamp: tuple[int, int] | None = None
         self._last_alignment_state = COORDINATE_MODEL_LOCAL_UNALIGNED
         self._formal_windows = 0
         self._last_worker_wall_time_sec: float | None = None
@@ -864,16 +687,10 @@ class ContinuousSession:
         self._last_service_budget_sec: float | None = None
         self._reconstruction_mode = config.initial_reconstruction_mode
         self._pool: FramePool | None = None
-        self._pool_revision = 0
-        self._plan = None
-        self._plan_path = ""
-        self._plan_exhausted = False
         self._capture_generation = 0
         self._config_timeline: list[dict[str, Any]] = []
         self._thread_factory = thread_factory
         self._monotonic = monotonic
-        self._pool_eligible_frames = 0
-        self._pool_lock = threading.RLock()
         self._lock = threading.Lock()
         self._goal_dispatch_lock = threading.Lock()
         self._selected_role: CameraRole | None = None
@@ -887,25 +704,23 @@ class ContinuousSession:
             save_sensor_depth=False,
             inference_resolution=config.initial_inference_resolution,
             worker_timeout_sec=config.initial_worker_timeout_sec,
-            overlap_frames=(0 if config.initial_reconstruction_mode == RECONSTRUCTION_MODE_FRAME_POOL
-                            else config.initial_overlap_frames),
+            overlap_frames=config.initial_overlap_frames,
         )
         self._state = SESSION_IDLE
         self._session_id = ""
         self._next_window = 0
         self._windows: list[WindowRecord] = []
-        self._shared_reference = None
         self._g4_process = None
-        self._alignment_fault = False
+        self._g4_start_error = ""
         self._fifo: list[WindowRecord] = []  # deque-like; only PENDING entries
         self._running_window: WindowRecord | None = None
         self._succeeded = 0
         self._failed = 0
+        self._missing_pose_frames = 0
         # 失败历史分两层：failed_windows 只数**未恢复的终态失败**（外部健康
         # 判据）；attempt_failures 单调累加每次尝试级失败（人工重试后仍保留）。
         self._attempt_failures = 0
         self._manual_retries = 0
-        self._dropped = 0
         self._last_error = ""
         self._capture_client: ContinuousCaptureClient | None = None
         self._backend: ReconstructionBackend | None = None
@@ -951,7 +766,6 @@ class ContinuousSession:
                 SESSION_DISK_PAUSED,
                 SESSION_FATAL_OOM,
                 SESSION_MEMORY_PAUSED,
-                SESSION_ALIGNMENT_PAUSED,
                 SESSION_STOPPING,
                 SESSION_DRAINING,
             ):
@@ -978,58 +792,35 @@ class ContinuousSession:
                     "reconstruction_mode must be one of "
                     f"{RECONSTRUCTION_MODES!r}"
                 )
-            if (selected_mode == RECONSTRUCTION_MODE_PER_WINDOW
-                    and not self._config.odom_local_enabled):
-                return 5, "per_window requires odom_local_enabled=true"
-            # 新 session 的角色相关采集值回到冻结 profile，避免上一
-            # 角色的热调值穿透到边界不同的 Capture Action。
+            # 会话参数来自冻结 profile；只有是否保存传感器深度随所选角色。
             runtime = EffectiveConfig(
                 sample_fps=self._config.initial_sample_fps,
                 window_frames=self._config.initial_window_frames,
-                queue_mode=self._runtime.queue_mode,
-                queue_capacity=self._runtime.queue_capacity,
-                max_retries=self._runtime.max_retries,
-                keep_snapshot_on_success=self._runtime.keep_snapshot_on_success,
+                queue_mode=self._config.initial_queue_mode,
+                queue_capacity=self._config.initial_queue_capacity,
+                max_retries=self._config.initial_max_retries,
+                keep_snapshot_on_success=self._config.initial_keep_snapshot_on_success,
                 save_sensor_depth=role.capture_config.save_sensor_depth,
                 inference_resolution=self._config.initial_inference_resolution,
                 worker_timeout_sec=self._config.initial_worker_timeout_sec,
-                overlap_frames=(0 if selected_mode == RECONSTRUCTION_MODE_FRAME_POOL
-                                else self._config.initial_overlap_frames),
+                overlap_frames=self._config.initial_overlap_frames,
             )
-            self._validate_runtime(runtime, role)
             self._selected_role = role
             self._runtime = runtime
             self._reconstruction_mode = selected_mode
             self._pool = None
-            self._pool_eligible_frames = 0
-            self._pool_revision = 0
-            self._plan = None
-            self._plan_path = ""
-            self._plan_exhausted = False
             self._capture_generation = 0
-            # 清空缓存之后再载入一次并校验：本次会话固定使用这份计划。
-            # 顺序反了会先校验上一次会话的缓存，再让采集线程重新打开可能已被
-            # 删除或改写的文件。
-            if self._config.window_plan_path.strip():
-                try:
-                    self._window_plan()
-                except Exception as error:
-                    return 6, (
-                        "grouping plan is unusable: "
-                        f"{type(error).__name__}: {error}"
-                    )
             self._session_id = "s" + secrets.token_hex(8)
             self._next_window = 0
             self._windows = []
-            self._shared_reference = None
-            self._alignment_fault = False
+            self._g4_start_error = ""
             self._fifo = []
             self._running_window = None
             self._succeeded = 0
             self._failed = 0
+            self._missing_pose_frames = 0
             self._attempt_failures = 0
             self._manual_retries = 0
-            self._dropped = 0
             self._last_error = ""
             self._stopping = False
             self._capture_stopped = False
@@ -1043,12 +834,7 @@ class ContinuousSession:
             self._resume_in_progress = False
             self._resume_token = None
             self._worker_disk_blocked = False
-            self._pool_capacity_blocked = False
             self._fifo_bytes = 0
-            self._map_epoch = 0
-            self._odom_reference_frame_id = None
-            self._last_odom_position = None
-            self._last_odom_stamp = None
             self._last_alignment_state = COORDINATE_MODEL_LOCAL_UNALIGNED
             self._formal_windows = 0
             self._last_worker_wall_time_sec = None
@@ -1088,8 +874,8 @@ class ContinuousSession:
         资源门暂停会让两个线程按硬停 latch 退出，因此人工恢复必须重新
         建线程——只把 state 改回 RUNNING 会得到一个没有 worker 的空转会话。
         调用方必须已经在锁外确认旧线程退出（见 resume()），否则会出现两个
-        线程同时消费同一个 FIFO。登记清单已耗尽时只重启消费线程：此时只剩
-        排空，重试窗照样会被消费，不需要也不能再开新采集。
+        线程同时消费同一个 FIFO。会话已在排空（STOP 之后）时只重启消费线程：
+        重试窗照样会被消费，不需要也不能再开新采集。
         """
         self._capture_done.clear()
         self._consume_done.clear()
@@ -1102,138 +888,6 @@ class ContinuousSession:
         else:
             self._capture_thread = None
         consume_thread.start()
-
-    def set_overlap_frames(self, count: int) -> tuple[int, str]:
-        """Set reused tail frames: 0 captures independently; N reuses N frames.
-
-        The first window always captures all frames. During a session the
-        change applies to the next window; the active capture stays frozen.
-        Returns (0, message) on success, otherwise an existing service error code.
-        """
-        with self._lock:
-            if self._config.alignment_backend in (BACKEND_A, BACKEND_G4):
-                return 5, "shared-window profiles freeze overlap; choose another configured profile"
-            if (self._reconstruction_mode == RECONSTRUCTION_MODE_FRAME_POOL
-                    and self._state not in (SESSION_IDLE, SESSION_STOPPED)):
-                return 5, "frame_pool fixes overlap_frames at 0; it cannot be changed"
-            try:
-                _validate_overlap_frames(count, self._runtime.window_frames)
-            except ContinuousConfigError as error:
-                return 5, str(error)
-            if self._state in (SESSION_IDLE, SESSION_STOPPED):
-                try:
-                    config = replace(self._config, initial_overlap_frames=count)
-                except ContinuousConfigError as error:
-                    return 5, str(error)
-                self._config = config
-                self._runtime = replace(self._runtime, overlap_frames=count)
-                return 0, f"overlap_frames set to {count}"
-        return self.set_params(overlap_frames=count)
-
-    def set_params(
-        self,
-        *,
-        sample_fps: float | None = None,
-        window_frames: int | None = None,
-        overlap_frames: int | None = None,
-        queue_mode: str | None = None,
-        queue_capacity: int | None = None,
-        max_retries: int | None = None,
-        keep_snapshot_on_success: bool | None = None,
-        save_sensor_depth: bool | None = None,
-        inference_resolution: int | None = None,
-        worker_timeout_sec: float | None = None,
-    ) -> tuple[int, str]:
-        with self._lock:
-            if self._uses_shared_A() or self._uses_g4():
-                return 5, "shared-window runtime parameters are frozen; start another configured session"
-            if self._state not in (
-                SESSION_RUNNING,
-                SESSION_PAUSED,
-                SESSION_DISK_PAUSED,
-            ):
-                return 4, f"cannot set params in state {self._state}"
-            if self._reconstruction_mode == RECONSTRUCTION_MODE_FRAME_POOL and overlap_frames is not None:
-                return 5, "frame_pool fixes overlap_frames at 0; it cannot be changed"
-            if save_sensor_depth is not None and type(save_sensor_depth) is not bool:
-                return 5, "save_sensor_depth must be a bool"
-            if inference_resolution is not None and (
-                isinstance(inference_resolution, bool)
-                or not isinstance(inference_resolution, int)
-            ):
-                return 5, "inference_resolution must be an integer"
-            if worker_timeout_sec is not None and (
-                isinstance(worker_timeout_sec, bool)
-                or not isinstance(worker_timeout_sec, (int, float))
-            ):
-                return 5, "worker_timeout_sec must be a finite number"
-            if overlap_frames is not None and (
-                isinstance(overlap_frames, bool) or not isinstance(overlap_frames, int)
-            ):
-                return 5, "overlap_frames must be an integer"
-            current = self._runtime
-            candidate = EffectiveConfig(
-                sample_fps=float(sample_fps)
-                if sample_fps is not None
-                else current.sample_fps,
-                window_frames=int(window_frames)
-                if window_frames is not None
-                else current.window_frames,
-                queue_mode=queue_mode if queue_mode is not None else current.queue_mode,
-                queue_capacity=int(queue_capacity)
-                if queue_capacity is not None
-                else current.queue_capacity,
-                max_retries=int(max_retries)
-                if max_retries is not None
-                else current.max_retries,
-                keep_snapshot_on_success=bool(keep_snapshot_on_success)
-                if keep_snapshot_on_success is not None
-                else current.keep_snapshot_on_success,
-                save_sensor_depth=bool(save_sensor_depth)
-                if save_sensor_depth is not None
-                else current.save_sensor_depth,
-                inference_resolution=int(inference_resolution)
-                if inference_resolution is not None
-                else current.inference_resolution,
-                worker_timeout_sec=float(worker_timeout_sec)
-                if worker_timeout_sec is not None
-                else current.worker_timeout_sec,
-                overlap_frames=int(overlap_frames)
-                if overlap_frames is not None
-                else current.overlap_frames,
-            )
-            try:
-                self._validate_runtime(candidate, self._selected_role)
-            except ContinuousConfigError as error:
-                return 5, str(error)
-            previous_digest = current.digest()
-            capturing_window = next(
-                (
-                    record.window_index
-                    for record in reversed(self._windows)
-                    if record.state == WINDOW_CAPTURING
-                ),
-                None,
-            )
-            self._runtime = candidate
-            change_event = {
-                "index": len(self._config_timeline),
-                "event": "config_changed",
-                "previous_config_digest": previous_digest,
-                "config_digest": candidate.digest(),
-                "applies_from_window_index": (
-                    self._windows[-1].window_index + 1
-                    if self._windows
-                    else self._next_window
-                ),
-                "window_index_capturing": capturing_window,
-                "config": candidate.as_dict(),
-            }
-            self._config_timeline.append(change_event)
-            journal_payload = dict(change_event)
-            journal_payload["session_id"] = self._session_id
-            self._write_journal(journal_payload)
-            return 0, "runtime params updated (next window applies)"
 
     def pause(self) -> tuple[int, str]:
         with self._lock:
@@ -1344,13 +998,6 @@ class ContinuousSession:
             )
         if self._stopping:
             return 4, "cannot resume session while stop_all is converging"
-        if self._reconstruction_mode != RECONSTRUCTION_MODE_PER_WINDOW:
-            return 5, (
-                "manual retry of a resource-guard window is only supported for "
-                f"per_window sessions, not {self._reconstruction_mode}: the "
-                "frame_pool path re-selects pool inputs instead of reusing the "
-                "preserved snapshot"
-            )
         if self._runtime.queue_mode != QUEUE_LOSSLESS:
             return 5, (
                 "manual retry of a resource-guard window requires lossless_fifo; "
@@ -1407,13 +1054,12 @@ class ContinuousSession:
                 for replacement in self._windows[position + 1:]
             ):
                 continue
-            if not self._plan_exhausted and record.window_index == self._next_window:
+            if record.window_index == self._next_window:
                 continue  # 重启采集会从这个索引重新采
             return (
                 f"window {record.window_index} was cancelled by the resource pause "
                 f"but capture restarts from window {self._next_window}"
-                + (" and the registered plan is exhausted" if self._plan_exhausted else "")
-                + "; that window cannot be recovered in place"
+                "; that window cannot be recovered in place"
             )
         return None
 
@@ -1443,7 +1089,6 @@ class ContinuousSession:
         record.done.clear()
         record.queued_at_monotonic = self._monotonic()
         # 保留失败窗 + 原 FIFO：绝不为人工恢复删除任何已采集窗口。
-        # realtime_latest 下队列可能暂时多一条，由采集侧容量判断自然收敛。
         self._fifo.insert(0, record)
         self._fifo_bytes += record.snapshot_bytes
         self._failed = max(0, self._failed - 1)
@@ -1451,7 +1096,7 @@ class ContinuousSession:
         self._memory_failed_window = None
         self._fatal_oom = False
         self._oom_latched = False
-        restart_capture = not self._plan_exhausted and not self._capture_stopped
+        restart_capture = not self._capture_stopped
         if self._capture_stopped:
             self._state = SESSION_DRAINING
         else:
@@ -1541,8 +1186,6 @@ class ContinuousSession:
                 self._stopping
                 or self._capture_stopped
                 or self._fatal_oom
-                or self._alignment_fault
-                or self._reconstruction_mode != RECONSTRUCTION_MODE_PER_WINDOW
                 or self._state not in (SESSION_RUNNING, SESSION_PAUSED, SESSION_DISK_PAUSED)
                 or not (self._fifo or self._running_window is not None or self._active_job_id is not None)
             ):
@@ -1886,9 +1529,7 @@ class ContinuousSession:
                     }
                 )
                 return 3, self._last_error
-            if (self._reconstruction_mode == RECONSTRUCTION_MODE_PER_WINDOW
-                    and self._pool is not None
-                    and not (self._uses_shared_A() and (self._alignment_fault or self._fatal_oom))):
+            if self._pool is not None:
                 try:
                     self._pool.clear()
                 except Exception as error:
@@ -1957,14 +1598,13 @@ class ContinuousSession:
                 running_window=running,
                 succeeded_windows=self._succeeded,
                 failed_windows=self._failed,
-                dropped_windows=self._dropped,
+                dropped_windows=0,
                 effective=self._runtime,
                 last_error=self._last_error,
                 min_free_disk_gb=self._config.min_free_disk_gb,
                 fifo_bytes=fifo_bytes,
                 fifo_oldest_wait_sec=fifo_oldest_wait_sec,
                 disk_free_gb=self._disk_free_locked(),
-                map_epoch=self._map_epoch,
                 last_alignment_state=self._last_alignment_state,
                 formal_windows=self._formal_windows,
                 reconstruction_mode=self._reconstruction_mode,
@@ -1972,33 +1612,10 @@ class ContinuousSession:
             )
 
     def _diagnostic_input_frames(self, status, window, kind: str):
-        """诊断里的 新增/共享/模型输入 三个数（按窗口实际语义）。
-
-        非分组后端（total_frames 语义）保持原样：模型输入就是
-        effective.window_frames，共享为 effective.overlap_frames，新增不显示。
-        """
+        """诊断里的 新增/共享/模型输入 三个数（按窗口实际语义）。"""
         shared = int(window.overlap_frame_count) if window is not None else 0
-        if self._uses_shared_A():
-            values = {"new": 100, "model": 100 + shared, "shared": shared}
-        elif self._uses_g4():
-            if window is not None:
-                model = int(window.effective.window_frames)
-                planned_new = int(getattr(window, "planned_new_frames", 0) or 0)
-                planned_shared = int(getattr(window, "planned_shared_frames", 0) or 0)
-                if planned_new or planned_shared:
-                    values = {"new": planned_new, "model": model, "shared": planned_shared}
-                else:
-                    values = {"new": model - shared, "model": model, "shared": shared}
-            else:
-                model = int(status.effective.window_frames)
-                values = {"new": model - shared, "model": model, "shared": shared}
-        else:
-            values = {
-                "new": None,
-                "model": status.effective.window_frames,
-                "shared": status.effective.overlap_frames,
-            }
-        return values[kind]
+        model = int((window.effective if window is not None else status.effective).window_frames)
+        return {"new": model - shared, "model": model, "shared": shared}[kind]
 
     def diagnostics_snapshot(self) -> dict[str, Any]:
         status = self.get_status()
@@ -2029,13 +1646,11 @@ class ContinuousSession:
                                    if item.state == WINDOW_CAPTURING), None)
             if display_window is None:
                 display_window = self._running_window or (self._windows[-1] if self._windows else None)
-            shared_count = display_window.overlap_frame_count if display_window is not None else 0
             return {
                 "state": status.state,
                 "session_id": status.session_id,
                 "alignment_backend": status.alignment_backend,
-                "g4": self._g4_process.status() if self._g4_process is not None else {},
-                "alignment_fault": self._alignment_fault,
+                "g4": self._g4_status_locked(),
                 # 资源门暂停是可人工恢复的（RESUME 重试同一窗口）；CUDA OOM
                 # 不可恢复。attempt_failures 是尝试级失败历史，单调累加。
                 "memory_paused": self._memory_guard_paused,
@@ -2046,9 +1661,7 @@ class ContinuousSession:
                 ),
                 "attempt_failures": self._attempt_failures,
                 "manual_retries": self._manual_retries,
-                # 按**该窗口实际生效**的计划与配置给出：长窗分组下 window_frames 是
-                # 模型输入总数，新增/共享必须取该窗口的 planned_*，否则会显示成
-                # 总帧语义（例如 80/20/100 而非 100/20/120）。
+                # 按当前（采集中或最近）窗口的实际共享帧数给出。
                 "new_input_frames": self._diagnostic_input_frames(status, display_window, "new"),
                 "model_input_frames": self._diagnostic_input_frames(status, display_window, "model"),
                 "shared_input_frames": self._diagnostic_input_frames(status, display_window, "shared"),
@@ -2066,6 +1679,8 @@ class ContinuousSession:
                 "succeeded_windows": status.succeeded_windows,
                 "failed_windows": status.failed_windows,
                 "dropped_windows": status.dropped_windows,
+                # 会话累计：采到的帧里没有位姿的帧数，每帧只算一次（含因此判失败的窗口）。
+                "missing_pose_frames": self._missing_pose_frames,
                 "effective": {
                     "sample_fps": status.effective.sample_fps,
                     "window_frames": status.effective.window_frames,
@@ -2084,30 +1699,8 @@ class ContinuousSession:
                     ),
                     "overlap_frames": status.effective.overlap_frames,
                     "alignment_backend": status.alignment_backend,
-                    "window_frame_semantics": (
-                        "new_frames" if (self._uses_shared_A() or self._grouped_window_semantics())
-                        else "total_frames"
-                    ),
-                    "steady_model_frames": (
-                        120 if self._uses_shared_A()
-                        else (self._config.initial_window_frames + self._config.initial_overlap_frames
-                              if self._grouped_window_semantics() else status.effective.window_frames)
-                    ),
-                    "window_plan_source": (
-                        None if not self._grouped_window_semantics()
-                        else (self._config.window_plan_path or "derived_grouping_rule")
-                    ),
-                    "minimum_total_frames": (
-                        self._config.minimum_total_frames if self._grouped_window_semantics() else None
-                    ),
-                    "grouping_plan_exhausted": bool(self._plan_exhausted),
-                    "g4_placement": (
-                        self._config.g4_placement if status.alignment_backend == BACKEND_G4 else None
-                    ),
-                    "pose_time_offset_ms": (
-                        self._config.pose_time_offset_ms
-                        if self._config.g4_placement == "frame_pose" else None
-                    ),
+                    "g4_placement": self._config.g4_placement,
+                    "pose_time_offset_ms": self._config.pose_time_offset_ms,
                 },
                 "fifo": waiting,
                 "fifo_bytes": status.fifo_bytes,
@@ -2117,14 +1710,6 @@ class ContinuousSession:
                 "disk_free_gb": status.disk_free_gb,
                 "disk_redline": self._disk_low_locked(),
                 "worker_disk_blocked": self._worker_disk_blocked,
-                "pool_capacity_blocked": self._pool_capacity_blocked,
-                "pool_eligible_frames": self._pool_eligible_frames,
-                "pool_target_frames": status.effective.window_frames,
-                "pool_waiting_for_frames": (
-                    self._reconstruction_mode == RECONSTRUCTION_MODE_FRAME_POOL
-                    and self._pool_eligible_frames < status.effective.window_frames
-                ),
-                "map_epoch": status.map_epoch,
                 "last_alignment_state": (COORDINATE_ODOM_LOCAL_APPROX
                     if self._g4_process is not None and self._g4_process.status().get("published_windows")
                     else status.last_alignment_state),
@@ -2153,62 +1738,10 @@ class ContinuousSession:
             return None
         return self._config.role_by_name(role_name)
 
-    def _validate_runtime(
-        self, candidate: EffectiveConfig, role: CameraRole | None
-    ) -> None:
-        _validate_window_frames(
-            candidate.window_frames, self._config.reconstruct_frame_group_size
-        )
-        _validate_overlap_frames(candidate.overlap_frames, candidate.window_frames)
-        if (
-            isinstance(candidate.sample_fps, bool)
-            or not isinstance(candidate.sample_fps, (int, float))
-            or not _finite(candidate.sample_fps)
-            or candidate.sample_fps <= 0
-        ):
-            raise ContinuousConfigError("sample_fps must be positive and finite")
-        if candidate.queue_mode not in _QUEUE_MODES:
-            raise ContinuousConfigError(
-                f"queue_mode must be one of {_QUEUE_MODES!r}"
-            )
-        if (
-            isinstance(candidate.queue_capacity, bool)
-            or not isinstance(candidate.queue_capacity, int)
-            or candidate.queue_capacity <= 0
-        ):
-            raise ContinuousConfigError("queue_capacity must be a positive integer")
-        if (
-            isinstance(candidate.max_retries, bool)
-            or not isinstance(candidate.max_retries, int)
-            or candidate.max_retries < 0
-        ):
-            raise ContinuousConfigError("max_retries must be a nonnegative integer")
-        if type(candidate.keep_snapshot_on_success) is not bool:
-            raise ContinuousConfigError("keep_snapshot_on_success must be a bool")
-        if type(candidate.save_sensor_depth) is not bool:
-            raise ContinuousConfigError("save_sensor_depth must be a bool")
-        _validate_inference_resolution(
-            candidate.inference_resolution, "inference_resolution"
-        )
-        from .backend_spec import validate_independent_request
-        try:
-            validate_independent_request(self._config.reconstruction_backend, candidate.window_frames,
-                                         candidate.inference_resolution)
-        except ValueError as error:
-            raise ContinuousConfigError(str(error)) from error
-        _validate_worker_timeout(candidate.worker_timeout_sec, "worker_timeout_sec")
-        if role is None:
-            raise ContinuousConfigError("no camera role selected")
-        _validate_capture_runtime(
-            candidate, role, self._config.capture_wait_margin_sec
-        )
-
     def _scene_id(self, window_index: int) -> str:
         return f"cs-{self._session_id}-w{window_index}"
 
     def _disk_low_locked(self) -> bool:
-        if self._pool_capacity_blocked:
-            return True
         free = self._disk_free_locked()
         if free != free:
             # 读不到剩余空间时 fail-closed：暂停新采集/新 worker 并告警。
@@ -2296,7 +1829,7 @@ class ContinuousSession:
                             self._state = SESSION_RUNNING
                             if self._last_error == _DISK_REDLINE_ERROR:
                                 self._last_error = ""
-                    if self._state != SESSION_RUNNING or self._plan_exhausted or (
+                    if self._state != SESSION_RUNNING or (
                         self._runtime.queue_mode == QUEUE_LOSSLESS
                         and len(self._fifo) >= self._runtime.queue_capacity
                     ):
@@ -2308,57 +1841,15 @@ class ContinuousSession:
                         role = self._selected_role
                         effective = self._runtime
                         window_index = self._next_window
-                        planned_new = planned_shared = 0
-                        grouping_error = ""
-                        if self._grouped_window_semantics():
-                            # 计划读取本身也可能失败（文件被删/改写），必须和形状
-                            # 解析一起转成可见状态，不能让采集线程退出。
-                            try:
-                                plan = self._window_plan()
-                                if plan is not None and window_index >= len(plan):
-                                    # 登记清单跑完是正常结束：停止新采集，让消费把
-                                    # 已排队/在途窗口排空，不置故障、不暂停消费。
-                                    self._plan_exhausted = True
-                                    self._last_error = ""
-                                    self._write_journal({
-                                        "event": "grouping_plan_exhausted",
-                                        "session_id": self._session_id,
-                                        "window_index": window_index,
-                                        "plan_windows": len(plan),
-                                    })
-                                    proceed = False
-                                else:
-                                    planned_new, planned_shared = self._planned_window_shape(window_index)
-                                    effective = self._grouped_effective(window_index)
-                            # WindowPlanError 是 ValueError 的子类，一并覆盖。
-                            except (FramePoolError, ValueError, OSError) as error:
-                                grouping_error = str(error)
-                        if grouping_error:
-                            # 分组与实到帧不符时暂停会话并保留现场；采集线程
-                            # 不能因为配置/输入不符而退出，否则会变成静默停摆。
-                            self._state = SESSION_ALIGNMENT_PAUSED
-                            self._alignment_fault = True
-                            self._last_error = "long-window grouping: " + grouping_error
-                            self._write_journal({
-                                "event": "long_window_grouping_paused",
-                                "session_id": self._session_id,
-                                "window_index": window_index,
-                                "reason": grouping_error,
-                                "recovery": "fix the grouping plan or start a new session",
-                            })
-                            proceed = False
-                        elif proceed:
-                            record = WindowRecord(
-                                window_index=window_index,
-                                scene_id=self._scene_id(window_index),
-                                role=role,
-                                effective=effective,
-                                capture_generation=self._capture_generation,
-                                planned_new_frames=planned_new,
-                                planned_shared_frames=planned_shared,
-                            )
-                            self._windows.append(record)
-                            self._capture_client = None
+                        record = WindowRecord(
+                            window_index=window_index,
+                            scene_id=self._scene_id(window_index),
+                            role=role,
+                            effective=effective,
+                            capture_generation=self._capture_generation,
+                        )
+                        self._windows.append(record)
+                        self._capture_client = None
                 if not proceed:
                     self._wake_capture.wait(0.5)
                     continue
@@ -2406,25 +1897,22 @@ class ContinuousSession:
                                 "reason": error,
                             }
                         )
-                    if self._uses_shared_A():
-                        self._pause_shared_failure(error)
-                    elif self._uses_g4():
-                        # A source gap may invalidate one window. Repeated
-                        # failures indicate a source/configuration fault.
-                        consecutive_failures += 1
-                        with self._lock:
-                            if consecutive_failures >= 3 and not self._stopping and not self._fatal_oom:
-                                self._state = SESSION_PAUSED
-                                self._capture_client = None
-                                self._write_journal({
-                                    "event": "capture_failure_paused",
-                                    "session_id": self._session_id,
-                                    "reason": error,
-                                    "recovery": "fix_source_then_resume",
-                                })
-                                consecutive_failures = 0
-                        self._wake_capture.clear()
-                        self._wake_capture.wait(0.5)
+                    # A source gap may invalidate one window. Repeated
+                    # failures indicate a source/configuration fault.
+                    consecutive_failures += 1
+                    with self._lock:
+                        if consecutive_failures >= 3 and not self._stopping and not self._fatal_oom:
+                            self._state = SESSION_PAUSED
+                            self._capture_client = None
+                            self._write_journal({
+                                "event": "capture_failure_paused",
+                                "session_id": self._session_id,
+                                "reason": error,
+                                "recovery": "fix_source_then_resume",
+                            })
+                            consecutive_failures = 0
+                    self._wake_capture.clear()
+                    self._wake_capture.wait(0.5)
                     break
                 with self._lock:
                     retain_client = (
@@ -2516,7 +2004,7 @@ class ContinuousSession:
                 fatal_oom = self._fatal_oom
                 capture_stopped = self._capture_stopped
                 source_stale = record.source_stale
-                paused = self._state in (SESSION_PAUSED, SESSION_ALIGNMENT_PAUSED)
+                paused = self._state == SESSION_PAUSED
                 if stopping and capture_cancel_deadline is None:
                     record.capture_cancel_pending = True
                     capture_cancel_deadline = (
@@ -2593,27 +2081,43 @@ class ContinuousSession:
                 "capture succeeded without valid snapshot metadata "
                 "(snapshot_uri or manifest_sha256)"
             )
-        if self._reconstruction_mode == RECONSTRUCTION_MODE_FRAME_POOL:
-            try:
-                self._import_pool_capture(record)
-            except FramePoolCapacityError as error:
-                with self._lock:
-                    self._pool_capacity_blocked = True
-                    self._state = SESSION_DISK_PAUSED
-                return f"frame pool capacity reached: {error}"
-            except Exception as error:
-                return f"frame pool import failed: {type(error).__name__}: {error}"
-        if (
-            self._reconstruction_mode == RECONSTRUCTION_MODE_PER_WINDOW
-        ):
-            try:
-                self._prepare_overlap_capture(record)
-            except BaseException as error:
-                return (
-                    "overlap window preparation failed: "
-                    f"{type(error).__name__}: {error}"
+        try:
+            self._prepare_overlap_capture(record)
+        except BaseException as error:
+            return (
+                "overlap window preparation failed: "
+                f"{type(error).__name__}: {error}"
+            )
+        missing, total = record.missing_pose_frames, len(record.window_frame_ids)
+        if missing / total > MAX_MISSING_POSE_FRACTION:
+            # 重建救不了缺位姿：不提交、不重试；采集继续，共享帧照常复用。
+            error = (
+                f"missing poses: {missing} of {total} window frames have no pose "
+                f"(limit {MAX_MISSING_POSE_FRACTION:.0%})"
+            )
+            with self._lock:
+                self._missing_pose_frames += record.new_missing_pose_frames
+                self._failed += 1
+                self._window_terminal(record, WINDOW_FAILED, error)
+                self._last_error = error
+                self._write_journal(
+                    {
+                        "event": "window_failed",
+                        "session_id": self._session_id,
+                        "window_index": record.window_index,
+                        "scene_id": record.scene_id,
+                        "attempts": 0,
+                        "config_digest": record.effective.digest(),
+                        "reason": error,
+                        "missing_pose_frames": missing,
+                        "window_frames": total,
+                    }
                 )
+                self._capture_client = None
+            self._remove_snapshot(record)
+            return None
         with self._lock:
+            self._missing_pose_frames += record.new_missing_pose_frames
             record.queued_at_monotonic = self._monotonic()
             record.state = WINDOW_PENDING
             record.snapshot_bytes = self._snapshot_bytes_from_uri(
@@ -2621,25 +2125,6 @@ class ContinuousSession:
             )
             self._fifo.append(record)
             self._fifo_bytes += record.snapshot_bytes
-            if record.effective.queue_mode == QUEUE_REALTIME_LATEST:
-                while len(self._fifo) > record.effective.queue_capacity:
-                    dropped = self._fifo.pop(0)
-                    self._fifo_bytes -= dropped.snapshot_bytes
-                    self._remove_snapshot(dropped)
-                    self._dropped += 1
-                    dropped.state = WINDOW_CANCELLED
-                    dropped.error = "realtime_latest dropped oldest waiting window"
-                    dropped.done.set()
-                    self._write_journal(
-                        {
-                            "event": "window_dropped",
-                            "session_id": self._session_id,
-                            "window_index": dropped.window_index,
-                            "scene_id": dropped.scene_id,
-                            "config_digest": dropped.effective.digest(),
-                            "reason": dropped.error,
-                        }
-                    )
             self._write_journal(
                 {
                     "event": "window_pending",
@@ -2650,6 +2135,7 @@ class ContinuousSession:
                     "manifest_sha256": record.manifest_sha256,
                     "new_frame_count": record.new_frame_count,
                     "overlap_frame_count": record.overlap_frame_count,
+                    "missing_pose_frames": missing,
                     "config_digest": record.effective.digest(),
                 }
             )
@@ -2667,7 +2153,6 @@ class ContinuousSession:
                     if (
                         self._running_window is None
                         and self._active_job_id is None
-                        and not self._alignment_fault
                         and self._fifo
                     ):
                         if self._disk_low_locked():
@@ -2712,8 +2197,7 @@ class ContinuousSession:
                         0.0, self._monotonic() - service_started
                     )
                     self._last_service_budget_sec = (
-                        100 if self._uses_shared_A()
-                        else record.effective.window_frames - record.effective.overlap_frames
+                        record.effective.window_frames - record.effective.overlap_frames
                     ) / record.effective.sample_fps
                     self._write_journal({
                         "event": "window_service_timing",
@@ -2806,147 +2290,38 @@ class ContinuousSession:
                 )
 
     def _backend_profile(self) -> dict[str, Any]:
-        """交给后台数值核对的显式配置。
+        """交给后台地图后端的显式配置（写入 backend_profile.json）。"""
+        from g4_backend import FRAME_POSE_METHOD_ID
 
-        方法身份、分组清单、历史阈值表与保留观测表都在这里显式给出；
-        未配置的项保持默认，既有 total_frames 会话因此逐位不变。
-        """
-        from g4_backend import FRAME_POSE_METHOD_ID, METHOD_ID, WINDOWED_METHOD_ID
-
-        grouped = self._grouped_window_semantics()
         profile = {
-            "method_id": WINDOWED_METHOD_ID if grouped else METHOD_ID,
-            "window_plan_path": str(self._config.window_plan_path),
-            "threshold_table_path": str(self._config.threshold_table_path),
-            "threshold_group": str(self._config.threshold_group),
-            "fit_exclusion_source": str(self._config.fit_exclusion_source),
-            "window_frame_semantics": self._config.window_frame_semantics,
-            "minimum_total_frames": int(self._config.minimum_total_frames),
-            # 分组形状：后端据此核对登记清单，不自行推断。
+            "method_id": FRAME_POSE_METHOD_ID,
             "window_frames": int(self._config.initial_window_frames),
             "overlap_frames": int(self._config.initial_overlap_frames),
-            # 长窗分组按冻结算法复现：退化三点假设中止该边，而不是继续换假设。
-            "registration": {"ransac_degenerate": "abort"} if grouped else {},
+            "placement": "frame_pose",
+            "frame_pose": {"pose_time_offset_ms": float(self._config.pose_time_offset_ms)},
+            "camera_intrinsics": (None if self._config.camera_intrinsics is None
+                                  else dict(self._config.camera_intrinsics)),
         }
-        if self._config.g4_placement == "frame_pose":
-            # 只有新放置方式才增加键，既有 graph 会话的 profile 逐字不变。
-            profile.update(
-                method_id=FRAME_POSE_METHOD_ID, placement="frame_pose",
-                frame_pose={"pose_time_offset_ms": float(self._config.pose_time_offset_ms)},
-                camera_intrinsics=(None if self._config.camera_intrinsics is None
-                                   else dict(self._config.camera_intrinsics)),
-            )
-            if self._config.frame_pose_fusion:
-                profile["frame_pose_fusion"] = True
-            if self._config.pose_time_offset_stage == "capture":
-                profile["frame_pose"]["pose_time_offset_stage"] = "capture"
-            if self._config.g4_cross_window_weight > 0:
-                profile["frame_pose"]["cross_window_weight"] = float(self._config.g4_cross_window_weight)
-            if self._config.g4_frame_scales:
-                profile["frame_pose"]["frame_scales"] = True
+        if self._config.frame_pose_fusion:
+            profile["frame_pose_fusion"] = True
+        if self._config.pose_time_offset_stage == "capture":
+            profile["frame_pose"]["pose_time_offset_stage"] = "capture"
+        if self._config.g4_cross_window_weight > 0:
+            profile["frame_pose"]["cross_window_weight"] = float(self._config.g4_cross_window_weight)
+        if self._config.g4_frame_scales:
+            profile["frame_pose"]["frame_scales"] = True
         return profile
 
     # ------------------------------------------------------------------
-    # 长窗分组（中性命名）：window_frames 只数新增帧，模型输入为新增＋共享
-    # ------------------------------------------------------------------
-    def _grouped_window_semantics(self) -> bool:
-        """移植的长窗分组是否生效。
-
-        只在全局配准后端上生效：window_frames 表示新增帧，模型实际输入
-        为新增＋共享。既有 total_frames 语义与 A 模式都不受影响。
-        """
-        return (
-            self._config.alignment_backend == BACKEND_G4
-            and self._config.window_frame_semantics == WINDOW_SEMANTICS_NEW
-        )
-
-    def _window_plan(self):
-        """登记的窗口分组清单；未登记时为 None（按分组规则推导）。"""
-        path = self._config.window_plan_path
-        if not path.strip():
-            return None
-        if self._plan is None or self._plan_path != path:
-            from g4_backend import load_plan
-
-            plan = load_plan(path)
-            limit = int(self._config.reconstruct_frame_group_size)
-            oversized = [spec.id for spec in plan if spec.input_frames > limit]
-            if oversized:
-                # 超限会被 worker 静默抽帧，因此在这里明确拒绝。
-                raise FramePoolError(
-                    "registered grouping plan exceeds reconstruct frame_group_size="
-                    f"{limit}: " + ", ".join(oversized)
-                )
-            if plan.windows[0].shared_prefix:
-                raise FramePoolError("a registered grouping plan must start with an unshared window")
-            self._plan, self._plan_path = plan, path
-        return self._plan
-
-    def _planned_window_shape(self, window_index: int) -> tuple[int, int]:
-        """返回 (新增帧数, 共享帧数)；登记清单优先，否则按分组规则推导。"""
-        plan = self._window_plan()
-        spec = None
-        if plan is not None:
-            if window_index >= len(plan):
-                raise FramePoolError(
-                    f"window {window_index} exceeds the registered grouping plan of {len(plan)} windows"
-                )
-            spec = plan.spec(window_index)
-        if spec is not None:
-            return spec.new_frames, spec.shared_prefix
-        if window_index == 0:
-            # 首窗没有可复用的前序帧：新增即整窗。
-            return self._runtime.window_frames, 0
-        return self._runtime.window_frames, self._runtime.overlap_frames
-
-    def _grouped_effective(self, window_index: int) -> EffectiveConfig:
-        """把新增帧语义解析成该窗口的实际模型输入总帧数与共享帧数。
-
-        共享帧数必须一并写入：尾窗计划是"共享 26 ＋ 新增 74"，若只改总帧数，
-        采集目标会按运行时 overlap（20）去凑共享帧并直接报错。
-        """
-        new_frames, shared = self._planned_window_shape(window_index)
-        total = new_frames + shared
-        limit = int(self._config.reconstruct_frame_group_size)
-        if total > limit:
-            raise FramePoolError(
-                f"window {window_index} needs {total} model frames but frame_group_size is {limit}"
-            )
-        return replace(self._runtime, window_frames=total, overlap_frames=shared)
-
-    # ------------------------------------------------------------------
-    # frame_pool (采样区) helpers
+    # overlap window helpers (shared frames cached in FramePool)
     # ------------------------------------------------------------------
     def _capture_goal_frames(self, record: WindowRecord) -> int:
         """Plan only the new frames; the first window still captures all N."""
-        if (
-            self._reconstruction_mode != RECONSTRUCTION_MODE_PER_WINDOW
-            or record.effective.overlap_frames <= 0
-        ):
-            record.capture_goal_frames = record.effective.window_frames
-            record.overlap_frame_count = 0
-            return record.capture_goal_frames
         pool = self._frame_pool()
         pool.load()
         record.overlap_frame_count = min(
             record.effective.overlap_frames, len(pool.entries)
         )
-        if self._grouped_window_semantics():
-            # 长窗分组：共享帧数由登记清单或分组规则给出，不随可用池静默缩小。
-            required = record.planned_shared_frames
-            if record.overlap_frame_count != required:
-                raise FramePoolError(
-                    "long-window grouping needs exactly "
-                    f"{required} shared RGB frames but {record.overlap_frame_count} "
-                    "are available; preserve inputs and start a new session"
-                )
-            record.capture_goal_frames = record.planned_new_frames
-            return record.capture_goal_frames
-        if self._uses_shared_A():
-            if record.overlap_frame_count not in (0, 20):
-                raise FramePoolError("shared-window profiles require exactly twenty cached shared RGB frames")
-            record.capture_goal_frames = 100
-            return 100
         record.capture_goal_frames = (
             record.effective.window_frames - record.overlap_frame_count
         )
@@ -2964,11 +2339,9 @@ class ContinuousSession:
         pool = self._frame_pool()
         pool.load()
         previous = list(pool.entries)
-        if previous and snapshot.snapshot_version >= 2 and snapshot.frame_stamps:
+        if previous:
             first_stamp = snapshot.frame_stamps[0]
             if (first_stamp.sec, first_stamp.nsec) <= previous[-1].stamp_key():
-                if self._uses_shared_A():
-                    raise FramePoolError("shared-window RGB time reset: preserve inputs and start a new session")
                 # Capture validates each individual window. A restart between
                 # actions must also invalidate cached overlap across windows.
                 pool.clear()
@@ -2992,17 +2365,11 @@ class ContinuousSession:
         original_uri = record.snapshot_uri
         original_digest = record.manifest_sha256
         try:
-            new_ids = pool.import_window(
-                snapshot, record.window_index, sharpness_reader=lambda _: 1.0
-            )
+            new_ids = pool.import_window(snapshot, record.window_index)
             by_index = {entry.global_index: entry for entry in pool.entries}
             selected = previous[-record.overlap_frame_count :] if record.overlap_frame_count else []
             selected += [by_index[index] for index in new_ids]
-            expected_frames = (
-                100 + record.overlap_frame_count
-                if self._uses_shared_A() else record.effective.window_frames
-            )
-            if len(selected) != expected_frames:
+            if len(selected) != record.effective.window_frames:
                 raise FramePoolError(
                     "overlap window did not produce exactly window_frames inputs"
                 )
@@ -3042,6 +2409,10 @@ class ContinuousSession:
             record.manifest_sha256 = original_digest
             raise
         record.window_frame_ids = [entry.global_index for entry in selected]
+        record.missing_pose_frames = sum(1 for entry in selected if not entry.pose_valid)
+        record.new_missing_pose_frames = sum(
+            1 for index in new_ids if not by_index[index].pose_valid
+        )
         record.captured_frame_ids = list(record.window_frame_ids)
         record.captured_frames = len(selected)
         if synthetic_uri:
@@ -3069,238 +2440,12 @@ class ContinuousSession:
             self._pool.load()
         return self._pool
 
-    def _import_pool_capture(self, record: WindowRecord) -> None:
-        """Make every completed capture available before queueing reconstruction."""
-        with self._pool_lock:
-            self._import_pool_capture_locked(record)
-
-    def _import_pool_capture_locked(self, record: WindowRecord) -> None:
-        role = record.role
-        pool = self._frame_pool()
-        if not record.pool_imported:
-            try:
-                snapshot = validate_snapshot(
-                    record.snapshot_uri,
-                    record.manifest_sha256,
-                    (role.capture_config.snapshot_root,),
-                    role.capture_config.snapshot_limits,
-                )
-            except BaseException as error:
-                raise FramePoolError(
-                    f"frame pool snapshot validation failed: "
-                    f"{type(error).__name__}: {error}"
-                ) from error
-            odom_span = self._frame_pool_odom_span(snapshot)
-            planned = None
-            if odom_span is not None:
-                with self._lock:
-                    planned = self._plan_map_epoch_locked(odom_span)
-                    current_epoch = self._map_epoch
-            try:
-                if planned is not None and planned[0] != current_epoch:
-                    pool.clear()
-                    self._write_journal(
-                        {
-                            "event": "frame_pool_epoch_reset",
-                            "session_id": self._session_id,
-                            "window_index": record.window_index,
-                            "previous_map_epoch": current_epoch,
-                            "map_epoch": planned[0],
-                        }
-                    )
-                pool.import_window(snapshot, record.window_index)
-            except BaseException:
-                self._pool = None
-                raise
-            if planned is not None:
-                with self._lock:
-                    self._apply_map_epoch_locked(
-                        planned[1], planned[2], planned[3], planned[0]
-                    )
-                    record.pool_epoch = self._map_epoch
-            else:
-                with self._lock:
-                    record.pool_epoch = self._map_epoch
-            record.pool_imported = True
-            with self._lock:
-                self._pool_eligible_frames = sum(
-                    math.isfinite(entry.score) and entry.score > 0 for entry in pool.entries
-                )
-        else:
-            with self._lock:
-                if record.pool_epoch != self._map_epoch:
-                    raise FramePoolError(
-                        "frame pool window belongs to a stale odometry epoch"
-                    )
-
-    def _prepare_pool_reconstruction(self, record: WindowRecord) -> bool:
-        """Reselect the frozen target count from the complete pool on every attempt."""
-        with self._pool_lock:
-            return self._prepare_pool_reconstruction_locked(record)
-
-    def _prepare_pool_reconstruction_locked(self, record: WindowRecord) -> bool:
-        self._import_pool_capture_locked(record)
-        role = record.role
-        pool = self._frame_pool()
-        original_uri = record.snapshot_uri
-
-        selected = pool.select(record.effective.window_frames)
-        record.pool_size = len(pool.entries)
-        if len(selected) < record.effective.window_frames:
-            # Inputs are safely retained in the pool. Keep capturing instead of
-            # failing/retrying the same undersized input and blocking the FIFO.
-            cleanup_error = self._remove_snapshot(record)
-            if cleanup_error is not None:
-                raise FramePoolError(f"buffered source cleanup failed: {cleanup_error}")
-            with self._lock:
-                self._window_terminal(record, WINDOW_BUFFERED, "")
-                self._write_journal({
-                    "event": "frame_pool_buffered", "session_id": self._session_id,
-                    "window_index": record.window_index, "pool_size": record.pool_size,
-                    "eligible_frames": len(selected), "required_frames": record.effective.window_frames,
-                })
-            return False
-        revision = self._pool_revision
-        pool.write_selection(revision, selected)
-
-        scene_id = f"cs-{self._session_id}-p{revision}"
-        destination = (
-            Path(role.capture_config.snapshot_root)
-            / f"cs-{self._session_id}-w{revision}-{secrets.token_hex(8)}"
-        )
-        uri, manifest_sha256 = pool.build_synthetic_snapshot(
-            revision,
-            selected,
-            destination,
-            scene_id,
-            camera_name=role.capture_config.camera_name,
-            image_topic=role.capture_config.image_topic,
-            camera_role=role.role,
-            camera_frame_id=role.capture_config.camera_frame_id,
-        )
-        try:
-            validate_snapshot(
-                uri, manifest_sha256, (role.capture_config.snapshot_root,),
-                role.capture_config.snapshot_limits,
-            )
-        except BaseException:
-            self._remove_snapshot(SimpleNamespace(snapshot_uri=uri, role=role))
-            raise
-        record.pool_revision = revision
-        record.pool_size = len(pool.entries)
-        record.pool_selected_indices = [
-            int(entry.global_index) for entry in selected
-        ]
-        record.pool_confidence_summary = pool.confidence_summary(selected)
-        record.snapshot_uri = uri
-        record.manifest_sha256 = manifest_sha256
-        record.scene_id = scene_id
-        record.snapshot_bytes = self._snapshot_bytes_from_uri(uri)
-        self._pool_revision += 1
-        # 只有合成快照完整生成后才允许删除源快照；构建失败保留原物可重试。
-        cleanup_error = self._remove_snapshot(
-            SimpleNamespace(snapshot_uri=original_uri, role=role)
-        )
-        if cleanup_error is not None:
-            self._write_journal(
-                {
-                    "event": "frame_pool_source_cleanup_failed",
-                    "session_id": self._session_id,
-                    "window_index": record.window_index,
-                    "snapshot_uri": original_uri,
-                    "reason": cleanup_error,
-                }
-            )
-        self._write_journal(
-            {
-                "event": "frame_pool_selection",
-                "window_index": record.window_index,
-                "target_frames": record.effective.window_frames,
-                "session_id": self._session_id,
-                "pool_revision": revision,
-                "pool_size": record.pool_size,
-                "pool_epoch": record.pool_epoch,
-                "selected_global_indices": record.pool_selected_indices,
-                "confidence_summary": record.pool_confidence_summary,
-                "synthetic_snapshot_uri": uri,
-            }
-        )
-
-        return True
-
-    def _update_pool_from_outcome(
-        self, record: WindowRecord, outcome
-    ) -> None:
-        predictions_path = self._predictions_path(outcome)
-        if predictions_path is None:
-            self._write_journal(
-                {
-                    "event": "frame_pool_score_update_skipped",
-                    "session_id": self._session_id,
-                    "pool_revision": record.pool_revision,
-                    "reason": "no local predictions.npz",
-                }
-            )
-            return
-        try:
-            with self._pool_lock:
-                if record.pool_epoch != self._map_epoch:
-                    self._write_journal({
-                        "event": "frame_pool_score_update_skipped",
-                        "session_id": self._session_id,
-                        "pool_revision": record.pool_revision,
-                        "reason": "result belongs to an earlier pool epoch",
-                    })
-                    return
-                self._frame_pool().update_from_predictions(
-                    predictions_path,
-                    record.pool_selected_indices,
-                    record.pool_revision,
-                    backend=self._config.reconstruction_backend,
-                )
-        except BaseException as error:
-            self._write_journal(
-                {
-                    "event": "frame_pool_score_update_failed",
-                    "session_id": self._session_id,
-                    "pool_revision": record.pool_revision,
-                    "reason": f"{type(error).__name__}: {error}",
-                }
-            )
-
-
     def _consume_window(
         self, record: WindowRecord, backend: ReconstructionBackend
     ) -> None:
         with self._lock:
             record.reconstruct_attempts += 1
         with self._goal_dispatch_lock:
-            with self._lock:
-                if self._stopping or self._fatal_oom:
-                    self._window_terminal(record, WINDOW_CANCELLED, "stop_all")
-                    return
-            if self._reconstruction_mode == RECONSTRUCTION_MODE_FRAME_POOL:
-                try:
-                    if not self._prepare_pool_reconstruction(record):
-                        return
-                except FramePoolCapacityError as error:
-                    with self._lock:
-                        self._pool_capacity_blocked = True
-                        if not self._stopping:
-                            self._state = SESSION_DISK_PAUSED
-                    self._handle_reconstruct_failure(
-                        record,
-                        "frame pool capacity reached; start a new session: "
-                        f"{error}",
-                    )
-                    return
-                except BaseException as error:
-                    self._handle_reconstruct_failure(
-                        record,
-                        "frame pool prepare failed: "
-                        f"{type(error).__name__}: {error}",
-                    )
-                    return
             with self._lock:
                 if self._stopping or self._fatal_oom:
                     self._window_terminal(record, WINDOW_CANCELLED, "stop_all")
@@ -3504,7 +2649,7 @@ class ContinuousSession:
         record.worker_result_manifest_uri = outcome.result_manifest_uri
         record.worker_result_manifest_sha256 = outcome.result_manifest_sha256
         record.model_frame_ids = self._window_model_frame_ids(record, outcome)
-        alignment = self._align_window(record, outcome)
+        alignment = self._align_window()
         formal_error = self._formalize_window(record, outcome, alignment)
         if formal_error == _FORMAL_SKIPPED_STOPPING:
             with self._lock:
@@ -3513,36 +2658,40 @@ class ContinuousSession:
         if formal_error is not None:
             self._handle_reconstruct_failure(record, formal_error)
             return
-        if self._uses_g4():
-            # Only committed, verified inputs can enter G4. The process scans
-            # complete records and coalesces arrivals while a solve is running.
-            with self._lock:
-                if not self._stopping:
-                    try:
-                        if self._g4_process is not None and self._g4_process.process.poll() is not None:
-                            self._g4_process.close()
-                            self._g4_process = None
-                        if self._g4_process is None:
-                            self._g4_process = G4BackendProcess(self._formal_records_root(), self._session_id,
-                                                                profile=self._backend_profile())
-                    except Exception as error:
-                        self._last_error = "G4 background start failed: " + str(error)
-        if self._uses_shared_A() and not valid_sim3_alignment(alignment):
-            record.alignment = alignment
-            with self._lock:
-                self._formal_windows += 1
-            self._handle_reconstruct_failure(record, "A alignment failed: " + alignment.get("reason", "unknown"))
-            return
-        if (
-            self._reconstruction_mode == RECONSTRUCTION_MODE_FRAME_POOL
-            and record.pool_revision >= 0
-        ):
-            self._update_pool_from_outcome(record, outcome)
+        # Only committed, verified inputs can enter G4. The process scans
+        # complete records and coalesces arrivals while a solve is running.
+        # A map backend that cannot start, or that died, does not stop capture: the
+        # recorded windows can be placed again after landing. It must be loud instead
+        # (diagnostics ERROR, journal), because the window itself still succeeds.
+        with self._lock:
+            if not self._stopping:
+                try:
+                    if self._g4_process is not None and self._g4_process.process.poll() is not None:
+                        exited = self._g4_process.status()
+                        self._write_journal({
+                            "event": "g4_backend_exited",
+                            "session_id": self._session_id,
+                            "window_index": record.window_index,
+                            "exit_code": exited.get("exit_code"),
+                            "error": exited.get("error", ""),
+                        })
+                        self._g4_process.close()
+                        self._g4_process = None
+                    if self._g4_process is None:
+                        self._g4_process = G4BackendProcess(self._formal_records_root(), self._session_id,
+                                                            profile=self._backend_profile())
+                        self._g4_start_error = ""
+                except Exception as error:
+                    self._g4_start_error = f"G4 background start failed: {type(error).__name__}: {error}"
+                    self._last_error = self._g4_start_error
+                    self._write_journal({
+                        "event": "g4_backend_start_failed",
+                        "session_id": self._session_id,
+                        "window_index": record.window_index,
+                        "error": self._g4_start_error,
+                    })
         with self._lock:
             record.alignment = alignment
-            if self._uses_shared_A():
-                self._shared_reference = record.shared_reference_candidate
-                record.shared_reference_candidate = None
             self._last_alignment_state = (
                 COORDINATE_MODEL_LOCAL_UNALIGNED
                 if alignment.get("quality_passed") is False
@@ -3551,7 +2700,6 @@ class ContinuousSession:
             self._succeeded += 1
             self._formal_windows += 1
             self._window_terminal(record, WINDOW_SUCCEEDED, "")
-            keep = record.effective.keep_snapshot_on_success
             self._write_journal(
                 {
                     "event": "window_succeeded",
@@ -3563,6 +2711,7 @@ class ContinuousSession:
                     "config_digest": record.effective.digest(),
                     "formal_result_uri": record.formal_result_uri,
                     "formal_provenance_sha256": record.formal_provenance_sha256,
+                    "missing_pose_frames": record.missing_pose_frames,
                 }
             )
             self._write_journal(
@@ -3578,33 +2727,18 @@ class ContinuousSession:
                     },
                 }
             )
-        if not keep:
-            error = self._remove_snapshot(record)
-            if error is not None:
-                with self._lock:
-                    self._last_error = (
-                        f"window {record.window_index} succeeded but snapshot "
-                        f"cleanup failed: {error}"
-                    )
-        if (
-            self._reconstruction_mode == RECONSTRUCTION_MODE_FRAME_POOL
-            and self._config.expected_result_root
-        ):
-            cleanup = prune_frame_pool_revisions(
-                result_root=self._config.result_root,
-                worker_result_root=self._config.expected_result_root,
-                session_id=self._session_id,
-                keep_revisions=self._config.retention_frame_pool_revisions,
-            )
-            if cleanup["errors"]:
-                with self._lock:
-                    self._last_error = "frame pool retention failed: " + "; ".join(
-                        cleanup["errors"]
-                    )
 
-    def _align_window(self, record: WindowRecord, outcome) -> dict[str, Any]:
-        """Align each window using its odometry, independently of frame overlap."""
-        base = {
+    def _g4_status_locked(self) -> dict[str, Any]:
+        """Map backend status for diagnostics; a failed start reports as an error, not as "waiting"."""
+        if self._g4_process is not None:
+            return self._g4_process.status()
+        if self._g4_start_error:
+            return {"state": "error", "error": self._g4_start_error}
+        return {}
+
+    def _align_window(self) -> dict[str, Any]:
+        """G4 places windows in the background; each window waits for a map revision."""
+        return {
             "coordinate_state": COORDINATE_MODEL_LOCAL_UNALIGNED,
             "map_id": "",
             "scale": None,
@@ -3614,136 +2748,12 @@ class ContinuousSession:
             "correspondence_count": 0,
             "reference_frame_id": "",
             "unreliable": True,
-            "reason": "",
+            "reason": "waiting_for_G4_map_revision",
+            "method": BACKEND_G4,
+            "pending": True,
+            "quality_passed": False,
+            "geometry_accepted": False,
         }
-        if self._reconstruction_mode == RECONSTRUCTION_MODE_FRAME_POOL:
-            base["reason"] = (
-                "frame_pool global reconstruction; per-window odom Sim(3) "
-                "alignment is not applied"
-            )
-            return base
-        predictions_path = self._predictions_path(outcome)
-        odom_reason = ""
-        if self._uses_g4():
-            base.update(method=BACKEND_G4, pending=True, quality_passed=False,
-                        geometry_accepted=False, reason="waiting_for_G4_map_revision")
-            return base
-        if self._uses_shared_A():
-            base["method"] = BACKEND_A
-            base["quality_passed"] = False
-            try:
-                if predictions_path is None:
-                    raise ValueError("missing predictions.npz")
-                snapshot = validate_snapshot(
-                    record.snapshot_uri, record.manifest_sha256,
-                    (record.role.capture_config.snapshot_root,), record.role.capture_config.snapshot_limits,
-                )
-                payload, reference = align_shared_points(
-                    snapshot, predictions_path, model_frame_ids=record.model_frame_ids,
-                    selected_indices=self._selected_frame_indices(outcome),
-                    window_index=record.window_index, capture_generation=record.capture_generation,
-                    map_id=f"{self._session_id}-m0", reference=self._shared_reference,
-                    odom_limits=(self._config.odom_min_baseline_m,
-                                 self._config.odom_max_orientation_residual_deg,
-                                 self._config.odom_max_normalized_residual_rms),
-                    odom_jump_m=self._config.odom_reset_jump_m,
-                )
-                record.shared_reference_candidate = reference
-                return payload
-            except Exception as error:
-                base["reason"] = f"{type(error).__name__}: {error}"
-                return base
-        if (
-            self._config.odom_local_enabled
-            and predictions_path is not None
-        ):
-            try:
-                snapshot = validate_snapshot(
-                    record.snapshot_uri,
-                    record.manifest_sha256,
-                    (record.role.capture_config.snapshot_root,),
-                    record.role.capture_config.snapshot_limits,
-                )
-                odom = align_window(
-                    snapshot,
-                    predictions_path,
-                    min_correspondences=self._config.odom_min_correspondences,
-                    selected_frame_indices=self._selected_frame_indices(outcome),
-                    min_reference_baseline_m=self._config.odom_min_baseline_m,
-                    max_orientation_residual_deg=(
-                        self._config.odom_max_orientation_residual_deg
-                    ),
-                    max_normalized_residual_rms=(
-                        self._config.odom_max_normalized_residual_rms
-                    ),
-                )
-                if odom.coordinate_state == COORDINATE_ODOM_LOCAL_APPROX:
-                    model_frame_ids = tuple(getattr(record, "model_frame_ids", ()))
-                    payload = dict(base)
-                    payload.update(
-                        {
-                            "coordinate_state": odom.coordinate_state,
-                            "method": "odom_pose_constrained_sim3",
-                            "reference_frame_id": odom.reference_frame_id,
-                            "correspondence_count": odom.correspondence_count,
-                            "scale": odom.scale,
-                            "rotation": odom.rotation,
-                            "translation": odom.translation,
-                            "residual_rms": odom.residual_rms,
-                            "normalized_residual_rms": odom.normalized_residual_rms,
-                            "orientation_residual_deg": odom.orientation_residual_deg,
-                            "reference_baseline_m": odom.reference_baseline_m,
-                            "reference_first_position": (
-                                list(odom.reference_first_position)
-                                if odom.reference_first_position is not None
-                                else None
-                            ),
-                            "reference_last_position": (
-                                list(odom.reference_last_position)
-                                if odom.reference_last_position is not None
-                                else None
-                            ),
-                            "reference_first_stamp": (
-                                list(odom.reference_first_stamp)
-                                if odom.reference_first_stamp is not None
-                                else None
-                            ),
-                            "reference_last_stamp": (
-                                list(odom.reference_last_stamp)
-                                if odom.reference_last_stamp is not None
-                                else None
-                            ),
-                            "reference_samples": list(odom.reference_samples),
-                            "metric_scale": True,
-                            "quality_passed": True,
-                            "pending": False,
-                            "unreliable": True,
-                            "merge_frame_indices": [
-                                index
-                                for index, frame_id in enumerate(model_frame_ids)
-                            ],
-                        }
-                    )
-                    payload["overlap_model_frames"] = len(model_frame_ids) - len(
-                        payload["merge_frame_indices"]
-                    )
-                    return payload
-                odom_reason = odom.reason
-            except BaseException as error:
-                odom_reason = f"odom alignment failed: {type(error).__name__}: {error}"
-
-        if not self._config.odom_local_enabled:
-            base["reason"] = "odom_local disabled by profile"
-            return base
-        if predictions_path is None:
-            base["reason"] = "result manifest uri has no local predictions.npz"
-            return base
-        base["reason"] = odom_reason or "odom alignment unavailable"
-        # map epoch 只在真实性门禁通过后推进（见 _formalize_window），
-        # 门禁失败的窗口不得影响后续地图纪元。
-        # 对齐 sidecar 不再写入 worker 已原子提交的结果目录；它随正式记录
-        # 一起发布到 sessions/<session>/window-NNNN/（见 _formalize_window）。
-        return base
 
     def _window_model_frame_ids(self, record: WindowRecord, outcome) -> list[int]:
         if not record.window_frame_ids:
@@ -3857,11 +2867,7 @@ class ContinuousSession:
         expected_identity = {
             "scene_id": record.scene_id,
             "snapshot_manifest_sha256": record.manifest_sha256,
-            "captured_frames": (
-                len(getattr(record, "pool_selected_indices", ()) or ())
-                if getattr(record, "pool_revision", -1) >= 0
-                else record.captured_frames
-            ),
+            "captured_frames": record.captured_frames,
             "camera_role": record.role.role,
             "camera_topic": record.role.capture_config.image_topic,
             "camera_frame_id": record.role.capture_config.camera_frame_id,
@@ -3955,74 +2961,26 @@ class ContinuousSession:
         depth_metrics, depth_metrics_error = self._depth_metrics_window(
             record, outcome
         )
-        planned_epoch = None
-        planned_frame_id = None
-        planned_last_position = None
-        planned_last_stamp = None
         with self._lock:
             session_id = self._session_id
             timeline = [dict(item) for item in self._config_timeline]
             stopping = self._stopping
-            if (
-                not stopping
-                and alignment.get("coordinate_state") == COORDINATE_ODOM_LOCAL_APPROX
-                and alignment.get("quality_passed") is not False
-                and not self._uses_shared_A()
-            ):
-                (
-                    planned_epoch,
-                    planned_frame_id,
-                    planned_last_position,
-                    planned_last_stamp,
-                ) = self._plan_map_epoch_locked(alignment)
-                alignment["map_id"] = f"{session_id}-m{planned_epoch}"
-            model_frame_ids = tuple(getattr(record, "model_frame_ids", ()))
-            if model_frame_ids and valid_sim3_alignment(alignment) and alignment.get("quality_passed") is not False:
-                # A successful inference need not have contributed to this map.
-                prior_ids = set()
-                for candidate in self._windows:
-                    prior = candidate.alignment or {}
-                    if (
-                        candidate is record or candidate.state != WINDOW_SUCCEEDED
-                        or prior.get("map_id") != alignment.get("map_id")
-                        or not valid_sim3_alignment(prior)
-                        or prior.get("quality_passed") is False
-                    ):
-                        continue
-                    indices = prior.get("merge_frame_indices", range(len(candidate.model_frame_ids)))
-                    prior_ids.update(candidate.model_frame_ids[index] for index in indices)
-                alignment["merge_frame_indices"] = [
-                    index for index, frame_id in enumerate(model_frame_ids)
-                    if frame_id not in prior_ids
-                ]
-                alignment["overlap_model_frames"] = len(model_frame_ids) - len(
-                    alignment["merge_frame_indices"]
-                )
         if stopping:
             return _FORMAL_SKIPPED_STOPPING
         checkpoint = payload.get("checkpoint") or {}
         stage_timing = payload.get("stage_timing") or {}
         worker_exit = payload.get("worker_exit") or {}
-        frame_pool_mode = self._reconstruction_mode == RECONSTRUCTION_MODE_FRAME_POOL
-        formal_window_index = (
-            record.pool_revision if frame_pool_mode else record.window_index
-        )
-        formal_frame_count = (
-            len(record.pool_selected_indices)
-            if frame_pool_mode
-            else record.captured_frames
-        )
         provenance = {
             "schema": FORMAL_RECORD_SCHEMA,
             "schema_version": FORMAL_RECORD_SCHEMA_VERSION,
             "session_id": session_id,
-            "window_index": int(formal_window_index),
+            "window_index": int(record.window_index),
             "scene_id": record.scene_id,
             "result_manifest_uri": outcome.result_manifest_uri,
             "result_manifest_sha256": outcome.result_manifest_sha256,
             "snapshot_manifest_uri": record.snapshot_uri,
             "snapshot_manifest_sha256": snapshot_manifest_sha256,
-            "captured_frames": int(formal_frame_count),
+            "captured_frames": int(record.captured_frames),
             "new_frame_count": int(
                 getattr(record, "new_frame_count", record.captured_frames)
             ),
@@ -4060,44 +3018,24 @@ class ContinuousSession:
                 "authenticity_verified": True,
                 "schema_verified": True,
             },
+            # pool_* 与 confidence_summary 属于正式记录格式，per_window 下恒为 None；
+            # 保留这些键，正式记录的格式和字节都不变。
             "reconstruction_mode": self._reconstruction_mode,
-            "pool_revision": (
-                int(record.pool_revision)
-                if frame_pool_mode
-                else None
-            ),
-            "pool_epoch": (
-                int(record.pool_epoch)
-                if frame_pool_mode
-                else None
-            ),
-            "pool_size": (
-                int(record.pool_size)
-                if frame_pool_mode
-                else None
-            ),
-            "pool_selected_indices": (
-                list(record.pool_selected_indices)
-                if frame_pool_mode
-                else None
-            ),
-            "confidence_summary": (
-                dict(record.pool_confidence_summary)
-                if frame_pool_mode
-                else None
-            ),
+            "pool_revision": None,
+            "pool_epoch": None,
+            "pool_size": None,
+            "pool_selected_indices": None,
+            "confidence_summary": None,
             "alignment": alignment,
             "depth_metrics": depth_metrics,
             "depth_metrics_error": depth_metrics_error,
         }
-        if frame_pool_mode:
-            provenance["source_window_index"] = int(record.window_index)
         try:
             self._ensure_formal_session_dir(session_id)
             final_path, provenance_sha256 = self._result_publisher(
                 self._formal_records_root(),
                 session_id,
-                formal_window_index,
+                record.window_index,
                 manifest_bytes,
                 provenance,
                 snapshot_manifest_bytes,
@@ -4109,133 +3047,9 @@ class ContinuousSession:
             )
         if not _valid_sha256(provenance_sha256):
             return "formal record publication returned an invalid provenance sha256"
-        # 只有原子发布成功后才提交地图纪元；发布失败/重试保持同一候选纪元。
-        if planned_epoch is not None:
-            with self._lock:
-                self._apply_map_epoch_locked(
-                    planned_frame_id,
-                    planned_last_position,
-                    planned_last_stamp,
-                    planned_epoch,
-                )
         record.formal_result_uri = str(final_path)
         record.formal_provenance_sha256 = provenance_sha256
         return None
-
-    @staticmethod
-    def _alignment_fields(alignment):
-        """读取 OdomLocalAlignment 或同名字段 dict 的轨迹字段。"""
-        if isinstance(alignment, Mapping):
-            return (
-                alignment.get("reference_frame_id"),
-                alignment.get("reference_first_position"),
-                alignment.get("reference_last_position"),
-                alignment.get("reference_first_stamp"),
-                alignment.get("reference_last_stamp"),
-            )
-        return (
-            alignment.reference_frame_id,
-            alignment.reference_first_position,
-            alignment.reference_last_position,
-            alignment.reference_first_stamp,
-            alignment.reference_last_stamp,
-        )
-
-    def _plan_map_epoch_locked(
-        self, alignment
-    ) -> tuple[int, str, tuple | None, tuple | None]:
-        """计算（不提交）该对齐窗口对应的地图纪元与 odom 状态。
-
-        只读取当前状态；调用方在同一锁内持有快照，发布成功后用
-        ``_apply_map_epoch_locked`` 提交。
-        """
-        (
-            frame_id,
-            first,
-            last,
-            first_stamp,
-            last_stamp,
-        ) = self._alignment_fields(alignment)
-        epoch = self._map_epoch
-        if self._odom_reference_frame_id is None:
-            return epoch, frame_id, last, last_stamp
-        if frame_id != self._odom_reference_frame_id:
-            return epoch + 1, frame_id, last, last_stamp
-        if (
-            first_stamp is not None
-            and self._last_odom_stamp is not None
-            and first_stamp < self._last_odom_stamp
-        ):
-            # A rolling window starts in the past but must advance its end.
-            if last_stamp is None or last_stamp <= self._last_odom_stamp:
-                return epoch + 1, frame_id, last, last_stamp
-            # Compare the same odom timestamp, never two ends of an overlap.
-            samples = alignment.get("reference_samples", ()) if isinstance(alignment, Mapping) else ()
-            first = next((sample["position"] for sample in samples
-                          if tuple(sample["stamp"]) == tuple(self._last_odom_stamp)), None)
-        if first is not None and self._last_odom_position is not None:
-            dx = first[0] - self._last_odom_position[0]
-            dy = first[1] - self._last_odom_position[1]
-            dz = first[2] - self._last_odom_position[2]
-            jump = math.sqrt(dx * dx + dy * dy + dz * dz)
-            if jump > float(self._config.odom_reset_jump_m):
-                return epoch + 1, frame_id, last, last_stamp
-        return epoch, frame_id, last, last_stamp
-
-    def _apply_map_epoch_locked(
-        self,
-        frame_id: str,
-        last_position: tuple | None,
-        last_stamp: tuple | None,
-        epoch: int,
-    ) -> None:
-        self._map_epoch = int(epoch)
-        self._odom_reference_frame_id = frame_id
-        self._last_odom_position = last_position
-        self._last_odom_stamp = last_stamp
-
-    def _advance_map_epoch_locked(self, alignment) -> None:
-        """立即提交该窗口的地图纪元（测试与历史调用路径）。"""
-        epoch, frame_id, last_position, last_stamp = self._plan_map_epoch_locked(
-            alignment
-        )
-        self._apply_map_epoch_locked(
-            frame_id, last_position, last_stamp, epoch
-        )
-
-    def _uses_shared_A(self) -> bool:
-        return (
-            self._config.alignment_backend == BACKEND_A
-            and self._reconstruction_mode == RECONSTRUCTION_MODE_PER_WINDOW
-        )
-
-    def _uses_g4(self) -> bool:
-        return (self._config.alignment_backend == BACKEND_G4
-                and self._reconstruction_mode == RECONSTRUCTION_MODE_PER_WINDOW)
-
-
-    def _pause_shared_failure(self, reason):
-        with self._lock:
-            if self._stopping:
-                return
-            self._alignment_fault = True
-            self._state = SESSION_ALIGNMENT_PAUSED
-            self._last_error = reason
-            client = self._capture_client
-            self._write_journal({
-                "event": "shared_alignment_paused", "session_id": self._session_id,
-                "reason": reason, "recovery": "stop_and_start_new_session",
-            })
-            self._wake_capture.set()
-            self._wake_consume.set()
-        if client is not None:
-            try:
-                accepted = client.pause()
-            except Exception:
-                accepted = False
-            if not accepted:
-                with self._lock:
-                    self._last_error += "; capture pause was not acknowledged; no new goals will start"
 
     @staticmethod
     def _predictions_path(outcome) -> Path | None:
@@ -4256,9 +3070,9 @@ class ContinuousSession:
         """从 result.json 读取每个模型帧对应的 snapshot 帧序号。
 
         Omega 在 frame_count > frame_group_size 时会均匀抽帧，模型帧序号
-        不再等于 snapshot 帧序号；此时对齐必须按 result.json 的
-        ``selected_frames[].index`` 匹配 odometry 参考位置。读取失败或
-        结构不符时返回 None，由 align_window 回退旧行为。
+        不再等于 snapshot 帧序号；此时模型帧必须按 result.json 的
+        ``selected_frames[].index`` 对应回窗口帧。读取失败或
+        结构不符时返回 None，按模型帧序号即快照帧序号处理。
         """
         try:
             if not outcome.result_manifest_uri.startswith("file://"):
@@ -4285,48 +3099,6 @@ class ContinuousSession:
         except BaseException:
             return None
 
-    def _frame_pool_odom_span(self, snapshot) -> dict[str, Any] | None:
-        samples = []
-        for valid, payload in zip(
-            getattr(snapshot, "pose_valid", ()) or (),
-            getattr(snapshot, "odometry_payloads", ()) or (),
-        ):
-            if not valid or not isinstance(payload, dict):
-                continue
-            try:
-                header = payload["header"]
-                frame_id = header["frame_id"]
-                stamp = header["stamp"]
-                position = payload["pose"]["position"]
-                point = tuple(float(position[key]) for key in ("x", "y", "z"))
-                stamp_key = (int(stamp["sec"]), int(stamp["nsec"]))
-            except (KeyError, TypeError, ValueError, OverflowError):
-                continue
-            if not isinstance(frame_id, str) or not frame_id:
-                continue
-            if not all(math.isfinite(value) for value in point):
-                continue
-            samples.append((frame_id, stamp_key, point))
-        if not samples:
-            return None
-        frame_ids = {sample[0] for sample in samples}
-        if len(frame_ids) != 1:
-            raise FramePoolError("odometry reference frame changed within snapshot")
-        for previous, current in zip(samples, samples[1:]):
-            if current[1] < previous[1]:
-                raise FramePoolError("odometry time moved backwards within snapshot")
-            if math.dist(previous[2], current[2]) > float(
-                self._config.odom_reset_jump_m
-            ):
-                raise FramePoolError("odometry position jumped within snapshot")
-        return {
-            "reference_frame_id": samples[0][0],
-            "reference_first_stamp": samples[0][1],
-            "reference_last_stamp": samples[-1][1],
-            "reference_first_position": samples[0][2],
-            "reference_last_position": samples[-1][2],
-        }
-
     def _handle_reconstruct_failure(self, record: WindowRecord, error: str) -> None:
         # attempt_failures 是"失败尝试"总数：每次重建尝试失败各记一次，
         # 与终态 failed_windows（未恢复失败）分开，人工重试不清历史。
@@ -4334,13 +3106,6 @@ class ContinuousSession:
             self._attempt_failures += 1
         oom = bool(_FATAL_OOM_PATTERN.search(error or ""))
         memory_guard = bool(_MEMORY_GUARD_PATTERN.search(error or ""))
-        if self._uses_shared_A() and not self._stopping and not memory_guard and not oom:
-            with self._lock:
-                self._failed += 1
-                record.shared_reference_candidate = None
-                self._window_terminal(record, WINDOW_FAILED, error)
-            self._pause_shared_failure(error)
-            return
         terminal = False
         with self._lock:
             if oom or memory_guard:
@@ -4390,25 +3155,6 @@ class ContinuousSession:
                 record.queued_at_monotonic = self._monotonic()
                 self._fifo.append(record)
                 self._fifo_bytes += record.snapshot_bytes
-                if record.effective.queue_mode == QUEUE_REALTIME_LATEST:
-                    while len(self._fifo) > record.effective.queue_capacity:
-                        dropped = self._fifo.pop(0)
-                        self._fifo_bytes -= dropped.snapshot_bytes
-                        self._remove_snapshot(dropped)
-                        self._dropped += 1
-                        dropped.state = WINDOW_CANCELLED
-                        dropped.error = "retry_overflow"
-                        dropped.done.set()
-                        self._write_journal(
-                            {
-                                "event": "window_dropped",
-                                "session_id": self._session_id,
-                                "window_index": dropped.window_index,
-                                "scene_id": dropped.scene_id,
-                                "config_digest": dropped.effective.digest(),
-                                "reason": dropped.error,
-                            }
-                        )
                 self._last_error = error
                 self._write_journal(
                     {
@@ -4453,7 +3199,7 @@ class ContinuousSession:
         record.done.set()
 
     def _remove_snapshot(self, record: WindowRecord) -> str | None:
-        if self._fatal_oom or (self._uses_shared_A() and self._alignment_fault):
+        if self._fatal_oom:
             # Fault evidence survives STOP. A new session uses a different root.
             return None
         uri = record.snapshot_uri
@@ -4663,11 +3409,7 @@ def _reconstruct_identity_error(
         return (
             f"scene_id mismatch: expected {record.scene_id!r}, got {outcome.scene_id!r}"
         )
-    expected_frame_count = (
-        len(getattr(record, "pool_selected_indices", ()) or ())
-        if getattr(record, "pool_revision", -1) >= 0
-        else record.captured_frames
-    )
+    expected_frame_count = record.captured_frames
     if outcome.frame_count != expected_frame_count:
         return (
             f"reconstruction frame_count {outcome.frame_count} does not match "
@@ -4696,40 +3438,6 @@ def _reconstruct_identity_error(
     return None
 
 
-def cleanup_stale_snapshots(config: ContinuousConfig) -> list[str]:
-    """启动清理：删除所有 scheduler 命名的未完成 snapshot。
-
-    只处理 capture profile snapshot_root 的直接子目录且 basename 匹配
-    当前或旧版 scheduler 命名。返回被删除的路径列表。
-    """
-    if config.alignment_backend in (BACKEND_A, BACKEND_G4):
-        # A preserves failure evidence.
-        return []
-    removed = []
-    seen_roots = set()
-    for role in config.roles:
-        root = Path(role.capture_config.snapshot_root)
-        if root in seen_roots:
-            continue
-        seen_roots.add(root)
-        try:
-            entries = list(root.iterdir())
-        except OSError:
-            continue
-        for entry in entries:
-            if not entry.is_dir() or entry.is_symlink():
-                continue
-            if _SNAPSHOT_DIR_RE.fullmatch(entry.name) is None:
-                continue
-            try:
-                import shutil
-                shutil.rmtree(str(entry))
-                removed.append(str(entry))
-            except OSError:
-                continue
-    return removed
-
-
 __all__ = [
     "ContinuousConfig",
     "ContinuousConfigError",
@@ -4739,9 +3447,9 @@ __all__ = [
     "ReconstructionBackend",
     "SessionStatus",
     "WindowRecord",
-    "cleanup_stale_snapshots",
     "QUEUE_LOSSLESS",
-    "QUEUE_REALTIME_LATEST",
+    "RECONSTRUCTION_MODE_PER_WINDOW",
+    "RECONSTRUCTION_MODES",
     "SESSION_DISK_PAUSED",
     "SESSION_FATAL_OOM",
     "SESSION_MEMORY_PAUSED",

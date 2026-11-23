@@ -38,7 +38,7 @@ On memory-constrained shared machines, wrap compilation with a memory limit (the
 
 ## XFeat (bundle adjustment only)
 
-`pose.refine: ba` matches features with [XFeat](https://github.com/verlab/accelerated_features) in addition to SIFT. XFeat is not a pip dependency: clone it, put the checkout on `PYTHONPATH` so that `modules.xfeat` imports, and point `pose.xfeat_weights` at its `weights/xfeat.pt`. Nothing is downloaded at run time; a missing module or checkpoint is an error.
+`pose.refine: ba` matches features with [XFeat](https://github.com/verlab/accelerated_features) in addition to SIFT. XFeat is not a pip dependency: clone it, set `pose.xfeat_source` to the checkout (or put it on `PYTHONPATH` so that `modules.xfeat` imports), and point `pose.xfeat_weights` at its `weights/xfeat.pt`. Nothing is downloaded at run time; a missing module or checkpoint is an error.
 
 ```bash
 git clone https://github.com/verlab/accelerated_features.git
@@ -47,7 +47,7 @@ export PYTHONPATH="$PWD/accelerated_features${PYTHONPATH:+:$PYTHONPATH}"
 
 ## Separate CPU and GPU phases
 
-External poses (`pose.provider: external`, `pose.refine: none`) with cached depth support CPU-only preparation and fusion, including the phone B0 protocol:
+External poses (`pose.provider: external`, `pose.refine: none`) with cached depth support CPU-only preparation and fusion, including the phone protocol:
 
 ```bash
 recon run --config my_scene.yaml --through fuse

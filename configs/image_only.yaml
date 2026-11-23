@@ -3,7 +3,6 @@ output: ../../outputs/image_only
 pose:
   provider: colmap
   refine: none
-  partial_policy: reject
 depth:
   weights: models/vggt_omega_1b_512.pt
   resolution: [512, 288]

@@ -19,9 +19,6 @@ from drone3d_reconstruction_msgs.srv import (
     ContinuousSessionCommand,
     ContinuousSessionCommandRequest,
     ContinuousSessionCommandResponse,
-    PipelineCommand,
-    PipelineCommandRequest,
-    PipelineCommandResponse,
 )
 
 
@@ -34,9 +31,6 @@ EXPECTED_MD5 = {
     ReconstructSegmentGoal: "65269bb509de2bd867052bce1728a33f",
     ReconstructSegmentResult: "9c3beda22eeda937c0495922aaec17a8",
     ReconstructSegmentFeedback: "57ba911deaf6eba72f2dd820bdd20a33",
-    PipelineCommand: "c0b1c39ddac45a393f2164803eccad9b",
-    PipelineCommandRequest: "91080421a73f3a9a0f283d66f5706a84",
-    PipelineCommandResponse: "2aa2e19a2b792b8741932ace4a0ef171",
     CaptureControl: "89a70d2248cd7b1a759c7e112937236a",
     CaptureControlRequest: "e6f22d5a8a1380fbfa7bd70180298d3e",
     CaptureControlResponse: "fd3a5d5a3847d5970fc4939b8cd70e63",
@@ -69,20 +63,6 @@ class MessageContractTest(unittest.TestCase):
         self.assertEqual(ReconstructSegmentResult.CANCELLED, 6)
         self.assertEqual(ReconstructSegmentResult.INTERNAL_ERROR, 7)
 
-    def test_pipeline_command_constants(self):
-        self.assertEqual(PipelineCommandRequest.SELECT_SOURCE, 0)
-        self.assertEqual(PipelineCommandRequest.START_TASK, 1)
-        self.assertEqual(PipelineCommandRequest.GET_STATUS, 2)
-        self.assertEqual(PipelineCommandRequest.CANCEL_TASK, 3)
-        self.assertEqual(PipelineCommandResponse.OK, 0)
-        self.assertEqual(PipelineCommandResponse.INVALID_COMMAND, 1)
-        self.assertEqual(PipelineCommandResponse.UNKNOWN_ROLE, 2)
-        self.assertEqual(PipelineCommandResponse.BUSY, 3)
-        self.assertEqual(PipelineCommandResponse.NO_TASK, 4)
-        self.assertEqual(PipelineCommandResponse.TASK_FAILED, 5)
-        self.assertEqual(PipelineCommandResponse.INTERNAL_ERROR, 6)
-        self.assertEqual(PipelineCommandResponse.NOT_READY, 7)
-        self.assertEqual(PipelineCommandResponse.INVALID_ARGUMENT, 8)
     def test_capture_control_constants(self):
         self.assertEqual(CaptureControlRequest.PAUSE, 0)
         self.assertEqual(CaptureControlRequest.RESUME, 1)

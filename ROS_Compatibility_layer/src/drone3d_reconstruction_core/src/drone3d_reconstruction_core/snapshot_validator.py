@@ -36,11 +36,9 @@ from urllib.parse import unquote_to_bytes, urlsplit
 
 SNAPSHOT_SCHEMA = "drone3d.reconstruction.snapshot"
 SNAPSHOT_VERSION = 4
-SUPPORTED_SNAPSHOT_VERSIONS = (1, 2, 3, 4)
-# v1 帧表列（最小 RGB 契约）
-_FRAME_COLUMNS_V1 = ("frame_index", "image_path")
-# v2/v3 帧表列（增加 stamp 与姿态关联元数据）
-_FRAME_COLUMNS_V2 = (
+SUPPORTED_SNAPSHOT_VERSIONS = (SNAPSHOT_VERSION,)
+# v4 帧表列（stamp、姿态关联、完整辅助数据文件与关联时间差）
+FRAME_COLUMNS_V4 = (
     "frame_index",
     "image_path",
     "stamp_sec",
@@ -48,20 +46,14 @@ _FRAME_COLUMNS_V2 = (
     "pose_valid",
     "pose_delta_ms",
     "odometry_gap_ms",
-)
-# v4 帧表列（v2/v3 列 + 完整辅助数据文件与关联时间差）
-_FRAME_COLUMNS_V4 = _FRAME_COLUMNS_V2 + (
     "auxiliary_path",
     "camera_info_delta_ms",
     "odometry_delta_ms",
     "depth_path",
     "depth_delta_ms",
 )
-# v1 / v2 / v3 / v4 snapshot.json 的字段集合（必须完全一致，不多不少）
-_V1_METADATA_FIELDS = frozenset(
-    ("schema", "version", "status", "scene_id", "frame_count")
-)
-_V2_METADATA_FIELDS = frozenset(
+# v4 snapshot.json 的字段集合（必须完全一致，不多不少）
+_V4_METADATA_FIELDS = frozenset(
     (
         "schema",
         "version",
@@ -76,15 +68,8 @@ _V2_METADATA_FIELDS = frozenset(
         "last_stamp_nsec",
         "has_camera_info",
         "has_odometry",
-    )
-)
-# v3 = v2 + camera role 契约（role/frame 由 profile 配置，写入不可变快照）
-_V3_METADATA_FIELDS = _V2_METADATA_FIELDS | frozenset(
-    ("camera_role", "camera_frame_id")
-)
-# v4 = v3 + 完整辅助数据契约（CameraInfo/Odometry 全量、TF、对齐深度）
-_V4_METADATA_FIELDS = _V3_METADATA_FIELDS | frozenset(
-    (
+        "camera_role",
+        "camera_frame_id",
         "camera_info_topic",
         "odometry_topic",
         "depth_topic",
@@ -231,8 +216,8 @@ class ValidatedSnapshot:
     """一次成功校验后的不可变快照描述。
 
     所有字段都在校验完成后一次性填充；image_paths 为绝对路径元组，
-    顺序与 frames.csv 一致。v4 增加完整辅助数据（CameraInfo/Odometry/
-    TF/深度）的只读回读契约；v1–v3 的对应字段为 None/空元组。
+    顺序与 frames.csv 一致，含完整辅助数据（CameraInfo/Odometry/TF/深度）的
+    只读回读契约。
     """
 
     canonical_root: Path
@@ -520,7 +505,7 @@ def _optional_milliseconds(value, label):
 
 @dataclass(frozen=True)
 class _SnapshotMeta:
-    """snapshot.json 的解析结果（v1–v4 版本无关表示）。"""
+    """snapshot.json 的解析结果。"""
 
     version: int
     scene_id: str
@@ -580,21 +565,14 @@ def _aux_summary_value(metadata, name):
 def _parse_snapshot_metadata(metadata, limits) -> _SnapshotMeta:
     """解析并校验 snapshot.json 元数据（schema/版本/字段集/场景/帧数…）。"""
     version = metadata["version"]
-    if (
-        isinstance(version, bool)
-        or not isinstance(version, int)
-        or version not in SUPPORTED_SNAPSHOT_VERSIONS
-    ):
-        raise _invalid("UNSUPPORTED_SCHEMA", "snapshot schema version is unsupported")
+    if isinstance(version, bool) or version != SNAPSHOT_VERSION:
+        raise _invalid(
+            "UNSUPPORTED_SCHEMA",
+            f"only snapshot version {SNAPSHOT_VERSION} is supported, got {version!r}",
+        )
     if metadata["schema"] != SNAPSHOT_SCHEMA:
         raise _invalid("UNSUPPORTED_SCHEMA", "snapshot schema identity is unsupported")
-    field_sets = {
-        1: _V1_METADATA_FIELDS,
-        2: _V2_METADATA_FIELDS,
-        3: _V3_METADATA_FIELDS,
-        4: _V4_METADATA_FIELDS,
-    }
-    if set(metadata) != field_sets[version]:
+    if set(metadata) != _V4_METADATA_FIELDS:
         raise _invalid("MALFORMED_SCHEMA", "snapshot.json has unexpected fields")
     if metadata["status"] != "PASS":
         raise _invalid("INVALID_STATUS", "snapshot status must be PASS")
@@ -614,15 +592,6 @@ def _parse_snapshot_metadata(metadata, limits) -> _SnapshotMeta:
         or frame_count > limits.max_frame_count
     ):
         raise _invalid("FRAME_COUNT_LIMIT", "frame_count is not positive and bounded")
-
-    if version == 1:
-        # v1 没有相机/时间戳字段
-        return _SnapshotMeta(
-            version=version, scene_id=scene_id, frame_count=frame_count,
-            camera_name=None, image_topic=None, camera_role=None,
-            camera_frame_id=None, first_stamp=None, last_stamp=None,
-            has_camera_info=None, has_odometry=None,
-        )
 
     camera_name = metadata["camera_name"]
     if (
@@ -646,15 +615,6 @@ def _parse_snapshot_metadata(metadata, limits) -> _SnapshotMeta:
         if type(metadata[name]) is not bool:
             raise _invalid("MALFORMED_SCHEMA", f"{name} must be a bool")
 
-    if version == 2:
-        return _SnapshotMeta(
-            version=version, scene_id=scene_id, frame_count=frame_count,
-            camera_name=camera_name, image_topic=image_topic, camera_role=None,
-            camera_frame_id=None, first_stamp=first_stamp, last_stamp=last_stamp,
-            has_camera_info=metadata["has_camera_info"],
-            has_odometry=metadata["has_odometry"],
-        )
-
     camera_role = metadata["camera_role"]
     if (
         not isinstance(camera_role, str)
@@ -669,17 +629,7 @@ def _parse_snapshot_metadata(metadata, limits) -> _SnapshotMeta:
     ):
         raise _invalid("INVALID_CAMERA_FRAME", "camera_frame_id is unsafe")
 
-    if version == 3:
-        return _SnapshotMeta(
-            version=version, scene_id=scene_id, frame_count=frame_count,
-            camera_name=camera_name, image_topic=image_topic,
-            camera_role=camera_role, camera_frame_id=camera_frame_id,
-            first_stamp=first_stamp, last_stamp=last_stamp,
-            has_camera_info=metadata["has_camera_info"],
-            has_odometry=metadata["has_odometry"],
-        )
-
-    # ---- v4：完整辅助数据契约 ----
+    # ---- 完整辅助数据契约 ----
     for name in ("save_sensor_depth", "has_tf", "has_depth"):
         if type(metadata[name]) is not bool:
             raise _invalid("MALFORMED_SCHEMA", f"{name} must be a bool")
@@ -697,10 +647,6 @@ def _parse_snapshot_metadata(metadata, limits) -> _SnapshotMeta:
         raise _invalid(
             "MALFORMED_SCHEMA", "camera_info_digest requires has_camera_info"
         )
-    if metadata["save_sensor_depth"] and metadata["has_depth"] is False:
-        # 允许开启保存但本窗口没有任何深度帧匹配；这里只要求字段一致性，
-        # 具体匹配数由 auxiliary_summary 表达。
-        pass
     summary = metadata["auxiliary_summary"]
     if not isinstance(summary, dict):
         raise _invalid("MALFORMED_SCHEMA", "auxiliary_summary must be an object")
@@ -773,7 +719,7 @@ def _parse_snapshot_metadata(metadata, limits) -> _SnapshotMeta:
 
 @dataclass(frozen=True)
 class _FrameRows:
-    """frames.csv 的解析结果（v1–v4 版本无关表示）。"""
+    """frames.csv 的解析结果。"""
 
     image_relatives: Tuple[str, ...]
     frame_stamps: Tuple[FrameStamp | None, ...]
@@ -799,15 +745,9 @@ def _optional_relative_path(value, limits, label, prefix):
     return relative.as_posix()
 
 
-def _parse_frame_rows(frames_bytes, limits, version, frame_count) -> _FrameRows:
+def _parse_frame_rows(frames_bytes, limits, frame_count) -> _FrameRows:
     """解析并校验 frames.csv：行数/顺序/stamp 递增/路径唯一且位于 images/ 下。"""
-    if version == 1:
-        columns = _FRAME_COLUMNS_V1
-    elif version in (2, 3):
-        columns = _FRAME_COLUMNS_V2
-    else:
-        columns = _FRAME_COLUMNS_V4
-    frame_rows = _load_csv(frames_bytes, columns, "frames.csv")
+    frame_rows = _load_csv(frames_bytes, FRAME_COLUMNS_V4, "frames.csv")
     if len(frame_rows) != frame_count:
         raise _invalid("FRAME_COUNT_MISMATCH", "frames row count does not match")
     image_relatives = []
@@ -833,18 +773,7 @@ def _parse_frame_rows(frames_bytes, limits, version, frame_count) -> _FrameRows:
             raise _invalid("DUPLICATE_IMAGE", "image paths must be unique")
         seen_images.add(relative_text)
         image_relatives.append(relative_text)
-        if version == 1:
-            frame_stamps.append(None)
-            pose_valid.append(None)
-            pose_delta_ms.append(None)
-            odometry_gap_ms.append(None)
-            auxiliary_paths.append(None)
-            camera_info_delta_ms.append(None)
-            odometry_delta_ms.append(None)
-            depth_paths.append(None)
-            depth_delta_ms.append(None)
-            continue
-        # v2+：stamp 必须是规范无符号整数且严格递增
+        # stamp 必须是规范无符号整数且严格递增
         if (
             not _CANONICAL_UINT.fullmatch(row["stamp_sec"])
             or not _CANONICAL_UINT.fullmatch(row["stamp_nsec"])
@@ -870,57 +799,50 @@ def _parse_frame_rows(frames_bytes, limits, version, frame_count) -> _FrameRows:
             )
         pose_delta_ms.append(delta)
         odometry_gap_ms.append(gap)
-        if version == 4:
-            aux_path = _optional_relative_path(
-                row["auxiliary_path"], limits, "auxiliary_path", "auxiliary"
+        aux_path = _optional_relative_path(
+            row["auxiliary_path"], limits, "auxiliary_path", "auxiliary"
+        )
+        ci_delta = _optional_milliseconds(
+            row["camera_info_delta_ms"], "camera_info_delta_ms"
+        )
+        odom_delta = _optional_milliseconds(
+            row["odometry_delta_ms"], "odometry_delta_ms"
+        )
+        depth_path = _optional_relative_path(
+            row["depth_path"], limits, "depth_path", "depth"
+        )
+        depth_delta = _optional_milliseconds(
+            row["depth_delta_ms"], "depth_delta_ms"
+        )
+        if ci_delta is not None and aux_path is None:
+            raise _invalid(
+                "MALFORMED_FRAMES",
+                "camera_info_delta_ms requires auxiliary_path",
             )
-            ci_delta = _optional_milliseconds(
-                row["camera_info_delta_ms"], "camera_info_delta_ms"
+        if odom_delta is not None and aux_path is None:
+            raise _invalid(
+                "MALFORMED_FRAMES",
+                "odometry_delta_ms requires auxiliary_path",
             )
-            odom_delta = _optional_milliseconds(
-                row["odometry_delta_ms"], "odometry_delta_ms"
+        if (depth_delta is None) != (depth_path is None):
+            raise _invalid(
+                "MALFORMED_FRAMES",
+                "depth_delta_ms must be present iff depth_path is",
             )
-            depth_path = _optional_relative_path(
-                row["depth_path"], limits, "depth_path", "depth"
+        if depth_path is not None and aux_path is None:
+            raise _invalid(
+                "MALFORMED_FRAMES", "depth_path requires auxiliary_path"
             )
-            depth_delta = _optional_milliseconds(
-                row["depth_delta_ms"], "depth_delta_ms"
+        if pose_valid[-1] and odom_delta is None:
+            raise _invalid(
+                "MALFORMED_FRAMES",
+                "valid pose rows must carry odometry_delta_ms",
             )
-            if ci_delta is not None and aux_path is None:
-                raise _invalid(
-                    "MALFORMED_FRAMES",
-                    "camera_info_delta_ms requires auxiliary_path",
-                )
-            if odom_delta is not None and aux_path is None:
-                raise _invalid(
-                    "MALFORMED_FRAMES",
-                    "odometry_delta_ms requires auxiliary_path",
-                )
-            if (depth_delta is None) != (depth_path is None):
-                raise _invalid(
-                    "MALFORMED_FRAMES",
-                    "depth_delta_ms must be present iff depth_path is",
-                )
-            if depth_path is not None and aux_path is None:
-                raise _invalid(
-                    "MALFORMED_FRAMES", "depth_path requires auxiliary_path"
-                )
-            if pose_valid[-1] and odom_delta is None:
-                raise _invalid(
-                    "MALFORMED_FRAMES",
-                    "valid pose rows must carry odometry_delta_ms",
-                )
-            auxiliary_paths.append(aux_path)
-            camera_info_delta_ms.append(ci_delta)
-            odometry_delta_ms.append(odom_delta)
-            depth_paths.append(depth_path)
-            depth_delta_ms.append(depth_delta)
-        else:
-            auxiliary_paths.append(None)
-            camera_info_delta_ms.append(None)
-            odometry_delta_ms.append(None)
-            depth_paths.append(None)
-            depth_delta_ms.append(None)
+        auxiliary_paths.append(aux_path)
+        camera_info_delta_ms.append(ci_delta)
+        odometry_delta_ms.append(odom_delta)
+        depth_paths.append(depth_path)
+        depth_delta_ms.append(depth_delta)
     return _FrameRows(
         image_relatives=tuple(image_relatives),
         frame_stamps=tuple(frame_stamps),
@@ -1258,12 +1180,11 @@ def validate_snapshot(
       1. URI 解码与允许根归属判定（拒绝越界/软链/遍历）；
       2. 限长读取 snapshot.json / frames.csv / files_sha256.csv；
       3. 校验清单摘要与 manifest_sha256 一致；
-      4. 解析元数据（v1/v2）与帧表（stamp 递增、路径唯一）；
+      4. 解析元数据（只支持 v4）与帧表（stamp 递增、路径唯一）；
       5. 校验清单覆盖恰为 {snapshot.json, frames.csv} ∪ 图像路径；
       6. 逐文件核对大小与 SHA-256（读前/读后双重身份检查）。
 
-    v1 是最初的最小 RGB 契约，仍可读；v2 增加逐帧 header stamp 与姿态
-    关联元数据。两个版本都由本函数校验，Action 契约保持不变。
+    采集只写 v4（逐帧辅助数据文件与关联时间差）；更早的 v1–v3 快照会被拒绝。
 
     Args:
         snapshot_uri: 快照根目录的 file:// URI 或绝对路径
@@ -1341,22 +1262,20 @@ def validate_snapshot(
     if not isinstance(metadata, dict):
         raise _invalid("MALFORMED_SCHEMA", "snapshot.json must be an object")
     meta = _parse_snapshot_metadata(metadata, limits)
-    version = meta.version
-    rows = _parse_frame_rows(frames_bytes, limits, version, meta.frame_count)
-    # v2+：帧表端点 stamp 必须与 snapshot.json 的 first/last_stamp 一致
-    if version in (2, 3, 4):
-        first_frame = rows.frame_stamps[0]
-        last_frame = rows.frame_stamps[-1]
-        if (
-            (first_frame.sec, first_frame.nsec)
-            != (meta.first_stamp.sec, meta.first_stamp.nsec)
-            or (last_frame.sec, last_frame.nsec)
-            != (meta.last_stamp.sec, meta.last_stamp.nsec)
-        ):
-            raise _invalid(
-                "STAMP_MISMATCH",
-                "snapshot.json stamps do not match frames.csv endpoints",
-            )
+    rows = _parse_frame_rows(frames_bytes, limits, meta.frame_count)
+    # 帧表端点 stamp 必须与 snapshot.json 的 first/last_stamp 一致
+    first_frame = rows.frame_stamps[0]
+    last_frame = rows.frame_stamps[-1]
+    if (
+        (first_frame.sec, first_frame.nsec)
+        != (meta.first_stamp.sec, meta.first_stamp.nsec)
+        or (last_frame.sec, last_frame.nsec)
+        != (meta.last_stamp.sec, meta.last_stamp.nsec)
+    ):
+        raise _invalid(
+            "STAMP_MISMATCH",
+            "snapshot.json stamps do not match frames.csv endpoints",
+        )
 
     manifest_rows = _load_csv(
         manifest_bytes, ("path", "size", "sha256"), "files_sha256.csv"
@@ -1390,15 +1309,14 @@ def validate_snapshot(
             raise _invalid("TOTAL_SIZE_LIMIT", "manifest total exceeds configured limit")
         manifest[relative] = (size, digest)
 
-    # 清单覆盖必须恰好包含：固定元数据 + 图像 + v4 辅助数据文件
+    # 清单覆盖必须恰好包含：固定元数据 + 图像 + 辅助数据文件
     expected_paths = {"snapshot.json", "frames.csv"}.union(rows.image_relatives)
-    if version == 4:
-        expected_paths.update(
-            path for path in rows.auxiliary_paths if path is not None
-        )
-        expected_paths.update(path for path in rows.depth_paths if path is not None)
-        if meta.has_tf:
-            expected_paths.add("tf.json")
+    expected_paths.update(
+        path for path in rows.auxiliary_paths if path is not None
+    )
+    expected_paths.update(path for path in rows.depth_paths if path is not None)
+    if meta.has_tf:
+        expected_paths.add("tf.json")
     if set(manifest) != expected_paths:
         raise _invalid("MANIFEST_COVERAGE", "manifest coverage is not exact")
 
@@ -1415,52 +1333,51 @@ def validate_snapshot(
     for relative in rows.image_relatives:
         canonical_images.append(canonical_root.joinpath(*PurePosixPath(relative).parts))
 
-    # ---- v4：解析并回读辅助 payload（读前/读后双重身份已由 manifest 保证）----
+    # ---- 解析并回读辅助 payload（读前/读后双重身份已由 manifest 保证）----
     camera_info_payloads = []
     odometry_payloads = []
     depth_metadata = []
     tf_entries = ()
-    if version == 4:
-        for index, aux_path in enumerate(rows.auxiliary_paths):
-            if aux_path is None:
-                camera_info_payloads.append(None)
-                odometry_payloads.append(None)
-                depth_metadata.append(None)
+    for index, aux_path in enumerate(rows.auxiliary_paths):
+        if aux_path is None:
+            camera_info_payloads.append(None)
+            odometry_payloads.append(None)
+            depth_metadata.append(None)
+            continue
+        ci, _ci_delta, odom, _odom_delta, depth_meta = _parse_aux_frame_json(
+            canonical_root,
+            canonical_root.joinpath(*PurePosixPath(aux_path).parts),
+            aux_path,
+            limits,
+            index,
+            rows,
+        )
+        camera_info_payloads.append(ci)
+        odometry_payloads.append(odom)
+        depth_metadata.append(depth_meta)
+    if meta.camera_info_digest is not None:
+        digest = hashlib.sha256()
+        for ci in camera_info_payloads:
+            if ci is None:
                 continue
-            ci, _ci_delta, odom, _odom_delta, depth_meta = _parse_aux_frame_json(
-                canonical_root,
-                canonical_root.joinpath(*PurePosixPath(aux_path).parts),
-                aux_path,
-                limits,
-                index,
-                rows,
+            digest.update(
+                json.dumps(
+                    ci,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
             )
-            camera_info_payloads.append(ci)
-            odometry_payloads.append(odom)
-            depth_metadata.append(depth_meta)
-        if meta.camera_info_digest is not None:
-            digest = hashlib.sha256()
-            for ci in camera_info_payloads:
-                if ci is None:
-                    continue
-                digest.update(
-                    json.dumps(
-                        ci,
-                        ensure_ascii=False,
-                        allow_nan=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ).encode("utf-8")
-                )
-                digest.update(b"\n")
-            if digest.hexdigest() != meta.camera_info_digest:
-                raise _invalid(
-                    "CAMERA_INFO_DIGEST_MISMATCH",
-                    "camera_info_digest does not match saved payloads",
-                )
-        if meta.has_tf:
-            tf_path = canonical_root / "tf.json"
-            tf_entries = _parse_tf_file(canonical_root, tf_path, limits)
+            digest.update(b"\n")
+        if digest.hexdigest() != meta.camera_info_digest:
+            raise _invalid(
+                "CAMERA_INFO_DIGEST_MISMATCH",
+                "camera_info_digest does not match saved payloads",
+            )
+    if meta.has_tf:
+        tf_path = canonical_root / "tf.json"
+        tf_entries = _parse_tf_file(canonical_root, tf_path, limits)
 
     return ValidatedSnapshot(
         canonical_root=canonical_root,
@@ -1469,7 +1386,7 @@ def validate_snapshot(
         image_basenames=tuple(path.name for path in canonical_images),
         frame_count=meta.frame_count,
         manifest_sha256=verified_digest,
-        snapshot_version=version,
+        snapshot_version=meta.version,
         frame_stamps=rows.frame_stamps,
         pose_valid=rows.pose_valid,
         pose_delta_ms=rows.pose_delta_ms,

@@ -12,6 +12,9 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+# The shared v4 snapshot fixture lives next to this file; catkin's nose run does not add this directory.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from snapshot_v4 import write_v4_snapshot  # noqa: E402
 from drone3d_reconstruction_core import (
     JobFinished,
     ResourceBusyError,
@@ -59,119 +62,20 @@ def make_snapshot(
     frame_count=3,
     *,
     duplicate_basenames=False,
+    missing_pose=(),
 ):
+    """A v4 snapshot stamped 100+k s; frames in ``missing_pose`` have no pose."""
+    if duplicate_basenames:
+        relatives = [f"images/{'a' if index == 0 else 'b'}/same.png" for index in range(frame_count)]
+    else:
+        relatives = [f"images/frame_{index:03d}.png" for index in range(frame_count)]
     scene = snapshots_root / scene_id
-    (scene / "images").mkdir(parents=True, exist_ok=True)
-    image_relatives = []
-    for index in range(frame_count):
-        if duplicate_basenames:
-            directory = "a" if index == 0 else "b"
-            (scene / "images" / directory).mkdir(exist_ok=True)
-            relative = f"images/{directory}/same.png"
-        else:
-            relative = f"images/frame_{index:03d}.png"
-        path = scene.joinpath(*Path(relative).parts)
-        path.write_bytes(f"image-{scene_id}-{index}".encode("utf-8"))
-        image_relatives.append(relative)
-
-    snapshot_bytes = json.dumps(
-        {
-            "schema": "drone3d.reconstruction.snapshot",
-            "version": 1,
-            "status": "PASS",
-            "scene_id": scene_id,
-            "frame_count": frame_count,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    (scene / "snapshot.json").write_bytes(snapshot_bytes)
-
-    frame_lines = ["frame_index,image_path"]
-    for index, relative in enumerate(image_relatives):
-        frame_lines.append(f"{index},{relative}")
-    frames_bytes = ("\n".join(frame_lines) + "\n").encode("utf-8")
-    (scene / "frames.csv").write_bytes(frames_bytes)
-
-    manifest_rows = {
-        "snapshot.json": snapshot_bytes,
-        "frames.csv": frames_bytes,
-    }
-    for relative in image_relatives:
-        manifest_rows[relative] = (
-            scene.joinpath(*Path(relative).parts).read_bytes()
-        )
-    lines = ["path,size,sha256"]
-    for relative in sorted(manifest_rows):
-        data = manifest_rows[relative]
-        lines.append(f"{relative},{len(data)},{sha256_bytes(data)}")
-    manifest_bytes = ("\n".join(lines) + "\n").encode("utf-8")
-    (scene / "files_sha256.csv").write_bytes(manifest_bytes)
-    return str(scene), sha256_bytes(manifest_bytes)
-
-
-def make_snapshot_v2(
-    snapshots_root,
-    scene_id="scene-v2",
-    frame_count=3,
-):
-    scene = snapshots_root / scene_id
-    (scene / "images").mkdir(parents=True, exist_ok=True)
-    image_relatives = []
-    for index in range(frame_count):
-        relative = f"images/frame_{index:03d}.png"
-        path = scene.joinpath(*Path(relative).parts)
-        path.write_bytes(f"image-{scene_id}-{index}".encode("utf-8"))
-        image_relatives.append(relative)
-    stamp_secs = [100 + index for index in range(frame_count)]
-    snapshot_bytes = json.dumps(
-        {
-            "schema": "drone3d.reconstruction.snapshot",
-            "version": 2,
-            "status": "PASS",
-            "scene_id": scene_id,
-            "frame_count": frame_count,
-            "camera_name": "camera4",
-            "image_topic": "/camera4/image_raw",
-            "first_stamp_sec": stamp_secs[0],
-            "first_stamp_nsec": 0,
-            "last_stamp_sec": stamp_secs[-1],
-            "last_stamp_nsec": 0,
-            "has_camera_info": False,
-            "has_odometry": True,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    (scene / "snapshot.json").write_bytes(snapshot_bytes)
-    frame_lines = [
-        "frame_index,image_path,stamp_sec,stamp_nsec,pose_valid,"
-        "pose_delta_ms,odometry_gap_ms"
-    ]
-    for index, relative in enumerate(image_relatives):
-        frame_lines.append(
-            f"{index},{relative},{stamp_secs[index]},0,"
-            f"{'true' if index != 2 else 'false'},"
-            f"{'10.0' if index != 2 else '-1'},"
-            f"{'0.0' if index != 2 else '250.0'}"
-        )
-    frames_bytes = ("\n".join(frame_lines) + "\n").encode("utf-8")
-    (scene / "frames.csv").write_bytes(frames_bytes)
-    manifest_rows = {
-        "snapshot.json": snapshot_bytes,
-        "frames.csv": frames_bytes,
-    }
-    for relative in image_relatives:
-        manifest_rows[relative] = (
-            scene.joinpath(*Path(relative).parts).read_bytes()
-        )
-    lines = ["path,size,sha256"]
-    for relative in sorted(manifest_rows):
-        data = manifest_rows[relative]
-        lines.append(f"{relative},{len(data)},{sha256_bytes(data)}")
-    manifest_bytes = ("\n".join(lines) + "\n").encode("utf-8")
-    (scene / "files_sha256.csv").write_bytes(manifest_bytes)
-    return str(scene), hashlib.sha256(manifest_bytes).hexdigest()
+    digest = write_v4_snapshot(
+        scene, scene_id, frame_count, first_stamp_sec=100, camera_name="camera4",
+        image_topic="/camera4/image_raw", image_paths=relatives, missing_pose=missing_pose,
+        image_bytes=lambda index: f"image-{scene_id}-{index}".encode("utf-8"),
+    )
+    return str(scene), digest
 
 
 def make_fake_validator(behavior="success", probe_path=None, frame_count_from_argv=True):
@@ -302,7 +206,6 @@ class ProductionTestBase(unittest.TestCase):
             conf_thres=50.0,
             max_points_k=5,
             profile_name="local_docker_test_candidate",
-            required_device_sku="docker_test_candidate",
             algorithm_revision="test-algorithm-revision",
             ros_revision="test-ros-revision",
         )
@@ -389,9 +292,6 @@ class ProductionConfigTest(ProductionTestBase):
             {"require_glb": 1},
             {"show_cameras": 0},
             {"profile_name": "bad name"},
-            {"required_device_sku": ""},
-            {"required_device_sku": "bad sku"},
-            {"required_device_sku": True},
             {"algorithm_revision": ""},
             {"ros_revision": None},
             {"allowed_snapshot_roots": ()},
@@ -770,15 +670,15 @@ class CompletionVerifierTest(ProductionTestBase):
         self.assertEqual(payload["snapshot"]["frame_count"], 3)
         self.assertRegex(payload["snapshot"]["sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(payload["actual_frame_count"], 3)
-        self.assertFalse(payload["frame_stamps_available"])
+        self.assertTrue(payload["frame_stamps_available"])
         self.assertEqual(payload["selected_frames"][0]["basename"], "frame_000.png")
-        self.assertIsNone(payload["selected_frames"][0]["stamp"])
+        self.assertEqual(payload["selected_frames"][0]["stamp"], {"sec": 100, "nsec": 0})
         self.assertEqual(payload["image_geometry"], {"width": 4, "height": 4})
         self.assertEqual(payload["checkpoint"]["sha256"], config.checkpoint_sha256)
         self.assertEqual(payload["algorithm_revision"], "test-algorithm-revision")
         self.assertEqual(payload["ros_revision"], "test-ros-revision")
         self.assertEqual(payload["profile"]["name"], "local_docker_test_candidate")
-        self.assertEqual(payload["profile"]["required_device_sku"], "docker_test_candidate")
+        self.assertNotIn("required_device_sku", payload["profile"])
         self.assertEqual(payload["profile"]["frame_group_size"], 3)
         self.assertEqual(payload["worker_exit"], {"cause": "worker_exit", "returncode": 0})
         self.assertEqual(payload["stage_timing"]["worker_wall_time_sec"], 2.5)
@@ -834,10 +734,10 @@ class CompletionVerifierTest(ProductionTestBase):
         self.assertIn("max_result_total_bytes", str(context.exception))
         self.assertFalse(prepared.result_transaction.committed)
 
-    def test_v2_snapshot_stamp_pose_metadata_reaches_result_json(self):
+    def test_snapshot_stamp_pose_metadata_reaches_result_json(self):
         config = self.make_config(frame_group_size=3)
-        snapshot_uri, manifest_sha256 = make_snapshot_v2(
-            self.snapshots_root, frame_count=3
+        snapshot_uri, manifest_sha256 = make_snapshot(
+            self.snapshots_root, "scene-v2", frame_count=3, missing_pose=(2,)
         )
         planner = self.make_planner(config)
         prepared = planner(self.make_goal(snapshot_uri, manifest_sha256))
@@ -850,7 +750,7 @@ class CompletionVerifierTest(ProductionTestBase):
         verifier(JobFinished("worker_exit", 0, 1.0, 1), threading.Event())
         payload = json.loads((staging / "result.json").read_text())
         self.assertTrue(payload["frame_stamps_available"])
-        self.assertEqual(payload["snapshot"]["schema_version"], 2)
+        self.assertEqual(payload["snapshot"]["schema_version"], 4)
         self.assertEqual(payload["snapshot"]["camera_name"], "camera4")
         self.assertEqual(
             payload["snapshot"]["first_stamp"], {"sec": 100, "nsec": 0}
@@ -865,10 +765,10 @@ class CompletionVerifierTest(ProductionTestBase):
             [True, True, False],
         )
 
-    def test_v2_subsampled_snapshot_keeps_original_stamp_identity(self):
+    def test_subsampled_snapshot_keeps_original_stamp_identity(self):
         config = self.make_config(frame_group_size=2)
-        snapshot_uri, manifest_sha256 = make_snapshot_v2(
-            self.snapshots_root, frame_count=3
+        snapshot_uri, manifest_sha256 = make_snapshot(
+            self.snapshots_root, "scene-v2", frame_count=3, missing_pose=(2,)
         )
         planner = self.make_planner(config)
         prepared = planner(self.make_goal(snapshot_uri, manifest_sha256))

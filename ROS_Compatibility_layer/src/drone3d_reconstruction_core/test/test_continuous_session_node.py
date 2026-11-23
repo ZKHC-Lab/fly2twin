@@ -18,7 +18,6 @@ from drone3d_reconstruction_core.continuous_session import (
     JOB_RUNNING,
     JOB_SUCCEEDED,
     QUEUE_LOSSLESS,
-    QUEUE_REALTIME_LATEST,
     ContinuousConfigError,
     SESSION_FATAL_OOM,
     SESSION_RUNNING,
@@ -125,7 +124,7 @@ class FakeCaptureClient:
         pass
 
     def outcome(self):
-        from drone3d_reconstruction_core.pipeline_service import (
+        from drone3d_reconstruction_core.action_types import (
             ACTION_FAILED,
             CaptureActionOutcome,
         )
@@ -202,6 +201,7 @@ class ContinuousSessionNodeTest(unittest.TestCase):
                 "max_scene_id_bytes": 128,
                 "max_relative_path_bytes": 1024,
             },
+            "odometry_association": "interpolate",
             "action_name": f"/{role}/capture_segment",
         }
 
@@ -215,7 +215,7 @@ class ContinuousSessionNodeTest(unittest.TestCase):
                 "front": self._capture_entry("front"),
                 "down": self._capture_entry("down"),
             },
-            "alignment_backend": "odom_pose_constrained_sim3",
+            "alignment_backend": "global_g4",
             "reconstruct_action": "/reconstruct/reconstruct_segment",
             "service_name": "/continuous_session/command",
             "diagnostics_topic": "/diagnostics",
@@ -227,14 +227,15 @@ class ContinuousSessionNodeTest(unittest.TestCase):
             "capture_wait_margin_sec": 1.0,
             "reconstruct_wait_timeout_sec": 5.0,
             "stop_timeout_sec": 2.0,
-            "reconstruct_frame_group_size": 8,
+            "reconstruct_frame_group_size": 6,
             "initial_sample_fps": 1.0,
-            "initial_window_frames": 2,
+            "initial_window_frames": 6,
+            "initial_overlap_frames": 5,
             "initial_queue_mode": QUEUE_LOSSLESS,
             "initial_queue_capacity": 8,
             "initial_max_retries": 0,
-            "initial_keep_snapshot_on_success": False,
-            "initial_inference_resolution": 0,
+            "initial_keep_snapshot_on_success": True,
+            "initial_inference_resolution": 384,
             "initial_worker_timeout_sec": 0.0,
             "expected_reconstruction": {
                 "checkpoint_sha256": "b" * 64,
@@ -243,32 +244,30 @@ class ContinuousSessionNodeTest(unittest.TestCase):
                 "algorithm_revision": "algo-test",
                 "ros_revision": "ros-test",
                 "worker_python": "/usr/bin/python3",
+                "image_resolution": 384,
+                "aggregator_frame_chunk_size": 10,
+                "load_mode": "max_size",
+                "frame_group_size": 6,
             },
         }
 
-    def make_long_window_params(self):
-        """真实 long_window 两份 YAML 对应的节点参数（120 = 100 新增 + 20 共享）。"""
+    def make_large_window_params(self):
+        """100 帧窗（含 20 帧共享）的节点参数。"""
         params = self.make_params()
         params.update({
             "alignment_backend": "global_g4",
-            "reconstruct_frame_group_size": 120,
+            "reconstruct_frame_group_size": 100,
             "initial_window_frames": 100,
             "initial_overlap_frames": 20,
             "initial_inference_resolution": 384,
             "initial_keep_snapshot_on_success": True,
-            "window_frame_semantics": "new_frames",
-            "minimum_total_frames": 100,
-            "window_plan_path": "/plans/candidate_windows.json",
-            "fit_exclusion_source": "/plans/retained_observations.json",
-            "threshold_table_path": "/plans/seams.json",
-            "threshold_group": "G0",
         })
         params["expected_reconstruction"].update({
             "backend": "omega",
             "image_resolution": 384,
             "aggregator_frame_chunk_size": 10,
             "load_mode": "max_size",
-            "frame_group_size": 120,
+            "frame_group_size": 100,
         })
         for entry in params["roles"].values():
             entry["max_goal_frames"] = 128
@@ -277,23 +276,28 @@ class ContinuousSessionNodeTest(unittest.TestCase):
             entry["snapshot_limits"] = dict(entry["snapshot_limits"], max_frame_count=128)
         return params
 
-    def test_long_window_profile_keeps_grouping_fields(self):
-        config = load_continuous_config(self.make_long_window_params())
-        self.assertEqual(config.window_frame_semantics, "new_frames")
-        self.assertEqual(config.minimum_total_frames, 100)
-        self.assertEqual(config.window_plan_path, "/plans/candidate_windows.json")
-        self.assertEqual(config.fit_exclusion_source, "/plans/retained_observations.json")
-        self.assertEqual(config.threshold_table_path, "/plans/seams.json")
-        self.assertEqual(config.threshold_group, "G0")
-        self.assertEqual(config.initial_window_frames, 100)
-        self.assertEqual(config.initial_overlap_frames, 20)
-        self.assertEqual(config.reconstruct_frame_group_size, 120)
+    def test_removed_grouping_keys_are_ignored_when_neutral_and_rejected_otherwise(self):
+        neutral = {"window_frame_semantics": "total_frames", "minimum_total_frames": 100,
+                   "window_plan_path": "", "fit_exclusion_source": "",
+                   "threshold_table_path": "", "threshold_group": ""}
+        params = self.make_large_window_params()
+        reference = load_continuous_config(params)
+        self.assertEqual(load_continuous_config(dict(params, **neutral)), reference)
+        for key, value in (("window_frame_semantics", "new_frames"),
+                           ("window_plan_path", "/plans/candidate_windows.json"),
+                           ("fit_exclusion_source", "/plans/retained_observations.json"),
+                           ("threshold_table_path", "/plans/seams.json"),
+                           ("threshold_group", "G0")):
+            with self.subTest(key=key), self.assertRaisesRegex(
+                ContinuousNodeConfigError, "removed feature"
+            ):
+                load_continuous_config(dict(params, **{key: value}))
 
     def test_frame_pose_placement_params_reach_the_session_config(self):
         import copy
-        params = self.make_long_window_params()
+        params = self.make_large_window_params()
         default = load_continuous_config(copy.deepcopy(params))
-        self.assertEqual(default.g4_placement, "graph")
+        self.assertEqual(default.g4_placement, "frame_pose")
         self.assertEqual(default.pose_time_offset_ms, 0.0)
         self.assertIsNone(default.camera_intrinsics)
         params.update({"g4_placement": "frame_pose", "pose_time_offset_ms": 70,
@@ -305,6 +309,9 @@ class ContinuousSessionNodeTest(unittest.TestCase):
         self.assertEqual(config.camera_intrinsics["fy"], 604.0)
         params["camera_intrinsics"] = "604,604,319,247"
         with self.assertRaisesRegex(Exception, "camera_intrinsics"):
+            load_continuous_config(params)
+        params.update(camera_intrinsics=None, g4_placement="graph")
+        with self.assertRaisesRegex(Exception, "graph placement was removed"):
             load_continuous_config(params)
 
     def test_total_frames_profile_still_requires_matching_group_size(self):
@@ -324,8 +331,7 @@ class ContinuousSessionNodeTest(unittest.TestCase):
             "image_resolution": 384, "aggregator_frame_chunk_size": 10,
             "load_mode": "max_size", "frame_group_size": 16,
         })
-        config = load_continuous_config(params)
-        self.assertEqual(config.window_frame_semantics, "total_frames")
+        load_continuous_config(params)
         params["expected_reconstruction"]["frame_group_size"] = 8
         with self.assertRaises(ContinuousNodeConfigError):
             load_continuous_config(params)
@@ -350,15 +356,10 @@ class ContinuousSessionNodeTest(unittest.TestCase):
     def test_load_continuous_config(self):
         config = load_continuous_config(self.make_params())
         self.assertEqual({role.role for role in config.roles}, {"front", "down"})
-        self.assertEqual(config.reconstruct_frame_group_size, 8)
-        self.assertEqual(config.initial_window_frames, 2)
-        self.assertEqual(config.initial_overlap_frames, 0)
-        self.assertTrue(config.odom_local_enabled)
-        self.assertEqual(config.odom_min_correspondences, 4)
-        self.assertEqual(config.odom_min_baseline_m, 0.1)
-        self.assertEqual(config.odom_max_orientation_residual_deg, 15.0)
-        self.assertEqual(config.odom_max_normalized_residual_rms, 0.25)
-        self.assertEqual(config.odom_reset_jump_m, 5.0)
+        self.assertEqual(config.reconstruct_frame_group_size, 6)
+        self.assertEqual(config.initial_window_frames, 6)
+        self.assertEqual(config.initial_overlap_frames, 5)
+        self.assertEqual(config.alignment_backend, "global_g4")
         self.assertEqual(config.expected_checkpoint_sha256, "b" * 64)
         self.assertEqual(config.expected_checkpoint_path, "/checkpoint/model.pt")
         self.assertEqual(
@@ -367,11 +368,8 @@ class ContinuousSessionNodeTest(unittest.TestCase):
         self.assertEqual(config.expected_algorithm_revision, "algo-test")
         self.assertEqual(config.expected_ros_revision, "ros-test")
         self.assertEqual(config.worker_python, "/usr/bin/python3")
-        self.assertEqual(config.initial_inference_resolution, 0)
+        self.assertEqual(config.initial_inference_resolution, 384)
         self.assertEqual(config.initial_worker_timeout_sec, 0.0)
-        self.assertEqual(config.retention_max_sessions, 3)
-        self.assertEqual(config.retention_frame_pool_revisions, 2)
-        self.assertEqual(config.retention_orphan_grace_sec, 86400.0)
 
 
 
@@ -391,29 +389,25 @@ class ContinuousSessionNodeTest(unittest.TestCase):
         with self.assertRaises((ContinuousNodeConfigError, ContinuousConfigError)):
             load_continuous_config(params)
 
-    def test_load_continuous_config_rejects_invalid_odom_params(self):
+    def test_alignment_backend_other_than_g4_is_a_config_error(self):
+        base = self.make_params()
+        for backend in ("odom_pose_constrained_sim3", "shared_point_sim3_A"):
+            params = dict(base, alignment_backend=backend)
+            with self.subTest(backend=backend), self.assertRaisesRegex(
+                ContinuousNodeConfigError, "alignment_backend must be 'global_g4'"
+            ):
+                load_continuous_config(params)
+
+    def test_load_continuous_config_rejects_invalid_params(self):
         invalid = [
-            {"odom_local_enabled": "yes"},
-            {"odom_local_enabled": 1},
-            {"odom_min_correspondences": True},
-            {"odom_min_correspondences": 4.0},
-            {"odom_min_correspondences": 3},
-            {"odom_min_baseline_m": 0.0},
-            {"odom_max_orientation_residual_deg": 181.0},
-            {"odom_max_normalized_residual_rms": float("nan")},
-            {"odom_reset_jump_m": True},
-            {"odom_reset_jump_m": "5"},
-            {"odom_reset_jump_m": float("nan")},
-            {"odom_reset_jump_m": -1.0},
+            {"initial_queue_mode": "realtime_latest"},
+            {"initial_keep_snapshot_on_success": False},
+            {"initial_overlap_frames": 0},
             {"initial_inference_resolution": True},
             {"initial_inference_resolution": 31},
             {"initial_inference_resolution": 4097},
             {"initial_worker_timeout_sec": True},
             {"initial_worker_timeout_sec": -1.0},
-            {"retention_max_sessions": 0},
-            {"retention_frame_pool_revisions": True},
-            {"retention_orphan_grace_sec": -1.0},
-            {"retention_orphan_grace_sec": float("inf")},
         ]
         base = self.make_params()
         for patch in invalid:
@@ -429,8 +423,6 @@ class ContinuousSessionNodeTest(unittest.TestCase):
         service_holder = []
         params = self.make_params()
         params["roles"]["front"]["depth_topic"] = "/front/depth"
-        # 滑窗模式要求推理分辨率在会话内固定；从会话开始就冻结为 256。
-        params["initial_inference_resolution"] = 256
         node = ContinuousSessionNode(
             params,
             service_factory=lambda *a, **k: service_holder.append(
@@ -457,66 +449,20 @@ class ContinuousSessionNodeTest(unittest.TestCase):
         self.assertEqual(response.error_code, ContinuousSessionCommandResponse.OK)
         self.assertEqual(response.state, SESSION_RUNNING)
         mode_change = ContinuousSessionCommandRequest(
-            command=ContinuousSessionCommandRequest.SET_PARAMS, reconstruction_mode="frame_pool"
+            command=ContinuousSessionCommandRequest.SET_PARAMS, reconstruction_mode="per_window"
         )
         response = service.callback(mode_change)
         self.assertEqual(response.error_code, ContinuousSessionCommandResponse.INVALID_ARGUMENT)
         self.assertEqual(response.effective_reconstruction_mode, "per_window")
-        resolution = ContinuousSessionCommandRequest(
-            command=ContinuousSessionCommandRequest.SET_PARAMS,
-            inference_resolution=256,
-            set_inference_resolution=True,
-        )
-        response = service.callback(resolution)
-        self.assertEqual(response.error_code, ContinuousSessionCommandResponse.OK)
         tune = ContinuousSessionCommandRequest(
-            command=ContinuousSessionCommandRequest.SET_PARAMS,
-            sample_fps=10.0,
-            window_frames=3,
-            overlap_frames=1,
-            set_overlap_frames=True,
-            queue_mode=QUEUE_REALTIME_LATEST,
-            queue_capacity=2,
-            max_retries=1,
-            set_max_retries=True,
-            keep_snapshot_on_success=False,
-            set_keep_snapshot=False,
-            save_sensor_depth=True,
-            set_save_sensor_depth=True,
-            worker_timeout_sec=60.0,
-            set_worker_timeout=True,
+            command=ContinuousSessionCommandRequest.SET_PARAMS, sample_fps=10.0, window_frames=3,
         )
         response = service.callback(tune)
-        self.assertEqual(response.error_code, ContinuousSessionCommandResponse.OK)
-        self.assertEqual(response.effective_sample_fps, 10.0)
-        self.assertEqual(response.effective_window_frames, 3)
-        self.assertEqual(response.effective_overlap_frames, 1)
-        self.assertEqual(response.effective_queue_mode, QUEUE_REALTIME_LATEST)
-        self.assertEqual(response.effective_queue_capacity, 2)
-        self.assertEqual(response.effective_max_retries, 1)
-        self.assertFalse(response.effective_keep_snapshot_on_success)
-        self.assertTrue(response.effective_save_sensor_depth)
-        self.assertEqual(response.effective_inference_resolution, 256)
-        self.assertEqual(response.effective_worker_timeout_sec, 60.0)
-        explicit_zero = ContinuousSessionCommandRequest(
-            command=ContinuousSessionCommandRequest.SET_PARAMS,
-            max_retries=0,
-            set_max_retries=True,
-            keep_snapshot_on_success=False,
-            set_keep_snapshot=True,
-        )
-        response = service.callback(explicit_zero)
-        self.assertEqual(response.error_code, ContinuousSessionCommandResponse.OK)
-        self.assertEqual(response.effective_max_retries, 0)
-        self.assertFalse(response.effective_keep_snapshot_on_success)
-        invalid = ContinuousSessionCommandRequest(
-            command=ContinuousSessionCommandRequest.SET_PARAMS, window_frames=9
-        )
-        response = service.callback(invalid)
-        self.assertEqual(
-            response.error_code, ContinuousSessionCommandResponse.INVALID_ARGUMENT
-        )
-        self.assertEqual(response.effective_window_frames, 3)
+        self.assertEqual(response.error_code, ContinuousSessionCommandResponse.INVALID_ARGUMENT)
+        self.assertIn("session parameters are fixed", response.message)
+        self.assertEqual(response.state, SESSION_RUNNING)
+        self.assertEqual(response.effective_sample_fps, 1.0)
+        self.assertEqual(response.effective_window_frames, 6)
         status = ContinuousSessionCommandRequest(
             command=ContinuousSessionCommandRequest.GET_STATUS
         )
@@ -601,11 +547,13 @@ class ContinuousDiagnosticsAssemblyTest(unittest.TestCase):
                 self.assertEqual(worker["failed_windows"], str(failures))
                 self.assertEqual(worker["attempt_failures"], "1")
                 self.assertEqual(worker["manual_retries"], str(int(not paused)))
-                capture = {item.key: item.value for item in
-                           statuses["drone3d/session/capture"].values}
-                self.assertEqual(capture["g4_exit_code"], "-9")
+                map_backend = statuses["drone3d/session/map_backend"]
+                self.assertEqual(
+                    {item.key: item.value for item in map_backend.values}["g4_exit_code"], "-9"
+                )
+                self.assertEqual(map_backend.level, DiagnosticStatus.ERROR)
 
-    def test_idle_snapshot_assembles_four_statuses(self):
+    def test_idle_snapshot_assembles_five_statuses(self):
         message = assemble_continuous_diagnostics(
             core_snapshot={
                 "state": "IDLE",
@@ -638,10 +586,36 @@ class ContinuousDiagnosticsAssemblyTest(unittest.TestCase):
             {
                 "drone3d/session/server",
                 "drone3d/session/capture",
+                "drone3d/session/map_backend",
                 "drone3d/session/fifo",
                 "drone3d/session/worker",
             },
         )
+
+    def test_map_backend_status_is_error_only_when_the_backend_failed(self):
+        ok, error = DiagnosticStatus.OK, DiagnosticStatus.ERROR
+        cases = (
+            ({}, ok, "waiting"),                      # 还没有成功的窗口，后台未启动
+            ({"state": "optimizing", "revision": 2}, ok, "optimizing"),
+            ({"state": "ready", "revision": 3}, ok, "ready"),
+            ({"state": "stopped", "exit_code": 0}, ok, "stopped"),
+            # 进程没起来、求解抛错、进程异常退出：都必须是 ERROR，并带上原因。
+            ({"state": "error", "error": "G4 background start failed: OSError: x"}, error,
+             "G4 background start failed: OSError: x"),
+            ({"state": "error", "error": "ValueError: bad window"}, error, "ValueError: bad window"),
+            ({"state": "error", "exit_code": -9}, error, "state error"),
+        )
+        for g4, level, text in cases:
+            with self.subTest(g4=g4):
+                message = assemble_continuous_diagnostics(
+                    core_snapshot={"state": "RUNNING", "effective": {}, "fifo": [], "g4": g4},
+                    config=None, not_ready_error=None,
+                )
+                statuses = {item.name: item for item in message.status}
+                status = statuses["drone3d/session/map_backend"]
+                self.assertEqual((status.level, status.message), (level, text))
+                # 地图后端出错不改变会话其它状态项的等级：采集和重建照常。
+                self.assertEqual(statuses["drone3d/session/capture"].level, ok)
 
     def test_fatal_oom_snapshot_marks_server_error(self):
         message = assemble_continuous_diagnostics(
@@ -684,7 +658,6 @@ class ContinuousDiagnosticsAssemblyTest(unittest.TestCase):
         server_keys = {
             item.key for item in statuses["drone3d/session/server"].values
         }
-        self.assertIn("map_epoch", server_keys)
         self.assertIn("last_alignment_state", server_keys)
 
     def test_min_free_disk_fails_closed_when_all_roots_unreadable(self):

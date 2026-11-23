@@ -4,6 +4,8 @@
 # Verified start order on the Orin NX 16GB bench host (Ubuntu 20.04 / ROS Noetic):
 #   roscore -> livox MID360 -> FAST-LIO -> Realsense -> body->camera TF
 #   -> production stack (capture + reconstruct + continuous session + web)
+# The production stack runs the mainline frame_pose placement from the
+# tools/nx_bench profiles; that profile has not been run on the NX yet.
 #
 # With --external-odom TOPIC the FAST-LIO step is replaced by an externally
 # published nav_msgs/Odometry topic: our FAST-LIO is never started and the
@@ -305,7 +307,7 @@ start_body_camera_tf() {
     tf_ok && { say "body->camera TF ready"; return 0; }
     sleep 2
   done
-  die "body->camera TF not connected; window alignment will fall back to MODEL_LOCAL_UNALIGNED"
+  die "body->camera TF not connected; frame_pose cannot place frames without the body->camera extrinsic"
 }
 
 production_running() {

@@ -1,5 +1,6 @@
 """CPU-only tests for the capture production node boundary."""
 
+import dataclasses
 import tempfile
 import unittest
 from pathlib import Path
@@ -116,6 +117,24 @@ class CaptureNodeTest(unittest.TestCase):
         self.assertEqual(config.camera_frame_id, "camera4_optical_frame")
         self.assertEqual(config.max_sample_interval_overshoot_ms, 250.0)
 
+    def test_optional_params_fall_back_to_the_config_field_defaults(self):
+        # The node carries no defaults of its own: an absent key must give exactly the CaptureConfig default.
+        optional = {field.name: field.default for field in dataclasses.fields(CaptureConfig)
+                    if field.default is not dataclasses.MISSING}
+        self.assertEqual(set(optional), {
+            "odometry_association", "pose_interpolation_wait_ms", "pose_time_offset_ms",
+            "keyframe_min_translation_m", "keyframe_min_rotation_deg", "keyframe_max_interval_sec",
+            "handoff_buffer_frames", "handoff_buffer_max_bytes"})
+        config = load_capture_config(self.make_params())
+        for name, default in optional.items():
+            self.assertEqual(getattr(config, name), default, name)
+        config = load_capture_config(self.make_params(
+            odometry_association="interpolate", pose_time_offset_ms=40.0, keyframe_min_translation_m=0.15,
+            keyframe_min_rotation_deg=8.0, handoff_buffer_frames=150))
+        self.assertEqual((config.odometry_association, config.pose_time_offset_ms, config.keyframe_min_translation_m,
+                          config.keyframe_min_rotation_deg, config.handoff_buffer_frames),
+                         ("interpolate", 40.0, 0.15, 8.0, 150))
+
     def test_every_safety_parameter_is_required(self):
         params = self.make_params()
         for key in list(params) + ["odometry_topic", "camera_info_topic"]:
@@ -192,6 +211,10 @@ class CaptureNodeTest(unittest.TestCase):
                 "has_odometry": False,
                 "has_depth": True,
                 "has_tf": True,
+                "auxiliary_errors": 2,
+                "auxiliary_dropped": 1,
+                "tf_dropped": 0,
+                "last_auxiliary_error": "odometry: bad quaternion",
             },
         }
         message = assemble_diagnostics_array(state, server)
@@ -202,6 +225,9 @@ class CaptureNodeTest(unittest.TestCase):
         )
         values = {item.key: item.value for item in input_status.values}
         self.assertEqual(values["aux_coverage"], "ci+ odom- depth+ tf+")
+        # Lost auxiliary samples include the per-frame pose source; the counts must reach the operator.
+        self.assertEqual((values["auxiliary_errors"], values["auxiliary_dropped"], values["tf_dropped"],
+                          values["last_auxiliary_error"]), ("2", "1", "0", "odometry: bad quaternion"))
 
     def test_node_not_ready_and_ready_paths(self):
         server_factory = mock.Mock()

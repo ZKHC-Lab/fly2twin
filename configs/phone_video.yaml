@@ -1,4 +1,4 @@
-# B0: drone depth/fusion method, GLOMAP poses, assumed camera height 1.4 m.
+# Phone video: drone depth/fusion method, GLOMAP poses, assumed camera height 1.4 m.
 protocol: phone
 video: scene/video.MOV
 output: ../../outputs/phone_b0
@@ -12,7 +12,6 @@ extract:
   quality: 2
   hdr: auto
 sfm:
-  sfm_mode: global
   camera_model: SIMPLE_RADIAL
   focal_factor: 1.2
   overlap: 20

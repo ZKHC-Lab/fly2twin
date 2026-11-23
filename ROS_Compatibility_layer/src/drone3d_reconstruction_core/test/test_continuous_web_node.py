@@ -209,66 +209,17 @@ class ContinuousWebNodeTest(unittest.TestCase):
         )
         self.assertEqual(request.role, "front")
         request = build_continuous_session_request(
-            {
-                "command": "start_session",
-                "role": "front",
-                "reconstruction_mode": "frame_pool",
-            }
+            {"command": "start_session", "role": "front"}
         )
         self.assertEqual(
             request.command, ContinuousSessionCommandRequest.START_SESSION
         )
         self.assertEqual(request.role, "front")
-        self.assertEqual(request.reconstruction_mode, "frame_pool")
+        self.assertEqual(request.reconstruction_mode, "")
 
-    def test_build_request_set_params_strict(self):
-        request = build_continuous_session_request(
-            {
-                "command": "set_params",
-                "sample_fps": 2.0,
-                "window_frames": 4,
-                "overlap_frames": 2,
-                "queue_mode": "realtime_latest",
-                "queue_capacity": 3,
-                "max_retries": 0,
-                "keep_snapshot_on_success": False,
-                "save_sensor_depth": True,
-                "inference_resolution": 256,
-                "worker_timeout_sec": 60.0,
-            }
-        )
-        self.assertEqual(request.command, ContinuousSessionCommandRequest.SET_PARAMS)
-        self.assertEqual(request.sample_fps, 2.0)
-        self.assertEqual(request.window_frames, 4)
-        self.assertEqual(request.overlap_frames, 2)
-        self.assertTrue(request.set_overlap_frames)
-        self.assertEqual(request.queue_mode, "realtime_latest")
-        self.assertEqual(request.queue_capacity, 3)
-        self.assertEqual(request.max_retries, 0)
-        self.assertTrue(request.set_max_retries)
-        self.assertFalse(request.keep_snapshot_on_success)
-        self.assertTrue(request.set_keep_snapshot)
-        self.assertTrue(request.save_sensor_depth)
-        self.assertTrue(request.set_save_sensor_depth)
-        self.assertEqual(request.inference_resolution, 256)
-        self.assertTrue(request.set_inference_resolution)
-        self.assertEqual(request.worker_timeout_sec, 60.0)
-        self.assertTrue(request.set_worker_timeout)
-
-        with self.assertRaises(ContinuousWebNodeError):
-            build_continuous_session_request(
-                {"command": "set_params", "queue_mode": "magic"}
-            )
-        with self.assertRaises(ContinuousWebNodeError):
-            build_continuous_session_request(
-                {"command": "set_params", "max_retries": True}
-            )
-        with self.assertRaises(ContinuousWebNodeError):
-            build_continuous_session_request(
-                {"command": "set_params", "keep_snapshot_on_success": "yes"}
-            )
-        with self.assertRaises(ContinuousWebNodeError):
-            build_continuous_session_request({"command": "set_params"})
+    def test_build_request_rejects_set_params(self):
+        with self.assertRaisesRegex(ContinuousWebNodeError, "unsupported web command"):
+            build_continuous_session_request({"command": "set_params", "sample_fps": 2.0})
 
     def test_command_response_to_dict(self):
         response = ContinuousSessionCommandResponse()

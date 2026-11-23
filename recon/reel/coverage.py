@@ -10,6 +10,7 @@ RES_RATIO times farther from the point than the query (otherwise the query magni
 import numpy as np
 import torch
 
+from recon.geometry.transforms import resize_K
 from recon.gaussian.render import render
 
 TIER_A = dict(unseen=0.02, ge10=0.80)
@@ -22,8 +23,7 @@ RES_RATIO = 1.5   # a training view counts only if it was at most 1.5x farther f
 
 
 def low_K(K, w, h):
-    sx, sy = LOW_W / w, LOW_H / h
-    return (np.array([[sx, 0, (sx - 1) / 2], [0, sy, (sy - 1) / 2], [0, 0, 1]]) @ K).astype(np.float32)
+    return resize_K(K, LOW_W, LOW_H, w, h).astype(np.float32)
 
 
 def render_depth(splats, c2w, K, w=LOW_W, h=LOW_H, degree=0, near_plane=.01):

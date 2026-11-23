@@ -67,6 +67,15 @@ class OnboardTests(unittest.TestCase):
                 manifest=export_session(records,sid,root/'delivery',capture)
                 with self.assertRaises(FileExistsError):export_session(records,sid,root/'delivery',capture)
                 export_session(records,sid,root/'plain',capture,revisit=False)
+                # A manifest write that dies half way (disk full) must not leave a manifest.json behind.
+                def half_written(path,value):
+                    Path(path).write_text('{"schema_version": 1, "frames": [')
+                    raise OSError(28,'No space left on device')
+                with patch('drone3d_onboard.export.dump',side_effect=half_written), self.assertRaises(OSError):
+                    export_session(records,sid,root/'interrupted',capture)
+            self.assertFalse((root/'interrupted/manifest.json').exists())
+            self.assertEqual(json.loads((root/'delivery/manifest.json').read_text())['hashes'],manifest['hashes'])
+            self.assertFalse((root/'delivery/manifest.json.tmp').exists())
             self.assertEqual(manifest['pose_time_offset_stage'],'capture')
             self.assertEqual(cv2.imread(str(root/'delivery/keyframes/000000.jpg')).shape,(720,1280,3))
             for name,value in manifest['hashes'].items():self.assertEqual(digest(root/'delivery'/name),value)

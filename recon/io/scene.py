@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
+from recon.geometry.transforms import resize_K
 from .ply import read_ply
 
 
@@ -74,9 +75,7 @@ def load_scene(path, width=None):
     sw, sh = int(res[0]), int(res[1])
     w = int(width or sw)
     h = int(round(sh * w / sw))
-    sx, sy = w / sw, h / sh
-    scale = np.array([[sx, 0, (sx - 1) / 2], [0, sy, (sy - 1) / 2], [0, 0, 1]])
-    K = scale @ K
+    K = resize_K(K, w, h, sw, sh)
     trained = np.isin(ids, meta['capture_corridor']['training_frame_ids'])
     up = np.asarray(meta.get('world_up', meta.get('coordinates', {}).get('world_up', [0, 0, 1])), float)
     bounds = meta.get('bounds')

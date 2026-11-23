@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 import numpy as np
-import json
 import time
 import sqlite3
 from pathlib import Path
 from recon.io.common import dump
+from .database import MAX_IMAGE_ID
 
 def readonly(path):
     return sqlite3.connect(Path(path).resolve().as_uri()+"?mode=ro",uri=True)
@@ -21,7 +21,7 @@ def merge(data, sift_path, xfeat_path, destination):
         if not np.array_equal(f['frame_ids'], data['frame_ids']):
             raise ValueError('XFeat frame order differs from cameras.npz')
         pairs, coords, offsets, fundamentals = [f[k] for k in ('pair_indices', 'coords', 'offsets', 'F')]
-    # T09 exact float32 coordinate deduplication: refinement is pair-dependent.
+    # Deduplicate on exact float32 coordinates: refinement is pair-dependent.
     pieces = [[] for _ in data['frame_ids']]
     mappings = [np.empty((b - a, 2), np.uint32) for a, b in zip(offsets[:-1], offsets[1:])]
     for k, (i, j) in enumerate(pairs):
@@ -56,7 +56,7 @@ def merge(data, sift_path, xfeat_path, destination):
         a, b = image_ids[i], image_ids[j]
         if a > b:
             a, b, values, F = b, a, values[:, ::-1], F.T
-        pair_id = a * 2147483647 + b
+        pair_id = a * MAX_IMAGE_ID + b
         xm[pair_id] = values
         geometry[pair_id] = (int(pc.TwoViewGeometryConfiguration.UNCALIBRATED),
                              np.asarray(F, np.float64).tobytes(), None, None, None, None, None, None)

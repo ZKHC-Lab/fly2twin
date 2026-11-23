@@ -10,7 +10,6 @@ judging (collision, out of bounds, timeout).
 Coordinates: metres, world Z up; camera rotation columns are right/down/forward; depth is camera Z,
 -1 where no point is hit.
 """
-import hashlib
 import math
 from pathlib import Path
 import sys
@@ -21,6 +20,8 @@ import numpy as np
 import torch
 from numba import njit
 from scipy.spatial import cKDTree
+
+from recon.io.common import digest
 
 DT = 1 / 15
 # Body radius and camera offset (body frame) of the DiffDrone-PyTorch3D quadrotor, i.e. its
@@ -33,12 +34,6 @@ REACH_RADIUS = .5
 OUT_OF_BOUNDS_M, OUT_OF_BOUNDS_S = 3., 1.
 
 
-def digest(path):
-    h = hashlib.sha256()
-    with open(path, 'rb') as f:
-        for block in iter(lambda: f.read(1 << 20), b''):
-            h.update(block)
-    return h.hexdigest()
 
 
 def load_diffdrone(root, checkpoint):

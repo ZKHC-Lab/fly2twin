@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Clean global LiDAR reference and pooled nearest-neighbour distances.
 
-Ported from T25/lidar_generate.py (header, scan, odometry, voxel keys,
-trajectory, exact paired support), T31/cloud_lidar31.py (prepare and
+Ported from the research scripts lidar_generate.py (header, scan, odometry,
+voxel keys, trajectory, exact paired support), cloud_lidar31.py (prepare and
  global_reference), and promo_20261029/lidar_eval/evaluate.py (float32 NN).
 Historical sources live under Data/experiments; never imported at runtime.
 """
-import hashlib
 import json
 import struct
 import time
@@ -15,6 +14,8 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation, Slerp
+
+from recon.io.common import digest as _digest
 
 __all__ = ["build_reference", "distances"]
 _DT = np.dtype([('t','<u4'),('x','<f4'),('y','<f4'),('z','<f4'),
@@ -112,17 +113,11 @@ def _static_support(ks,scanid,scan_ns,positions,order=None):
         starts.append(i);good.append(ok);witness_a.append(wa);witness_b.append(wb);i=j
     return np.array(starts),np.array(good),np.array(witness_a),np.array(witness_b)
 
-def _digest(path):
-    h = hashlib.sha256()
-    with Path(path).open('rb') as f:
-        for block in iter(lambda: f.read(1024 * 1024), b''):
-            h.update(block)
-    return h.hexdigest()
 
 
 def build_reference(bag, out_npz, *, lidar_topic='/livox/lidar',
                     odometry_topic='/Odometry', body_from_lidar=None):
-    """Build T25 clean 5 cm reference; T_BL maps LiDAR coordinates into body.
+    """Build the clean 5 cm reference; T_BL maps LiDAR coordinates into body.
 
     None retains the historical Ry(+25°)*(p+[-.011,-.02329,.04412]).
     Custom extrinsics are rigid 4x4 matrices, not the inverse body→LiDAR.
@@ -175,7 +170,7 @@ def build_reference(bag, out_npz, *, lidar_topic='/livox/lidar',
         raise ValueError('Bag lacks odometry or Livox scans on the requested topics')
     traj = _Trajectory(np.array(ts, np.int64), np.array(pq))
     odometry_stats = traj.stats
-    # T31 Inputs reconstructed the already-deduplicated trajectory. Preserve this
+    # The original evaluation rebuilt the already-deduplicated trajectory. Preserve this
     # second pass (normally idempotent), rather than silently changing its path.
     traj = _Trajectory(traj.ts, traj.pq)
     fixed = np.array(sorted(k for k, n in hist.items() if n >= np.ceil(.2*len(meta))), np.int64)
@@ -273,7 +268,7 @@ def distances(cloud_points, reference):
     """All fused points → nearest reference; identity, no fit, metres.
 
     Arrays or NPZ/PLY paths accepted. Distances round to float32 BEFORE pooled
-    quantiles, exactly as T31. Thresholds are strict <; world-z bins are [lo,hi).
+    quantiles, exactly as the original evaluation. Thresholds are strict <; world-z bins are [lo,hi).
     """
     p, ref = _load_points(cloud_points), _load_points(reference)
     tree = cKDTree(ref)

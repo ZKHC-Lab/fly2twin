@@ -67,14 +67,14 @@ A full office floor was captured with the S380 drone's sensor suite (Intel RealS
 
 | Scene | Pose source | Metric | Value |
 | --- | --- | --- | --- |
-| Office floor, onboard point cloud | FAST-LIO | Distance to LiDAR map, P50 / P90 | 3.3 / 11.2 cm |
-| Office floor, after post-flight BA | FAST-LIO + BA | Distance to LiDAR map, P50 / P90 | **2.9 / 6.8 cm** |
+| Office floor, onboard point cloud | FAST-LIO | Distance to LiDAR map, P50 / P90 | 2.9 / 6.1 cm |
+| Office floor, after post-flight BA | FAST-LIO + BA | Distance to LiDAR map, P50 / P90 | **2.7 / 4.7 cm** |
 | Office floor, 3DGS | FAST-LIO + BA | PSNR, 433 held-out views (640×360, test-time pose alignment) | **25.7 dB** |
 | Lounge, phone 4K video | GLOMAP | PSNR, 150 held-out views (1600×900) | **32.6 dB** |
 | Onboard, Jetson Orin NX 16 GB | FAST-LIO | Per 40-frame window: GPU inference / total | 38 s / 42 s |
 | Obstacle avoidance in the reconstructed office (`recon sim`) | — | 50 random start–goal pairs, policy trained in random obstacle fields | **50 / 50** collision-free |
 
-Distances are measured from each reconstructed point to a LiDAR map built from the same recording ([protocol](recon/docs/LIDAR_EVAL.md)).
+Distances are measured from each reconstructed point to a LiDAR map built from the same recording ([protocol](recon/docs/LIDAR_EVAL.md)). Both distance rows come from one flight: the onboard row is the cloud exported from the windows that flight produced in onboard replay (40 frames, 10 shared) after re-solving their scales with the current code, and the BA row is the cloud fused under the BA poses; both include revisit alignment (step 5 of the method). The figures published earlier, 3.3 / 11.2 cm and 2.9 / 6.8 cm, predate per-frame scales (onboard) and revisit alignment. The 3DGS and obstacle-avoidance rows were also measured before revisit alignment was added and have not been re-measured.
 
 ## Getting Started
 
@@ -170,7 +170,7 @@ fly2twin/
 ├── viewer/                    # Browser viewer and demo tools
 ├── configs/                   # Example configurations (phone video, drone with poses, image only, S380)
 ├── third_party/vggt-omega/    # VGGT-Omega model code and inference entry
-├── scripts/ · tests/          # Equivalence checks and test suite
+├── scripts/ · tests/          # Link check and test suite
 └── licenses/ · requirements-lock/ · THIRD_PARTY_NOTICES.md
 ```
 

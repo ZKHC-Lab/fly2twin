@@ -76,7 +76,7 @@ E3 运行期间的执行进程持有 GPU 锁覆盖了纯 CPU 的 SfM 阶段（�
 
 ## 抽离与兼容决策
 
-同一个 [训练器](../gaussian/train.py)支持两条参考。[无人机预设](../../configs/drone_with_poses.yaml)指定精确 N×60、1280×720、固定致密化时间表、SH 间隔 1000、正整数倍 reset、1M 初始化上限及全部清晰帧。历史 E2/E3 手机 RGB-only 设置已内联到[验收脚本](../../scripts/equivalence.py)，保留精确 N×60、宽 1600、缩放并 round 的致密化时间表、SH 间隔 steps/30、第零步 reset、RGB 与各向异性损失。[当前手机预设](../../configs/phone_video.yaml)改为 B0，加入无人机方法的 Omega 深度、米制融合和 λ=0.1 深度损失；不将上文 E2/E3 数字当作 B0 分阶段版本的验收。已有 T30 的默认值不变。
+同一个 [训练器](../gaussian/train.py)支持两条参考。[无人机预设](../../configs/drone_with_poses.yaml)指定精确 N×60、1280×720、固定致密化时间表、SH 间隔 1000、正整数倍 reset、1M 初始化上限及全部清晰帧。历史 E2/E3 手机 RGB-only 设置当时内联在验收脚本 scripts/equivalence.py（已删除）里，保留精确 N×60、宽 1600、缩放并 round 的致密化时间表、SH 间隔 steps/30、第零步 reset、RGB 与各向异性损失。[当前手机预设](../../configs/phone_video.yaml)改为 B0，加入无人机方法的 Omega 深度、米制融合和 λ=0.1 深度损失；不将上文 E2/E3 数字当作 B0 分阶段版本的验收。已有 T30 的默认值不变。
 
 | 阶段 | 复用代码 | 保留与差异 |
 | --- | --- | --- |
@@ -86,8 +86,8 @@ E3 运行期间的执行进程持有 GPU 锁覆盖了纯 CPU 的 SfM 阶段（�
 | 手机适配 | [pipeline](../video/pipeline.py) | 先 float32 相机再归一化；K 直接按比例缩放，不改成无人机半像素公式；图像从全栈改为 32 帧 LRU，OpenCV 像素计算不变 |
 | 训练顺序 | [schedule](../gaussian/schedule.py)、[strategy](../gaussian/strategy.py) | 手机参考循环前额外生成一次 permutation，作为显式配置保留；zero-depth 不访问深度缓存也不请求深度渲染 |
 | 手机评测 | [evaluation](../video/evaluation.py) | 原固定位姿 1600 指标；颜色加左乘 SE3 拟合使用 960、200 步、Adam1e-4、clamped RGB L1，与无人机旧评测分别保留 |
-| 漫游 | [render_roam](../video/render_roam.py)、[prepare_route](../video/prepare_route.py) | 原平滑、Catmull-Rom、SLERP 与覆盖检查；0.12 归一化单位/8° 至少 95%，策划路径另验地面高度跨度 0.15。地面 ROI 与帧段仍是参考场景专用，不能当通用地面估计 |
-| 导出 | [export](../io/export.py)、[手机导出](../video/export.py) | 无人机原终版归一化四元数/向下量化作为独立选项；手机原半径5、opacity .02过滤/排序；独立 NumPy PLY 写入器替代 plyfile |
+| 漫游 | render_roam、prepare_route（已删除） | 原平滑、Catmull-Rom、SLERP 与覆盖检查；0.12 归一化单位/8° 至少 95%，策划路径另验地面高度跨度 0.15。地面 ROI 与帧段仍是参考场景专用，不能当通用地面估计 |
+| 导出 | [export](../io/export.py)、手机导出 video/export.py（已删除） | 无人机原终版归一化四元数/向下量化作为独立选项；手机原半径5、opacity .02过滤/排序；独立 NumPy PLY 写入器替代 plyfile |
 | 查看器 | 场景适配（来源仓库 viewer/src/scene-contract.js，本次未搬入）、资产准备（来源仓库 viewer/tools/prepare_web.py，本次未搬入） | 线上代码读 scene.json，不再硬编码 scenes.json；真实非对称内参投影与留边；默认采集走廊约束；无占用体素时不宣称具备重建表面碰撞 |
 
 ### 环境差异必须保留
@@ -100,8 +100,8 @@ E3 运行期间的执行进程持有 GPU 锁覆盖了纯 CPU 的 SfM 阶段（�
 
 - 原回归：`CUDA_VISIBLE_DEVICES='' python -m pytest -q tests`。
 - 手机 B0 正式入口：`recon run --config my_phone.yaml --through prepare` → `--through fuse` → `--only train` → `--only eval` → `--only export`，用当前手机预设填写视频与权重路径。位姿 provider/refine、相高假设与 CPU 验收见[输入契约](INPUTS.md)。
-- 历史 E2/E3 顺序工具仍为 `python -m recon.video.extract_frames` → `python -m recon.video.sfm` → `python -m recon.video.pipeline` → `python -m recon.video.export`，RGB-only 设置由验收脚本独立保存。
-- 本地严格验收：[equivalence.py](../../scripts/equivalence.py) 接收显式 reference/config/video/output，不导入研究脚本。
+- 历史 E2/E3 顺序工具当时为 `python -m recon.video.extract_frames` → `python -m recon.video.sfm` → `python -m recon.video.pipeline` → `python -m recon.video.export`，RGB-only 设置由验收脚本独立保存。其中 `recon.video.pipeline`、`recon.video.export` 两个入口和漫游脚本 `recon.video.render_roam`、`recon.video.prepare_route` 已删除，可从提交 894a4dc 恢复；抽帧与 SfM 现由 `recon run` 的手机路径调用。
+- 本地严格验收：当时由 scripts/equivalence.py 接收显式 reference/config/video/output，不导入研究脚本。它和 scripts/verify_exports.py、scripts/verify_reproduction.py 写死了当时的帧数和目标值，已删除，可从提交 ea029bb 恢复。
 - 查看器入口：index.html（来源仓库 viewer/index.html，本次未搬入），查询参数 `manifest` 指定导出 scene.json URL。多档资产脚本接收 `--scene`，生成 scene-web.json，原始 scene.json 不覆盖。
 - 有头浏览器验收：verify_scene.cjs（来源仓库 viewer/tools/verify_scene.cjs，本次未搬入），依赖可通过 `npm install --prefix viewer/tools` 安装。参数依次为仓库根、scene.json 绝对路径、结果 JSON；使用本机 Edge（可由 `CHROME` 指定），不强制软件或独显后端。
 - GPU 步骤均须外层 `flock <共享锁> <命令>`；重任务外层 `systemd-run --user --scope -q -p MemoryMax=16G`。产物在忽略的 outputs 下，不进入 Git。

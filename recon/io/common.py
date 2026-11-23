@@ -17,6 +17,12 @@ def load_manifest(path):
     return manifest
 
 
+def stage_manifest(root):
+    """Frame manifest of a run: the pose stage rewrites it when its provider drops frames, otherwise prepare's stands."""
+    path = Path(root) / 'pose/manifest.json'
+    return load_json(path if path.exists() else Path(root) / 'prepare/manifest.json')
+
+
 def dump(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -296,6 +296,7 @@ class ReconstructActionServer:
         self._accepted_count = 0
         self._terminal_attempt_count = 0
         self._busy_rejection_count = 0
+        self._warm_fallback_count = 0
         self._cancel_request_count = 0
         self._server_stopped = False
         self._controller = controller_factory(
@@ -383,6 +384,7 @@ class ReconstructActionServer:
                 "accepted": bool(record.accepted if record is not None else False),
                 "accepted_count": self._accepted_count,
                 "busy_rejection_count": self._busy_rejection_count,
+                "warm_fallback_count": self._warm_fallback_count,
                 "cancel_request_count": self._cancel_request_count,
                 "terminal_attempt_count": self._terminal_attempt_count,
             }
@@ -794,9 +796,15 @@ class ReconstructActionServer:
                         warm_job,
                         **controller_kwargs,
                     )
-                except WarmWorkerUnavailableError:
+                except WarmWorkerUnavailableError as error:
                     # warm 进程同步 spawn 失败发生在 job_id 发布之前，
                     # 暂存目录仍洁净：安全退回一次性 worker 路径。
+                    # 一次性 worker 每窗重新加载模型，更慢、峰值内存也不同，所以要出声。
+                    with self._lock:
+                        self._warm_fallback_count += 1
+                    rospy.logwarn(
+                        "warm worker unavailable (%s); this window uses a one-shot worker "
+                        "that reloads the model", error)
                     controller_job_id = self._controller.start(
                         prepared_launch.command,
                         **controller_kwargs,

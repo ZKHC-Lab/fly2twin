@@ -81,12 +81,6 @@ def _positive_integer(value: Any, label: str) -> int:
     return value
 
 
-def _nonnegative_integer(value: Any, label: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ContinuousWebNodeError(f"{label} must be a nonnegative integer")
-    return value
-
-
 def _positive_byte_limit(value: Any, label: str) -> int:
     # ROS XML-RPC cannot carry integers above 2**31-1. Byte limits use decimal
     # strings in YAML, matching the capture/reconstruction configuration contract.
@@ -231,13 +225,6 @@ def build_continuous_session_request(
     elif command == "start_session":
         request.command = ContinuousSessionCommandRequest.START_SESSION
         request.role = _string_arg(command_dict, "role")
-        mode = command_dict.get("reconstruction_mode", "")
-        if not isinstance(mode, str):
-            raise ContinuousWebNodeError("reconstruction_mode must be a string")
-        request.reconstruction_mode = mode
-    elif command == "set_params":
-        request.command = ContinuousSessionCommandRequest.SET_PARAMS
-        _map_set_params(command_dict, request)
     else:
         raise ContinuousWebNodeError(f"unsupported web command: {command!r}")
     return request
@@ -248,88 +235,6 @@ def _string_arg(command_dict: Mapping[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value:
         raise ContinuousWebNodeError(f"{key} must be a nonempty string")
     return value
-
-
-def _map_set_params(command_dict: Mapping[str, Any], request) -> None:
-    known = {
-        "sample_fps",
-        "window_frames",
-        "overlap_frames",
-        "queue_mode",
-        "queue_capacity",
-        "max_retries",
-        "keep_snapshot_on_success",
-        "save_sensor_depth",
-        "inference_resolution",
-        "worker_timeout_sec",
-    }
-    unknown = sorted(set(command_dict.keys()) - {"command"} - known)
-    if unknown:
-        raise ContinuousWebNodeError(f"unknown set_params fields: {unknown!r}")
-    if not any(key in command_dict for key in known):
-        raise ContinuousWebNodeError("set_params requires at least one field")
-    if "sample_fps" in command_dict:
-        request.sample_fps = float(_positive_finite(command_dict["sample_fps"], "sample_fps"))
-    if "window_frames" in command_dict:
-        request.window_frames = int(_positive_integer(command_dict["window_frames"], "window_frames"))
-    if "overlap_frames" in command_dict:
-        request.overlap_frames = int(
-            _nonnegative_integer(command_dict["overlap_frames"], "overlap_frames")
-        )
-        request.set_overlap_frames = True
-    if "queue_mode" in command_dict:
-        mode = command_dict["queue_mode"]
-        if mode not in ("lossless_fifo", "realtime_latest"):
-            raise ContinuousWebNodeError(
-                "queue_mode must be lossless_fifo or realtime_latest"
-            )
-        request.queue_mode = mode
-    if "queue_capacity" in command_dict:
-        request.queue_capacity = int(
-            _positive_integer(command_dict["queue_capacity"], "queue_capacity")
-        )
-    if "max_retries" in command_dict:
-        request.max_retries = int(
-            _nonnegative_integer(command_dict["max_retries"], "max_retries")
-        )
-        request.set_max_retries = True
-    if "keep_snapshot_on_success" in command_dict:
-        value = command_dict["keep_snapshot_on_success"]
-        if type(value) is not bool:
-            raise ContinuousWebNodeError("keep_snapshot_on_success must be a bool")
-        request.keep_snapshot_on_success = value
-        request.set_keep_snapshot = True
-    if "save_sensor_depth" in command_dict:
-        value = command_dict["save_sensor_depth"]
-        if type(value) is not bool:
-            raise ContinuousWebNodeError("save_sensor_depth must be a bool")
-        request.save_sensor_depth = value
-        request.set_save_sensor_depth = True
-    if "inference_resolution" in command_dict:
-        value = command_dict["inference_resolution"]
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise ContinuousWebNodeError(
-                "inference_resolution must be an integer"
-            )
-        if value != 0 and (value < 32 or value > 4096):
-            raise ContinuousWebNodeError(
-                "inference_resolution must be 0 (inherit) or in [32, 4096]"
-            )
-        request.inference_resolution = int(value)
-        request.set_inference_resolution = True
-    if "worker_timeout_sec" in command_dict:
-        value = command_dict["worker_timeout_sec"]
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise ContinuousWebNodeError(
-                "worker_timeout_sec must be a finite number"
-            )
-        value = float(value)
-        if not math.isfinite(value) or value < 0:
-            raise ContinuousWebNodeError(
-                "worker_timeout_sec must be 0.0 or positive finite"
-            )
-        request.worker_timeout_sec = value
-        request.set_worker_timeout = True
 
 
 def command_response_to_dict(response) -> dict:

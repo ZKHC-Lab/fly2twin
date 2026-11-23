@@ -4,7 +4,7 @@ ROS1 Noetic / catkin 工作空间，无人机机载端的连续重建：相机�
 
 当前主线用逐帧位姿放置（`g4_placement: frame_pose`）：每帧按位姿来源给出的相机位姿放置，VGGT 提供深度，后台求窗口尺度和逐帧尺度。每窗 40 个关键帧，其中 5 个与上一窗共享，推理长边 384。配置见[机载融合、交付包与落地全局 BA](src/drone3d_reconstruction_core/docs/ONBOARD_V1.md)。
 
-配置模板的默认值仍是早期的 G4 图配准（`g4_placement: graph`）：16 帧窗口，11 个新帧加 5 个共享帧，见 [G4 接入与性能说明](src/drone3d_reconstruction_core/docs/G4_INTEGRATION.md)。后台完成求解后原子更新历史窗口。
+逐帧位姿放置是唯一的放置方式；早期的图配准（每窗一个 Sim(3)）和长窗分组已删除，见 [G4 接入](src/drone3d_reconstruction_core/docs/G4_INTEGRATION.md)。后台完成求解后原子更新历史窗口。
 
 ## 目录
 
@@ -49,7 +49,7 @@ bash src/drone3d_reconstruction_core/scripts/nx_step2_bringup.sh
 ```
 
 顺序：roscore → Livox → FAST-LIO → RealSense → TF → 生产栈；不启动飞控或桨叶。
-一键脚本的生产栈按台架配置运行：640×480、16 帧窗、G4 图配准。机载主线的配置见 [机载融合与交付包](src/drone3d_reconstruction_core/docs/ONBOARD_V1.md) 第 1 节，目前只在 bag 回放中验证过，还没有接入一键脚本。
+一键脚本的生产栈按台架配置运行：640×480、16 帧窗、逐帧位姿放置，NX 实机未验证。机载主线的完整配置见 [机载融合与交付包](src/drone3d_reconstruction_core/docs/ONBOARD_V1.md) 第 1 节，只在 bag 回放中验证过。
 外部里程计用 `--external-odom /Odometry`，同时禁用 Livox 加 `--no-livox`；关闭 Web 加 `--no-web`。
 
 仅启动生产栈（要求已有可达的 roscore）：
@@ -66,28 +66,21 @@ bash src/drone3d_reconstruction_core/scripts/continuous_production.sh \
 
 ## 配置与接口
 
-- 按模板填写绝对路径、checkpoint 摘要、设备 SKU、资源阈值及快照限制；替换全部占位值。
+- 按模板填写绝对路径、checkpoint 摘要、资源阈值及快照限制；替换全部占位值。
 - ROS1 中超过 `2147483647` 的字节阈值须写成带引号的十进制字符串，如 `"8589934592"`。
 - front/down 使用独立采集配置；相机角色、topic、frame_id 在配置中固定。
-- `PipelineCommand`：`SELECT_SOURCE / START_TASK / GET_STATUS / CANCEL_TASK`。
-- `ContinuousSessionCommand`：`SELECT_SOURCE / START_SESSION / PAUSE / RESUME / STOP_ALL / GET_STATUS / SET_PARAMS`。
-- `/diagnostics`：就绪状态、任务阶段、资源占用、队列及错误；CUDA 重建并发上限为 1。
-- 快照支持 schema v1–v4；结果经校验后原子提交，取消/超时负责清理 worker 进程组。
+- `ContinuousSessionCommand`：`SELECT_SOURCE / START_SESSION / PAUSE / RESUME / STOP_ALL / GET_STATUS`；会话参数来自 profile、会话内固定，`SET_PARAMS` 一律返回错误码 5。
+- `/diagnostics`：就绪状态、任务阶段、资源占用、队列及错误；CUDA 重建并发上限为 1。采集侧另报辅助数据（里程计、内参、深度、TF）的丢失计数 `auxiliary_errors` / `auxiliary_dropped` / `tf_dropped`，重建侧报常驻推理进程回退成一次性进程的次数 `warm_fallback_count`；这几项不为 0 时要查原因。会话侧的 `missing_pose_frames` 是累计缺位姿帧数，缺位姿超过窗口帧数 20% 的窗口判失败（见[机载融合与交付包](src/drone3d_reconstruction_core/docs/ONBOARD_V1.md)“时间语义”）。地图后端（G4 后台进程）有单独一项 `drone3d/session/map_backend`：进程起不来、求解报错或异常退出时为 ERROR，Web 顶栏同时出现“地图后端出错”。此时采集和逐窗重建不停，窗口照常成功，只是没有被放进地图，落地后可以重算。
+- 快照只支持 schema v4（采集只写 v4，读到 v1–v3 报错）；结果经校验后原子提交，取消/超时负责清理 worker 进程组。
 
 ## 工具
 
-- `bash tools/check.sh validator`：真实结果校验与原子提交检查；`bag`、`web` 子命令见 `--help`。
 - `bash tools/nx_bench/bench/run100.sh --help`：参数化基准测试，支持 `--dry-run`（内部台架工具，开源导出不包含）。
 - 安装：在上述构建与测试通过后执行 `catkin_make install`，新终端加载 `install/setup.bash`。
 
 ## 模式与限制
 
-- 会话创建时选择模式，运行中禁止切换；停止后可创建另一种模式的新会话。
-- `per_window`：默认G4全局配准。G4会话内固定输入配置。旧 `odom_pose_constrained_sim3` 模式仍支持逐窗里程计对齐和运行时重叠调整。
-- `g4_placement: frame_pose`：当前主线，G4 会话改为逐帧外部定位位姿加 VGGT 深度尺度，见本页开头和[机载融合与交付包](src/drone3d_reconstruction_core/docs/ONBOARD_V1.md)。早期以 D435i 参考面做的验证见 [G4 接入](src/drone3d_reconstruction_core/docs/G4_INTEGRATION.md) 的“逐帧位姿放置”。
-- `frame_pool`：重叠固定为 0 且不可修改；不进行对齐；Web 仅显示最新一次重建点云。
-- `window_frames` 是采集及帧数池重建的目标帧数，可调整；合格帧不足时继续入池等待。
-- 采集完成立即入池；每次重建和重试重新按质量、位置、朝向和时间覆盖选帧，允许旧优质帧再次入选。
-- 目标帧数受重建配置及快照上限约束；坏图不参与选帧，无朝向帧按质量与时间覆盖选择。
+- 重建模式只有 `per_window`，窗口放置只有 G4 全局配准（`alignment_backend: global_g4`）。G4会话内固定输入配置。
+- `g4_placement: frame_pose`（唯一取值）：逐帧外部定位位姿加 VGGT 深度尺度，见本页开头和[机载融合与交付包](src/drone3d_reconstruction_core/docs/ONBOARD_V1.md)。早期以 D435i 参考面做的验证见 [G4 接入](src/drone3d_reconstruction_core/docs/G4_INTEGRATION.md) 的“逐帧位姿放置”。
 - CUDA OOM 进入 `FATAL_OOM` 并停止采集与消费；降低帧数或分辨率后人工重启。
 - 快照根、结果根及其父目录必须可信、稳定；NX 候选配置不代表已通过生产验收。

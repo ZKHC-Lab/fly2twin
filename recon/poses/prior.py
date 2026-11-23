@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-from pathlib import Path
 import numpy as np
 from recon.io.common import dump
 from .pairs import plan_pairs
+from .database import MAX_IMAGE_ID
 
 
 def stage(name, start):
@@ -43,7 +43,7 @@ def reconstruct(data,images,out,settings):
     for i,j in pairs:
         a,b=data['image_names'][i],data['image_names'][j]
         lo,hi=sorted((names[a],names[b]))
-        if lo*2147483647+hi not in existing: new.append(f'{a} {b}\n')
+        if lo*MAX_IMAGE_ID+hi not in existing: new.append(f'{a} {b}\n')
     pair_file=out/'pairs.txt';pair_file.write_text(''.join(new))
     if new:
         pc.match_image_pairs(db,matching_options=matching,pairing_options=pc.ImportedPairingOptions(match_list_path=pair_file),

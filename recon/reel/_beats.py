@@ -6,9 +6,7 @@ autocorrelation peak in 70-160 BPM; the beat phase maximises summed onset streng
 Prints tempo, beat times and per-second RMS energy (dB) for picking a 60 s excerpt.
 Usage: python beats.py track.mp3 [more.mp3 ...]
 """
-import json
 import subprocess
-import sys
 
 import numpy as np
 from scipy.signal import stft

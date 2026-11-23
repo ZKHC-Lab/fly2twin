@@ -1,7 +1,6 @@
 """Real-core tests for ingestion, immutable revisions and isolated failures."""
 import hashlib
 import json
-import os
 from pathlib import Path
 import tempfile
 import time
@@ -10,7 +9,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from g4_backend import Sim3, WindowGeometry, solve_g4
+from g4_backend import Sim3, WindowGeometry
 from drone3d_reconstruction_core.g4.input_adapter import WindowInput
 from drone3d_reconstruction_core.g4.map_backend import G4MapBackend
 
@@ -91,7 +90,7 @@ class MapSnapshotTest(unittest.TestCase):
                                                   "translation": [float(number), 0., 0.]},
                             "global_frame_status": "localized" if usable else "pending"})
         revision = {"session_id": SESSION, "revision": number, "replacement": "complete_map",
-                    "reference_frame_id": "odom", "window_count": count, "windows": windows,
+                    "placement": "frame_pose", "reference_frame_id": "odom", "window_count": count, "windows": windows,
                     "published_windows": list(range(count)) if usable else [],
                     "pending_windows": [] if usable else list(range(count))}
         raw = json.dumps(revision).encode()
@@ -140,12 +139,10 @@ class MapSnapshotTest(unittest.TestCase):
 class G4BackendProcessTest(unittest.TestCase):
     def test_parent_bootstrap_and_unknown_directory_rejection(self):
         from drone3d_reconstruction_core.g4.backend_process import G4BackendProcess, output_root
-        from g4_backend import WINDOWED_METHOD_ID
 
-        grouped = {"method_id": WINDOWED_METHOD_ID, "window_frame_semantics": "new_frames",
-                   "window_frames": 100, "overlap_frames": 20, "minimum_total_frames": 100,
-                   "window_plan_path": "", "threshold_table_path": "", "fit_exclusion_source": ""}
-        for profile, unknown in ((None, False), (grouped, False), (grouped, True)):
+        frame_pose = {"placement": "frame_pose", "frame_pose": {"pose_time_offset_ms": 40.0},
+                      "window_frames": 16, "overlap_frames": 5, "camera_intrinsics": None}
+        for profile, unknown in ((frame_pose, False), (frame_pose, True)):
             with self.subTest(profile=profile, unknown=unknown), tempfile.TemporaryDirectory() as directory:
                 records = Path(directory) / "sessions"
                 records.mkdir()
@@ -190,7 +187,7 @@ class G4MapBackendTest(unittest.TestCase):
             service.close()
 
     def add_window(self, window_id, start, **kwargs):
-        record, loaded = fixture(window_id, start, **kwargs)
+        record, loaded = pose_fixture(window_id, start, **kwargs)
         self.records.append(record)
         self.loaded[window_id] = loaded
         return record
@@ -245,17 +242,17 @@ class G4MapBackendTest(unittest.TestCase):
         self.assertIsNone(second.update())
         self.assertEqual(len(list((self.root/"output/revisions").glob("revision-*"))), 1)
 
-    def test_pending_graph_retains_one_complete_display_then_recovers(self):
+    def test_pending_solve_retains_one_complete_display_then_recovers(self):
+        from drone3d_reconstruction_core.g4 import map_backend
         self.add_window(0, 0)
         service = self.service()
         first = service.update()
         self.add_window(1, 20, shared=10)
+        real = map_backend.solve_window_scales
         def pending(*args, **kwargs):
-            result = solve_g4(*args, **kwargs)
-            for component in result.diagnostics["component_diagnostics"]:
-                component["publishable_numerical"] = False
-            return result
-        with patch("drone3d_reconstruction_core.g4.map_backend.solve_g4", side_effect=pending):
+            _scales, constrained, diagnostics = real(*args, **kwargs)
+            return {}, constrained, diagnostics  # no window gets a metric scale
+        with patch("drone3d_reconstruction_core.g4.map_backend.solve_window_scales", side_effect=pending):
             second = service.update()
         pointer = json.loads((self.root/"output/latest.json").read_text())
         self.assertEqual(pointer["path"], str(second))
@@ -281,26 +278,6 @@ class G4MapBackendTest(unittest.TestCase):
         self.assertEqual((self.root/"output/latest.json").read_bytes(), pointer)
         self.assertEqual(service.status()["latest_revision_path"], str(first))
 
-    def test_nonconvergent_identical_inputs_do_not_repeat_expensive_solve(self):
-        self.add_window(0, 0)
-        service = self.service()
-        service.update()
-        pointer = (self.root/"output/latest.json").read_bytes()
-        self.add_window(1, 20, shared=10)
-        def fail(*args, **kwargs):
-            result = solve_g4(*args, **kwargs)
-            result.diagnostics["status"] = 0
-            return result
-        with patch("drone3d_reconstruction_core.g4.map_backend.solve_g4", side_effect=fail) as solve:
-            with self.assertRaisesRegex(RuntimeError, "did not converge"):
-                service.update()
-            with self.assertRaisesRegex(RuntimeError, "previously failed"):
-                service.update()
-            self.assertEqual(solve.call_count, 1)
-        self.assertEqual((self.root/"output/latest.json").read_bytes(), pointer)
-        self.add_window(2, 40, shared=10)
-        self.assertEqual(self.revision(service.update())["window_count"], 3)
-
     def test_duplicate_and_disappeared_window_fail_without_replacement(self):
         record = self.add_window(0, 0)
         service = self.service()
@@ -312,21 +289,6 @@ class G4MapBackendTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "source window disappeared"):
             service.update()
         self.assertTrue(first.exists())
-
-    def test_mismatched_shared_rgb_fails_and_keeps_previous_revision(self):
-        self.add_window(0, 0)
-        service = self.service()
-        first = service.update()
-        self.add_window(1, 20, shared=10)
-        old = self.loaded[1].geometry
-        # Same identities with altered RGB hashes must never produce an edge.
-        self.loaded[1].geometry = WindowGeometry(old.window_id, old.frame_ids, old.timestamps_ns,
-            old.depth, old.confidence, old.intrinsics, old.rotations, old.centers,
-            old.shared_prefix, tuple("changed-"+s for s in old.rgb_hashes))
-        with self.assertRaises(ValueError):
-            service.update()
-        pointer = json.loads((self.root/"output/latest.json").read_text())
-        self.assertEqual(pointer["path"], str(first))
 
     def test_second_writer_is_rejected(self):
         self.service()
@@ -381,7 +343,7 @@ class G4MapBackendTest(unittest.TestCase):
         self.add_window(1, 11, count=16, shared=5)
         latest = service.update()
         revision = self.revision(latest)
-        self.assertEqual(revision["graph"]["edge_count"], 1)
+        self.assertEqual(revision["graph"]["edges"], 1)
         self.assertEqual(revision["published_windows"], [0, 1])
         with np.load(latest/"trajectory.npz") as data:
             self.assertEqual(len(data["timestamps_ns"]), 27)
@@ -395,7 +357,7 @@ class G4MapBackendTest(unittest.TestCase):
         latest = service.update()
         revision = self.revision(latest)
         self.assertEqual(revision["published_windows"], [0, 2])
-        self.assertEqual(revision["graph"]["edge_count"], 0)
+        self.assertEqual(revision["graph"]["edges"], 0)
         source = revision["windows"][1]["source"]
         self.assertEqual(source["declared_shared_prefix"], 5)
         self.assertEqual(source["shared_prefix"], 0)
@@ -404,242 +366,53 @@ class G4MapBackendTest(unittest.TestCase):
             self.assertEqual(len(np.unique(data["timestamps_ns"])), 60)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 class BackendProfileTests(unittest.TestCase):
-    """D-0/D-5：会话给出的 profile 必须能直接构造后端，包括所有默认空值。"""
+    """会话写的 backend_profile.json 直接构造后端；老会话的旧键取中性值时照常，取已删功能的值时报错。"""
+
+    # Profile written before graph placement and registered plans were removed
+    # (the reference flight of 2026-11-20 carries exactly these keys).
+    OLD_FRAME_POSE = {
+        "camera_intrinsics": None, "fit_exclusion_source": "",
+        "frame_pose": {"frame_scales": True, "pose_time_offset_ms": 40.0, "pose_time_offset_stage": "capture"},
+        "frame_pose_fusion": True, "method_id": "frame_pose_window_scale_20261008",
+        "minimum_total_frames": 100, "overlap_frames": 5, "placement": "frame_pose", "registration": {},
+        "threshold_group": "", "threshold_table_path": "", "window_frame_semantics": "total_frames",
+        "window_frames": 40, "window_plan_path": "",
+    }
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         (self.root / "records").mkdir()
-        (self.root / "out").mkdir()
 
-    def test_default_profile_with_empty_paths_builds_a_backend(self):
+    def build(self, profile):
         from drone3d_reconstruction_core.g4.map_backend import build_backend
-        profile = {"method_id": "legacy_g4_20260916", "window_plan_path": "",
-                   "threshold_table_path": "", "fit_exclusion_source": "",
-                   "window_frame_semantics": "total_frames", "minimum_total_frames": 100,
-                   "registration": {}}
-        backend = build_backend(self.root / "records", SESSION, self.root / "out", profile)
+        return build_backend(self.root / "records", SESSION, self.root / "out", profile)
+
+    def test_old_frame_pose_profile_with_neutral_removed_keys_builds(self):
+        backend = self.build(self.OLD_FRAME_POSE)
         try:
-            self.assertEqual(len(backend.threshold_policy), 0)
-            self.assertEqual(backend.exclusions, {})
-            self.assertIsNone(backend.plan)
-            self.assertEqual(backend.method_id, "legacy_g4_20260916")
+            self.assertEqual(backend.method_id, "frame_pose_window_scale_20261008")
+            self.assertTrue(backend.frame_pose_config.frame_scales)
+            self.assertEqual(backend.frame_pose_config.pose_time_offset_ms, 40.0)
         finally:
             backend.close()
 
-    def test_grouped_profile_with_empty_paths_builds_a_backend(self):
-        from drone3d_reconstruction_core.g4.map_backend import build_backend
-        profile = {"method_id": "windowed_sim3_graph_20261008", "window_plan_path": "",
-                   "threshold_table_path": "", "threshold_group": "", "fit_exclusion_source": "",
-                   "window_frame_semantics": "new_frames", "minimum_total_frames": 100,
-                   "window_frames": 100, "overlap_frames": 20,
-                   "registration": {"ransac_degenerate": "abort"}}
-        backend = build_backend(self.root / "records", SESSION, self.root / "out", profile)
-        try:
-            self.assertEqual(backend.reg_config.ransac_degenerate, "abort")
-            self.assertEqual(backend.method_id, "windowed_sim3_graph_20261008")
-        finally:
-            backend.close()
-
-    def test_grouped_profile_with_a_plan_and_a_real_threshold_table(self):
-        # 冻结材料是可选的本地输入：按 DRONE3D_REPO_ROOT 约定定位，缺失时跳过。
-        root = Path(os.environ.get("DRONE3D_REPO_ROOT", Path(__file__).resolve().parents[4]))
-        frozen = root / "Data/experiments/testflight3_full_route_20260915"
-        seams, plan = frozen / "reports/seams.json", frozen / "inputs/candidate_windows.json"
-        if not seams.exists() or not plan.exists():
-            self.skipTest("frozen threshold table or plan is not present")
-        from drone3d_reconstruction_core.g4.map_backend import build_backend
-        profile = {"method_id": "windowed_sim3_graph_20261008", "window_plan_path": str(plan),
-                   "threshold_table_path": str(seams), "threshold_group": "G0",
-                   "fit_exclusion_source": "", "window_frame_semantics": "new_frames",
-                   "minimum_total_frames": 100, "window_frames": 100, "overlap_frames": 20,
-                   "registration": {"ransac_degenerate": "abort"}}
-        backend = build_backend(self.root / "records", SESSION, self.root / "out", profile)
-        try:
-            self.assertEqual(len(backend.plan), 38)
-            # 冻结表按 F0NN 命名；运行时窗口号是整数，必须能对上。
-            value, source = backend.threshold_policy.lookup(0, 1)
-            self.assertAlmostEqual(value, 0.014139644801616669, places=15)
-            self.assertTrue(source.endswith("seams.json"))
-            # 末段缺记录的两条边必须落回重算，而不是被当成 0。
-            self.assertGreaterEqual(backend.threshold_policy.skipped_records, 1)
-        finally:
-            backend.close()
-
-
-    def test_plan_shape_is_checked_against_the_declared_window(self):
-        from drone3d_reconstruction_core.g4.map_backend import build_backend, check_plan_shape
-        from g4_backend import plan_from_records
-        profile = {"window_frame_semantics": "new_frames", "window_frames": 100,
-                   "overlap_frames": 20, "minimum_total_frames": 100}
-        good = plan_from_records([
-            {"id": "F000", "new_start": 0, "new_end_exclusive": 100,
-             "input_start": 0, "input_end_exclusive": 100, "shared_prefix": 0},
-            {"id": "F001", "new_start": 100, "new_end_exclusive": 200,
-             "input_start": 80, "input_end_exclusive": 200, "shared_prefix": 20},
-            {"id": "F002", "new_start": 200, "new_end_exclusive": 274,
-             "input_start": 174, "input_end_exclusive": 274, "shared_prefix": 26},
-        ])
-        check_plan_shape(good, profile)  # 尾窗 26 共享 / 100 输入：接受
-        # 短窗借用不足：模型输入低于下限
-        starved = plan_from_records([
-            {"id": "F000", "new_start": 0, "new_end_exclusive": 100,
-             "input_start": 0, "input_end_exclusive": 100, "shared_prefix": 0},
-            {"id": "F001", "new_start": 100, "new_end_exclusive": 174,
-             "input_start": 80, "input_end_exclusive": 174, "shared_prefix": 20},
-        ])
-        with self.assertRaises(ValueError):
-            check_plan_shape(starved, profile)
-        # 常规窗与会话声明不一致
-        drifted = plan_from_records([
-            {"id": "F000", "new_start": 0, "new_end_exclusive": 100,
-             "input_start": 0, "input_end_exclusive": 100, "shared_prefix": 0},
-            {"id": "F001", "new_start": 100, "new_end_exclusive": 200,
-             "input_start": 70, "input_end_exclusive": 200, "shared_prefix": 30},
-        ])
-        with self.assertRaises(ValueError):
-            check_plan_shape(drifted, profile)
-        # total_frames 语义下不做该校验
-        check_plan_shape(drifted, {"window_frame_semantics": "total_frames"})
-
-    def test_threshold_table_group_ambiguity_is_rejected(self):
-        root = Path(os.environ.get("DRONE3D_REPO_ROOT", Path(__file__).resolve().parents[4]))
-        seams = root / "Data/experiments/testflight3_full_route_20260915/reports/seams.json"
-        if not seams.exists():
-            self.skipTest("frozen threshold table is not present")
-        from drone3d_reconstruction_core.g4.map_backend import load_threshold_table
-        with self.assertRaises(ValueError):
-            load_threshold_table(seams)
-
-class PortedArtifactTests(unittest.TestCase):
-    """移植字段必须真的落到消费者读取的产物里（run.json / revision.json / 窗口元数据）。"""
-
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
-        self.records, self.loaded, self.services = [], {}, []
-        from g4_backend import ThresholdPolicy, plan_from_records
-        self.policy = ThresholdPolicy({"0|1": 0.02}, source="registered_table.json")
-        self.plan = plan_from_records([
-            {"id": "F000", "new_start": 0, "new_end_exclusive": 30,
-             "input_start": 0, "input_end_exclusive": 30, "shared_prefix": 0},
-            {"id": "F001", "new_start": 30, "new_end_exclusive": 50,
-             "input_start": 20, "input_end_exclusive": 50, "shared_prefix": 10},
-        ], source="registered_plan.json")
-
-    def tearDown(self):
-        for service in self.services:
-            service.close()
-
-    def add_window(self, window_id, start, **kwargs):
-        record, loaded = fixture(window_id, start, **kwargs)
-        self.records.append(record)
-        self.loaded[window_id] = loaded
-        return record
-
-    def service(self):
-        from drone3d_reconstruction_core.g4.map_backend import G4MapBackend
-        from g4_backend import WINDOWED_METHOD_ID
-        service = G4MapBackend(self.root/"records", SESSION, self.root/"output",
-            reader=Reader(self.loaded), scanner=lambda root, session: list(self.records),
-            threshold_policy=self.policy, plan=self.plan, method_id=WINDOWED_METHOD_ID,
-            exclusion_source={"rgb-20": [[1., 1.], [2., 2.]]})
-        self.services.append(service)
-        return service
-
-    def test_run_and_revision_record_the_ported_input_policy(self):
-        from g4_backend import WINDOWED_METHOD_ID
-        self.add_window(0, 0, count=30)
-        self.add_window(1, 20, count=30, shared=10)
-        service = self.service()
-        path = service.update()
-        run = json.loads((self.root/"output"/"run.json").read_text())
-        self.assertEqual(run["method_id"], WINDOWED_METHOD_ID)
-        self.assertEqual(run["input_policy"]["recorded_threshold_count"], 1)
-        self.assertEqual(run["input_policy"]["plan_digest"], self.plan.digest())
-        self.assertEqual(run["input_policy"]["exclusion_frame_count"], 1)
-        revision = json.loads((path/"revision.json").read_text())
-        self.assertEqual(revision["method_id"], WINDOWED_METHOD_ID)
-        self.assertEqual(revision["graph"]["method_id"], WINDOWED_METHOD_ID)
-        self.assertEqual(revision["edge_thresholds"],
-                         [{"i": 0, "j": 1, "value": 0.02, "source": "registered_table.json"}])
-        self.assertEqual(revision["input_policy"]["plan_source"], "registered_plan.json")
-        second = revision["windows"][1]["source"]
-        self.assertEqual(second["method_id"], WINDOWED_METHOD_ID)
-        self.assertEqual(second["plan"]["digest"], self.plan.digest())
-        self.assertEqual(second["threshold"], {"value": 0.02, "source": "registered_table.json"})
-        self.assertEqual(second["registration"]["exclusion_source"], "inline_mapping")
-
-    def test_plan_mismatch_stops_ingestion_without_a_revision(self):
-        from drone3d_reconstruction_core.g4.map_backend import G4MapBackend
-        self.add_window(0, 0, count=30)
-        self.add_window(1, 20, count=30, shared=5)  # 计划要求 10 个共享帧
-        service = self.service()
-        with self.assertRaises(ValueError):
-            service.update()
-        self.assertFalse((self.root/"output"/"revisions").exists() and
-                         any((self.root/"output"/"revisions").iterdir()))
-
-class InputPolicyContentBindingTests(unittest.TestCase):
-    """输入策略必须按**内容**绑定：同路径、同条目数但数值变化不得复用旧输出目录。"""
-
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
-        (self.root / "records").mkdir()
-        self.out = self.root / "output"
-
-    def open_backend(self, thresholds, exclusions):
-        from g4_backend import ThresholdPolicy
-        return G4MapBackend(self.root / "records", SESSION, self.out,
-                            threshold_policy=ThresholdPolicy(thresholds, source="registered_table.json"),
-                            exclusion_source=exclusions)
-
-    def test_changed_threshold_values_reject_reuse(self):
-        backend = self.open_backend({"0|1": 0.03}, {"123": [[10.0, 20.0]]})
-        digest = backend.config_digest
-        backend.close()
-        with self.assertRaises(ValueError):
-            self.open_backend({"0|1": 3.0}, {"123": [[10.0, 20.0]]})
-
-    def test_changed_exclusion_content_rejects_reuse(self):
-        backend = self.open_backend({"0|1": 0.03}, {"123": [[10.0, 20.0]]})
-        backend.close()
-        with self.assertRaises(ValueError):
-            self.open_backend({"0|1": 0.03}, {"123": [[110.0, 120.0]]})
-
-    def test_identical_content_reuses_the_output_directory(self):
-        backend = self.open_backend({"0|1": 0.03}, {"123": [[10.0, 20.0]]})
-        digest = backend.config_digest
-        backend.close()
-        again = self.open_backend({"0|1": 0.03}, {"123": [[10.0, 20.0]]})
-        try:
-            self.assertEqual(again.config_digest, digest)
-        finally:
-            again.close()
-
-    def test_content_is_bound_even_when_only_order_differs(self):
-        backend = self.open_backend({"0|1": 0.03, "1|2": 0.05}, {"123": [[10.0, 20.0]]})
-        backend.close()
-        reordered = self.open_backend({"1|2": 0.05, "0|1": 0.03}, {"123": [[10.0, 20.0]]})
-        reordered.close()
-
-    def test_alias_spellings_of_the_same_edge_share_one_digest(self):
-        """同一策略的两种拼写必须得到同一摘要；冲突拼写则在构造时就拒绝。"""
-        from g4_backend import ThresholdPolicy
-        from drone3d_reconstruction_core.g4.map_backend import _input_policy
-        single = _input_policy(ThresholdPolicy({"0|1": 0.03}, source="t"), {}, "none", None)
-        alias = _input_policy(ThresholdPolicy({"F000|F001": 0.03}, source="t"), {}, "none", None)
-        self.assertEqual(single, alias)
-        with self.assertRaises(ValueError):
-            ThresholdPolicy({"0|1": 0.03, "F000|F001": 3.0})
+    def test_profiles_that_used_removed_features_are_rejected(self):
+        for change, message in (
+            ({"placement": "graph"}, "graph placement was removed"),
+            ({"placement": None}, "graph placement was removed"),
+            ({"window_frame_semantics": "new_frames"}, "removed feature"),
+            ({"window_plan_path": "/plans/candidate_windows.json"}, "removed feature"),
+            ({"threshold_table_path": "/reports/seams.json"}, "removed feature"),
+            ({"threshold_group": "G0"}, "removed feature"),
+            ({"fit_exclusion_source": "/reports/exclusions.json"}, "removed feature"),
+            ({"registration": {"ransac_degenerate": "abort"}}, "removed feature"),
+        ):
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, message):
+                self.build({**self.OLD_FRAME_POSE, **change})
+        self.assertFalse((self.root / "out").exists())
 
 
 def pose_fixture(window_id, start, **kwargs):
@@ -677,7 +450,7 @@ class FramePosePlacementTest(unittest.TestCase):
     def service(self, **kwargs):
         service = G4MapBackend(self.root / "records", SESSION, self.root / "output",
                                reader=Reader(self.loaded), scanner=lambda root, session: list(self.records),
-                               placement="frame_pose", **kwargs)
+                               **kwargs)
         self.services.append(service)
         return service
 
@@ -753,7 +526,7 @@ class FramePosePlacementTest(unittest.TestCase):
             for loaded in self.loaded.values():
                 loaded.metadata["capture_pose_time_offset_ms"] = 0.0
             service = G4MapBackend(self.root / "records", SESSION, self.root / output, reader=Reader(self.loaded),
-                                   scanner=lambda root, session: list(self.records), placement="frame_pose",
+                                   scanner=lambda root, session: list(self.records),
                                    frame_pose_config=config)
             self.services.append(service)
             windows = self.revision(service.update())["windows"]
@@ -793,7 +566,7 @@ class FramePosePlacementTest(unittest.TestCase):
         def solve(output):
             config = FramePoseConfig(pose_time_offset_stage="capture", frame_scales=True)
             service = G4MapBackend(self.root / "records", SESSION, self.root / output, reader=Reader(self.loaded),
-                                   scanner=lambda root, session: list(self.records), placement="frame_pose",
+                                   scanner=lambda root, session: list(self.records),
                                    frame_pose_config=config)
             self.services.append(service)
             return self.revision(service.update())["windows"]
@@ -839,27 +612,18 @@ class FramePosePlacementTest(unittest.TestCase):
         K = np.array(window["intrinsics"])
         np.testing.assert_allclose(K[[0, 1, 0, 1], [0, 1, 2, 2]], [20., 22., 15.5, 14.75])
 
-    def test_graph_runs_keep_their_historical_run_file(self):
-        self.add_window(0, 0)
-        service = G4MapBackend(self.root / "records", SESSION, self.root / "output",
-                               reader=Reader(self.loaded), scanner=lambda root, session: list(self.records))
-        self.services.append(service)
-        stored = json.loads((self.root / "output" / "run.json").read_text())
-        for key in ("placement", "frame_pose", "camera_intrinsics"):
-            self.assertNotIn(key, stored)
-
     def test_frame_pose_profile_builds_a_backend_with_its_method_identity(self):
         from drone3d_reconstruction_core.g4.map_backend import build_backend
         from g4_backend import FRAME_POSE_METHOD_ID
         (self.root / "records").mkdir()
         backend = build_backend(self.root / "records", SESSION, self.root / "out", {
-            "window_plan_path": "", "threshold_table_path": "", "fit_exclusion_source": "",
-            "window_frame_semantics": "total_frames", "registration": {}, "placement": "frame_pose",
-            "frame_pose": {"pose_time_offset_ms": 70.0}, "camera_intrinsics": None})
+            "placement": "frame_pose", "frame_pose": {"pose_time_offset_ms": 70.0}, "camera_intrinsics": None})
         try:
             self.assertEqual(backend.method_id, FRAME_POSE_METHOD_ID)
             self.assertEqual(backend.frame_pose_config.pose_time_offset_ms, 70.0)
         finally:
             backend.close()
-        with self.assertRaises(ValueError):
-            G4MapBackend(self.root / "records", SESSION, self.root / "out2", placement="bundle")
+
+
+if __name__ == "__main__":
+    unittest.main()

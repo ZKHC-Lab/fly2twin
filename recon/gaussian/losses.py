@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Differentiable BEST losses; torch is imported only by training callers."""
+"""Differentiable training losses; torch is imported only by training callers."""
 
 def inverse_depth_pearson(rendered, prior, mask):
     x = rendered[mask].clamp_min(1e-6).reciprocal()

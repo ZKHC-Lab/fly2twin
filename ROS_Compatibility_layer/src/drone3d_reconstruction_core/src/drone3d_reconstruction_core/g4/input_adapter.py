@@ -83,8 +83,6 @@ class WindowInputReader:
                                       1024**3, 2*1024**3, 4096, 4096)
         snapshot = validate_snapshot(str(snapshot_path), record["snapshot_manifest_sha256"],
                                      [snapshot_path.parent], limits)
-        if snapshot.snapshot_version < 4:
-            raise ValueError("G4 needs a retained v4 RGB/odometry/TF snapshot")
         selected = payload.get("selected_frames", [])
         indices = [int(item["index"]) for item in selected]
         if indices != list(range(snapshot.frame_count)):

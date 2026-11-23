@@ -1,6 +1,5 @@
 """CPU coverage of phone stage wiring; no GPU kernels or model downloads."""
 import json
-from pathlib import Path
 from types import SimpleNamespace
 import sys
 

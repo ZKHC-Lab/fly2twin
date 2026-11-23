@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""COLMAP orchestration. Explicit partial-model policy; no silent pose fallback."""
+"""COLMAP orchestration. Partial registration is rejected; no silent pose fallback."""
 from pathlib import Path
 import numpy as np
 from recon.io.common import dump
@@ -33,7 +33,6 @@ def estimate(data,manifest,out,settings,provider):
     n=len(names);registered=counts.get(str(largest),0)
     dump(out/'report.json',dict(provider='colmap',units='arbitrary',input_frames=n,registered=registered,
         registration_rate=registered/n,models=counts,disconnected_submodels=max(0,len(models)-1),largest_model=largest,
-        partial_policy=settings.get('partial_policy','reject'),
         recommendation=('For white-wall/weak-texture fragmentation, use pose.provider: glomap to solve globally' if registered<n else None)))
     if largest is None: raise RuntimeError('COLMAP registered no model; see report.json')
     if registered<n:

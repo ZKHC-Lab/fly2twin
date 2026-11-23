@@ -3,9 +3,8 @@
 from pathlib import Path
 import hashlib
 import json
-import shutil
 import numpy as np
-from .io.common import load_json, load_manifest, dump, digest, image_loader
+from .io.common import load_json, load_manifest, stage_manifest, dump, digest, image_loader
 from .geometry.transforms import resize_K, normalization
 
 STAGES = ('prepare','pose','depth','fuse','train','eval','export')
@@ -193,9 +192,7 @@ def depth(cfg,out,root):
         dump(out/'source.json',dict(folder=str(Path(settings['cache']).resolve()),reused_predictions=True))
         return
     from .depth.backends import infer_windows
-    manifest_path=root/'pose/manifest.json'
-    if not manifest_path.exists(): manifest_path=root/'prepare/manifest.json'
-    infer_windows(load_json(manifest_path),settings,out)
+    infer_windows(stage_manifest(root),settings,out)
     dump(out/'source.json',dict(folder=str(out.resolve()),reused_predictions=False))
 
 
@@ -246,9 +243,7 @@ def fuse(cfg,out,root):
 
 def load_data(cfg,root,init=False):
     with np.load(root/'pose/cameras.npz',allow_pickle=False) as z: data=dict(z)
-    manifest_path=root/'pose/manifest.json'
-    if not manifest_path.exists(): manifest_path=root/'prepare/manifest.json'
-    manifest=load_json(manifest_path)
+    manifest=stage_manifest(root)
     data['arbitrary_scale']=load_json(root/'pose/report.json').get('units')=='arbitrary'
     selection=load_json(root/'prepare/selection.json')
     fixed=load_json(cfg['normalization_file']) if cfg.get('normalization_file') else cfg.get('normalization')
@@ -256,7 +251,7 @@ def load_data(cfg,root,init=False):
     poses,K=data['c2w'],data['K']
     center,meters,scale=normalization(poses,train,fixed)
     normalized=poses.astype(np.float32).copy()
-    # Reference casts poses first then translates in float64 on T21 replacement path.
+    # The reference drone run cast poses to float32 first, then translated in float64.
     source=normalized if cfg.get('normalization_cast_first',False) else poses
     normalized[:,:3,3]=(source[:,:3,3]-center)/meters
     w,h=cfg.get('train',{}).get('resolution',[640,360]);sw,sh=manifest['resolution']

@@ -1,20 +1,21 @@
-"""Unit tests for the frame-pool core (import, scoring, NMS, synthetic snapshot)."""
+"""Unit tests for the frame-pool core (import, retain, clear, synthetic snapshot)."""
 
 from pathlib import Path
-from types import SimpleNamespace
+import sys
 import shutil
 import tempfile
 import unittest
 
 import numpy as np
 
+# The shared v4 snapshot fixture lives next to this file; catkin's nose run does not add this directory.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from snapshot_v4 import write_v4_snapshot  # noqa: E402
 from drone3d_reconstruction_core.frame_pool import (
     FramePoolCapacityError,
     FramePool,
     FramePoolConfig,
     FramePoolError,
-    RECONSTRUCTION_MODE_FRAME_POOL,
-    RECONSTRUCTION_MODE_PER_WINDOW,
 )
 from drone3d_reconstruction_core.snapshot_validator import (
     SnapshotSafetyLimits,
@@ -34,48 +35,21 @@ def _limits():
     )
 
 
-def _png(path: Path, value: int):
+def _png_bytes(index):
     import cv2
     image = ((np.indices((16, 16)).sum(axis=0) % 2) * 255).astype(np.uint8)
-    if not cv2.imwrite(str(path), image):
-        raise RuntimeError("could not write test PNG")
+    encoded, png = cv2.imencode(".png", image)
+    if not encoded:
+        raise RuntimeError("could not encode test PNG")
+    return png.tobytes()
 
 
 def _snapshot(root: Path, count=4, positions=None):
-    images = root / "images"
-    images.mkdir(parents=True)
-    paths = []
-    stamps = []
-    valid = []
-    payloads = []
-    for index in range(count):
-        path = images / f"frame_{index:06d}.png"
-        _png(path, index + 1)
-        paths.append(path)
-        stamps.append(SimpleNamespace(sec=100 + index, nsec=index))
-        valid.append(True)
-        if positions is not None:
-            payloads.append(
-                {
-                    "header": {"frame_id": "map", "stamp": {"sec": 100 + index, "nsec": 0}},
-                    "pose": {
-                        "position": {
-                            "x": float(positions[index][0]),
-                            "y": float(positions[index][1]),
-                            "z": float(positions[index][2]),
-                        },
-                        "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
-                    },
-                }
-            )
-        else:
-            payloads.append(None)
-    return SimpleNamespace(
-        image_paths=tuple(paths),
-        frame_stamps=tuple(stamps),
-        pose_valid=tuple(valid),
-        odometry_payloads=tuple(payloads),
-    )
+    """A validated v4 snapshot of ``count`` frames stamped 100+k s, k ns, all with odometry."""
+    digest = write_v4_snapshot(root, "scene", count, first_stamp_sec=100,
+                               stamp_nsecs=range(count), image_bytes=_png_bytes,
+                               positions=positions, odometry_frame_id="map")
+    return validate_snapshot(str(root), digest, (root.parent,), _limits())
 
 
 class FramePoolTest(unittest.TestCase):
@@ -169,47 +143,6 @@ class FramePoolTest(unittest.TestCase):
         self.assertEqual(combined.tf_entries, expected_tf)
         self.assertEqual((combined.canonical_root / combined.depth_paths[0]).read_bytes(), b"\x01\x00\x02\x00")
 
-    def test_selection_is_score_ranked_with_odom_voxel_nms(self):
-        snapshot_root = Path(self.temp.name) / "snap"
-        positions = [
-            (0.0, 0.0, 0.0),   # voxel 0
-            (0.1, 0.1, 0.0),   # voxel 0 (NMS removes lower score)
-            (1.0, 0.0, 0.0),   # voxel 2
-            (1.1, 0.0, 0.0),   # voxel 2
-        ]
-        snapshot = _snapshot(snapshot_root, positions=positions)
-        self.pool.import_window(snapshot, 0)
-        self.pool.entries[0].score = 0.9
-        self.pool.entries[1].score = 0.8
-        self.pool.entries[2].score = 0.6
-        self.pool.entries[3].score = 0.4
-        selected = self.pool.select(2, voxel_m=0.5)
-        self.assertEqual([entry.global_index for entry in selected], [0, 2])
-        self.assertTrue(selected[0].stamp_key() < selected[1].stamp_key())
-
-    def test_selection_keeps_different_angles_at_same_position_and_fills_count(self):
-        snapshot = _snapshot(Path(self.temp.name) / "views", count=120,
-                             positions=[(0, 0, 0)] * 120)
-        self.pool.import_window(snapshot, 0)
-        for entry in self.pool.entries:
-            entry.score = 1.0 - entry.global_index / 1000
-        self.pool.entries[1].odom_orientation = (0.0, 0.0, 1.0, 0.0)
-        selected = self.pool.select(2)
-        self.assertEqual([e.global_index for e in selected], [0, 1])
-        self.assertEqual(len(self.pool.select(100)), 100)
-        self.pool.entries[-1].score = 2.0
-        self.assertIn(119, [e.global_index for e in self.pool.select(100)])
-
-    def test_bad_images_excluded_and_missing_pose_uses_time_coverage(self):
-        snapshot = _snapshot(Path(self.temp.name) / "no-pose", count=6)
-        snapshot.pose_valid = (False,) * 6
-        snapshot.image_paths[0].write_bytes(b"broken PNG")
-        self.pool.import_window(snapshot, 0)
-        selected = self.pool.select(3)
-        self.assertEqual(len(selected), 3)
-        self.assertNotIn(0, [e.global_index for e in selected])
-        self.assertGreaterEqual(selected[-1].stamp_sec - selected[0].stamp_sec, 3)
-
     def test_import_failure_is_atomic_and_retryable(self):
         oversized = _snapshot(Path(self.temp.name) / "oversized", count=2)
         pool = FramePool(self.root, FramePoolConfig(max_frames=1))
@@ -238,9 +171,7 @@ class FramePoolTest(unittest.TestCase):
     def test_clear_discards_epoch_without_reusing_indices(self):
         first = _snapshot(Path(self.temp.name) / "first", count=2)
         self.pool.import_window(first, 0)
-        self.pool.write_selection(0, self.pool.select(2))
         self.pool.clear()
-        self.assertTrue((self.root / "selections" / "p000000.json").is_file())
         second = _snapshot(Path(self.temp.name) / "second", count=1)
         self.assertEqual(self.pool.import_window(second, 1), [2])
         self.assertEqual([entry.global_index for entry in self.pool.entries], [2])
@@ -257,40 +188,16 @@ class FramePoolTest(unittest.TestCase):
         second = _snapshot(Path(self.temp.name) / "second", count=1)
         self.assertEqual(self.pool.import_window(second, 1), [4])
 
-    def test_update_from_predictions_scores_conf_and_points(self):
-        snapshot_root = Path(self.temp.name) / "snap"
-        snapshot = _snapshot(snapshot_root, count=2)
-        self.pool.import_window(snapshot, 0)
-        predictions = Path(self.temp.name) / "predictions.npz"
-        conf = np.array([[[0.9, 1.0], [1.1, 1.2]], [[0.1, 0.2], [0.3, 0.4]]], dtype=np.float32)
-        world = np.zeros((2, 2, 2, 3), dtype=np.float32)
-        world[0, :, :, :] = 0.5
-        world[1, :, :, :] = 0.5
-        world[1, 1, 1, 1] = float("nan")  # fewer valid points
-        np.savez(
-            predictions,
-            depth_conf=conf,
-            world_points_from_depth=world,
-        )
-        self.pool.update_from_predictions(predictions, [0, 1], revision=1)
-        self.assertGreater(self.pool.entries[0].score, self.pool.entries[1].score)
-        self.assertEqual(self.pool.entries[0].source, "vggt_depth_conf")
-        self.assertEqual(self.pool.entries[0].vggt_valid_points, 4)
-        self.assertEqual(self.pool.entries[1].vggt_valid_points, 3)
-        self.assertAlmostEqual(self.pool.entries[0].score, 0.75, places=4)
-        self.assertAlmostEqual(self.pool.entries[1].score, 0.25, places=4)
-
     def test_synthetic_snapshot_passes_existing_validator(self):
         snapshot_root = Path(self.temp.name) / "snap"
         snapshot = _snapshot(snapshot_root, count=3)
         self.pool.import_window(snapshot, 0)
-        selected = self.pool.select(3)
         destination = Path(self.temp.name) / "cs-s0123456789abcdef-w1-0123456789abcdef"
         uri, digest = self.pool.build_synthetic_snapshot(
             1,
-            selected,
+            self.pool.entries,
             destination,
-            "cs-s0123456789abcdef-p1",
+            "cs-s0123456789abcdef-w1",
             camera_name="front_camera",
             image_topic="/front/image_raw",
             camera_role="front",
@@ -299,7 +206,8 @@ class FramePoolTest(unittest.TestCase):
         self.assertTrue(destination.is_dir())
         self.assertEqual(uri, destination.as_uri())
         validated = validate_snapshot(uri, digest, (destination.parent,), _limits())
-        self.assertEqual(validated.snapshot_version, 3)
+        self.assertEqual(validated.snapshot_version, 4)
+        self.assertEqual(validated.pose_valid, (True, True, True))
         self.assertEqual(validated.frame_count, 3)
         self.assertEqual(len(validated.image_paths), 3)
         self.assertEqual(validated.camera_role, "front")
@@ -313,7 +221,7 @@ class FramePoolTest(unittest.TestCase):
             with self.subTest(limit=key):
                 destination = Path(self.temp.name) / ("limited-" + key)
                 with self.assertRaises(FramePoolError):
-                    self.pool.build_synthetic_snapshot(0, self.pool.select(3), destination, "scene",
+                    self.pool.build_synthetic_snapshot(0, self.pool.entries, destination, "scene",
                         camera_name="front", image_topic="/rgb", camera_role="front",
                         camera_frame_id="camera", limits=replace(_limits(), **{key: value}))
                 self.assertFalse(destination.exists())
@@ -334,9 +242,9 @@ class FramePoolTest(unittest.TestCase):
         with self.assertRaisesRegex(OSError, "injected synthetic copy failure"):
             self.pool.build_synthetic_snapshot(
                 0,
-                self.pool.select(2),
+                self.pool.entries,
                 destination,
-                "cs-s0123456789abcdef-p0",
+                "cs-s0123456789abcdef-w0",
                 camera_name="front_camera",
                 image_topic="/front/image_raw",
                 camera_role="front",
@@ -346,13 +254,20 @@ class FramePoolTest(unittest.TestCase):
         self.assertFalse(destination.exists())
         self.assertEqual(list(destination.parent.glob(f".{destination.name}.*")), [])
 
-    def test_invalid_config_and_selection_size_are_rejected(self):
-        with self.assertRaises(FramePoolError):
-            FramePoolConfig(voxel_m=0)
+    def test_synthetic_snapshot_rejects_entries_without_v4_metadata(self):
+        from dataclasses import replace
+        self.pool.import_window(_snapshot(Path(self.temp.name) / "snap", count=2), 0)
+        legacy = [replace(entry, frame_metadata=None) for entry in self.pool.entries]
+        destination = Path(self.temp.name) / "legacy"
+        with self.assertRaisesRegex(FramePoolError, "only snapshot version 4"):
+            self.pool.build_synthetic_snapshot(
+                0, legacy, destination, "scene", camera_name="front", image_topic="/rgb",
+                camera_role="front", camera_frame_id="camera")
+        self.assertFalse(destination.exists())
+
+    def test_invalid_config_and_empty_selection_are_rejected(self):
         with self.assertRaises(FramePoolError):
             FramePoolConfig(max_frames=0)
-        with self.assertRaises(FramePoolError):
-            self.pool.select(0)
         with self.assertRaises(FramePoolError):
             self.pool.build_synthetic_snapshot(
                 1,
@@ -364,10 +279,6 @@ class FramePoolTest(unittest.TestCase):
                 camera_role="front",
                 camera_frame_id="front_camera_optical_frame",
             )
-
-    def test_mode_constants(self):
-        self.assertEqual(RECONSTRUCTION_MODE_PER_WINDOW, "per_window")
-        self.assertEqual(RECONSTRUCTION_MODE_FRAME_POOL, "frame_pool")
 
 
 if __name__ == "__main__":

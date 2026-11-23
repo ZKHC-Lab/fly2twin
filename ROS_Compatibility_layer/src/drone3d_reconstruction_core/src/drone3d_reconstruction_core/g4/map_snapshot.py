@@ -35,6 +35,8 @@ def apply_map_snapshot(records, records_root, session_id):
         revision = json.loads(raw)
         if revision["session_id"] != session_id or revision["replacement"] != "complete_map":
             raise ValueError("G4 display session or replacement contract differs")
+    if revision.get("placement") != "frame_pose":
+        raise ValueError("G4 revision uses the removed graph placement; this session cannot be displayed")
     windows = {w["window_id"]: w for w in revision["windows"]}
     if len(windows) != len(revision["windows"]):
         raise ValueError("duplicate G4 revision window")

@@ -1,6 +1,6 @@
 # VGGT-Omega 独立流程(历史/开发用)
 
-> 本文是 S380 时代的独立脚本和开发查看器说明，不定义当前配置。机载主线见 [ROS 兼容层](../../../ROS_Compatibility_layer/README.md)，离线流程见 [recon](../../../recon/README.md)；两者都通过 `reconstruct_omega.py` 做推理，参数由各自的配置给出。
+> 本文是 S380 时代的独立脚本说明，不定义当前配置。机载主线见 [ROS 兼容层](../../../ROS_Compatibility_layer/README.md)，离线流程见 [recon](../../../recon/README.md)；两者都通过 `reconstruct_omega.py` 做推理，参数由各自的配置给出。
 
 ## 环境准备
 
@@ -69,36 +69,6 @@ Run stages manually:
 python3 third_party/vggt-omega/reconstruct_omega.py
 python3 third_party/vggt-omega/web_viewer.py --output_dir colmap/data_vggt_omega
 ```
-
-### Live committed-result watcher (legacy dev viewer, NOT the production Web)
-
-> For the continuous single-NX production line, use the WP8 Web node
-> (`continuous_production.sh --web`, bind host/port in the continuous profile)
-> instead. It provides session isolation, live RGB/depth, latest-window Omega
-> depth, status/control and the accumulated same-map point cloud.
-
-The legacy `third_party/vggt-omega/result_watch_viewer.py` polls a results root every 2 s
-and lists every directory that contains a committed `result.json` +
-`predictions.npz`. It is a single-result development viewer only: it has no
-session isolation, scans every result under one root, and its frame slider is
-not bound. Do not use it as evidence for the continuous production Web.
-
-```bash
-python3 third_party/vggt-omega/result_watch_viewer.py   --results-root <结果根目录>   --server-port 8080
-# 另一台机器的浏览器：http://<运行主机地址>:8080
-```
-
-On the local workstation while ROS1 Noetic runs inside Docker (Gradio 5 needs
-Python >= 3.10, so use a small viewer container next to the ROS container with
-the repository mounted):
-
-```bash
-docker run --rm --network host -v "$PWD":/repo -w /repo python:3.11-slim bash -lc   "pip install -q 'numpy<2' pillow matplotlib trimesh gradio &&    python third_party/vggt-omega/result_watch_viewer.py      --results-root /repo/<your-results-root> --server-port 8080"
-# browser: http://localhost:8080
-```
-
-Run the viewer before starting `rosbag play`; every verified and atomically
-committed reconstruction shows up automatically without touching staging data.
 
 ### VGGT-Omega key parameters
 

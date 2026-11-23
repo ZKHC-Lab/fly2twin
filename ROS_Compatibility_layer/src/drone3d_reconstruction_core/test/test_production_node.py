@@ -132,8 +132,6 @@ class ProductionNodeTestBase(unittest.TestCase):
             "conf_thres": 50.0,
             "max_points_k": 5,
             "profile_name": "local_docker_test_candidate",
-            "required_device_sku": "docker_test_candidate",
-            "device_sku": "docker_test_candidate",
             "algorithm_revision": "test-algorithm-revision",
             "ros_revision": "test-ros-revision",
         }
@@ -153,7 +151,6 @@ class ProductionNodeConfigTest(ProductionNodeTestBase):
         config = load_production_config(self.make_params())
         self.assertIsInstance(config, ProductionConfig)
         self.assertEqual(config.profile_name, "local_docker_test_candidate")
-        self.assertEqual(config.required_device_sku, "docker_test_candidate")
         self.assertEqual(config.image_resolution, 4)
 
     def test_runtime_memory_guard_is_optional_and_profile_controlled(self):
@@ -225,8 +222,6 @@ class ProductionNodeConfigTest(ProductionNodeTestBase):
             "conf_thres",
             "max_points_k",
             "profile_name",
-            "required_device_sku",
-            "device_sku",
             "algorithm_revision",
             "ros_revision",
         ]
@@ -256,8 +251,6 @@ class ProductionNodeConfigTest(ProductionNodeTestBase):
                 "swap_sample_window_sec": 0.01,
                 "extra": 1,
             }},
-            {"device_sku": "bad sku"},
-            {"required_device_sku": ""},
             {"verifier_timeout_sec": float("nan")},
             {"conf_thres": True},
         )
@@ -266,18 +259,9 @@ class ProductionNodeConfigTest(ProductionNodeTestBase):
                 with self.assertRaises(ProductionNodeConfigError):
                     load_production_config(self.make_params(**overrides))
 
-    def test_device_sku_mismatch_is_a_deployment_error(self):
-        params = self.make_params(required_device_sku="orin_nx_16gb_unsigned")
-        with self.assertRaises(ProductionNodeConfigError) as context:
-            load_production_config(params)
-        self.assertIn("device SKU mismatch", str(context.exception))
-
-    def test_injected_sku_probe_result_is_compared(self):
-        params = self.make_params()
-        with self.assertRaises(ProductionNodeConfigError):
-            load_production_config(
-                params, sku_probe=lambda _params: "different_device"
-            )
+    def test_device_sku_keys_left_in_old_profiles_are_ignored(self):
+        params = self.make_params(required_device_sku="old_board", device_sku="other_board")
+        self.assertEqual(load_production_config(params), load_production_config(self.make_params()))
 
     def test_runtime_wiring_defaults_are_interface_only(self):
         runtime = load_runtime_params({})
@@ -300,7 +284,7 @@ class DiagnosticsAssemblyTest(ProductionNodeTestBase):
     def test_diagnostic_array_contains_phase1_required_fields(self):
         state = DiagnosticsState()
         config = load_production_config(self.make_params())
-        state.set_config(config, "docker_test_candidate")
+        state.set_config(config)
         state.record_finished(JobFinished("worker_exit", 137, 12.5, 8))
         terminal = SimpleNamespace(
             error_code=4,
@@ -347,7 +331,8 @@ class DiagnosticsAssemblyTest(ProductionNodeTestBase):
         self.assertEqual(supervisor.level, DiagnosticStatus.OK)
         supervisor_values = {item.key: item.value for item in supervisor.values}
         self.assertEqual(supervisor_values["profile_name"], "local_docker_test_candidate")
-        self.assertEqual(supervisor_values["actual_device_sku"], "docker_test_candidate")
+        self.assertNotIn("actual_device_sku", supervisor_values)
+        self.assertNotIn("required_device_sku", supervisor_values)
         self.assertEqual(supervisor_values["checkpoint_sha256"], config.checkpoint_sha256)
 
         job = message.status[1]
@@ -392,7 +377,7 @@ class DiagnosticsAssemblyTest(ProductionNodeTestBase):
     def test_resource_breaches_are_reported_with_warn(self):
         state = DiagnosticsState()
         config = load_production_config(self.make_params())
-        state.set_config(config, "docker_test_candidate")
+        state.set_config(config)
         message = assemble_diagnostic_array(
             state=state.snapshot(),
             server_snapshot={"running": False, "stage": "idle"},

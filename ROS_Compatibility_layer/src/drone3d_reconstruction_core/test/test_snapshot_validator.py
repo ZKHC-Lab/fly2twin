@@ -29,6 +29,84 @@ LIMITS = SnapshotSafetyLimits(
 )
 
 
+FRAME_COLUMNS = (
+    "frame_index",
+    "image_path",
+    "stamp_sec",
+    "stamp_nsec",
+    "pose_valid",
+    "pose_delta_ms",
+    "odometry_gap_ms",
+    "auxiliary_path",
+    "camera_info_delta_ms",
+    "odometry_delta_ms",
+    "depth_path",
+    "depth_delta_ms",
+)
+
+
+def _row(index, image_path, stamp_sec=None, **changes):
+    """One v4 frames.csv row without a pose or auxiliary file."""
+    row = {
+        "frame_index": str(index),
+        "image_path": image_path,
+        "stamp_sec": str(10 + index if stamp_sec is None else stamp_sec),
+        "stamp_nsec": "0",
+        "pose_valid": "false",
+        "pose_delta_ms": "-1",
+        "odometry_gap_ms": "-1",
+        "auxiliary_path": "",
+        "camera_info_delta_ms": "-1",
+        "odometry_delta_ms": "-1",
+        "depth_path": "",
+        "depth_delta_ms": "-1",
+    }
+    row.update(changes)
+    return row
+
+
+def _minimal_metadata():
+    """v4 snapshot.json for two frames without any auxiliary data."""
+    return {
+        "schema": SNAPSHOT_SCHEMA,
+        "version": 4,
+        "status": "PASS",
+        "scene_id": "scene-01",
+        "frame_count": 2,
+        "camera_name": "camera4",
+        "image_topic": "/camera4/image_raw",
+        "first_stamp_sec": 10,
+        "first_stamp_nsec": 0,
+        "last_stamp_sec": 11,
+        "last_stamp_nsec": 0,
+        "has_camera_info": False,
+        "has_odometry": False,
+        "camera_role": "front",
+        "camera_frame_id": "front_camera_optical_frame",
+        "camera_info_topic": None,
+        "odometry_topic": None,
+        "depth_topic": None,
+        "tf_topic": None,
+        "tf_static_topic": None,
+        "save_sensor_depth": False,
+        "body_frame_id": None,
+        "has_tf": False,
+        "has_depth": False,
+        "camera_info_digest": None,
+        "auxiliary_summary": {
+            "camera_info_samples": 0,
+            "odometry_samples": 0,
+            "depth_samples": 0,
+            "tf_samples": 0,
+            "camera_info_matched_frames": 0,
+            "odometry_matched_frames": 0,
+            "depth_matched_frames": 0,
+            "tf_dropped": 0,
+            "auxiliary_errors": 0,
+        },
+    }
+
+
 def _csv_bytes(columns, rows):
     import io
 
@@ -48,17 +126,11 @@ class SnapshotFixture:
             "images/frame_000.jpg": b"first-image",
             "images/frame_001.jpg": b"second-image",
         }
-        self.metadata = {
-            "schema": SNAPSHOT_SCHEMA,
-            "version": 1,
-            "status": "PASS",
-            "scene_id": "scene-01",
-            "frame_count": 2,
-        }
-        self.frame_columns = ("frame_index", "image_path")
+        self.metadata = _minimal_metadata()
+        self.frame_columns = FRAME_COLUMNS
         self.frame_rows = [
-            {"frame_index": "0", "image_path": "images/frame_000.jpg"},
-            {"frame_index": "1", "image_path": "images/frame_001.jpg"},
+            _row(0, "images/frame_000.jpg"),
+            _row(1, "images/frame_001.jpg"),
         ]
         self.extra_manifest = {}
         self.write()
@@ -233,10 +305,12 @@ class SnapshotValidatorTest(unittest.TestCase):
     def test_rejects_schema_identity_status_scene_and_count(self):
         cases = (
             ("schema", "other", "UNSUPPORTED_SCHEMA"),
-            ("version", 2, "MALFORMED_SCHEMA"),
-            ("version", 3, "MALFORMED_SCHEMA"),
+            ("version", 1, "UNSUPPORTED_SCHEMA"),
+            ("version", 2, "UNSUPPORTED_SCHEMA"),
+            ("version", 3, "UNSUPPORTED_SCHEMA"),
+            ("version", 5, "UNSUPPORTED_SCHEMA"),
             ("version", True, "UNSUPPORTED_SCHEMA"),
-            ("version", 1.0, "UNSUPPORTED_SCHEMA"),
+            ("version", 4.5, "UNSUPPORTED_SCHEMA"),
             ("status", "FAIL", "INVALID_STATUS"),
             ("scene_id", "../bad", "INVALID_SCENE_ID"),
             ("scene_id", "trailing.", "INVALID_SCENE_ID"),
@@ -260,14 +334,14 @@ class SnapshotValidatorTest(unittest.TestCase):
 
     def test_rejects_frames_columns_order_duplicates_and_unsafe_paths(self):
         bad_rows = (
-            ([{"frame_index": "1", "image_path": "images/frame_000.jpg"},
-              {"frame_index": "0", "image_path": "images/frame_001.jpg"}], "FRAME_ORDER"),
-            ([{"frame_index": "0", "image_path": "images/frame_000.jpg"},
-              {"frame_index": "1", "image_path": "images/frame_000.jpg"}], "DUPLICATE_IMAGE"),
-            ([{"frame_index": "0", "image_path": "../frame.jpg"},
-              {"frame_index": "1", "image_path": "images/frame_001.jpg"}], "UNSAFE_PATH"),
-            ([{"frame_index": "0", "image_path": "other/frame.jpg"},
-              {"frame_index": "1", "image_path": "images/frame_001.jpg"}], "UNSAFE_IMAGE_PATH"),
+            ([_row(1, "images/frame_000.jpg", stamp_sec=10),
+              _row(0, "images/frame_001.jpg", stamp_sec=11)], "FRAME_ORDER"),
+            ([_row(0, "images/frame_000.jpg"),
+              _row(1, "images/frame_000.jpg")], "DUPLICATE_IMAGE"),
+            ([_row(0, "../frame.jpg"),
+              _row(1, "images/frame_001.jpg")], "UNSAFE_PATH"),
+            ([_row(0, "other/frame.jpg"),
+              _row(1, "images/frame_001.jpg")], "UNSAFE_IMAGE_PATH"),
         )
         for index, (rows, code) in enumerate(bad_rows):
             fixture = SnapshotFixture(self.temp.name + "-frames" + str(index))
@@ -351,34 +425,8 @@ class SnapshotValidatorTest(unittest.TestCase):
             )
 
 
-    _V2_COLUMNS = (
-        "frame_index",
-        "image_path",
-        "stamp_sec",
-        "stamp_nsec",
-        "pose_valid",
-        "pose_delta_ms",
-        "odometry_gap_ms",
-    )
-
-    def _v2_metadata(self):
-        return {
-            "schema": SNAPSHOT_SCHEMA,
-            "version": 2,
-            "status": "PASS",
-            "scene_id": "scene-v2",
-            "frame_count": 2,
-            "camera_name": "camera4",
-            "image_topic": "/camera4/image_raw",
-            "first_stamp_sec": 10,
-            "first_stamp_nsec": 0,
-            "last_stamp_sec": 12,
-            "last_stamp_nsec": 500000000,
-            "has_camera_info": False,
-            "has_odometry": True,
-        }
-
     def _v2_rows(self):
+        """Stamp and pose columns of the two v4 fixture frames."""
         return [
             {
                 "frame_index": "0",
@@ -400,88 +448,9 @@ class SnapshotValidatorTest(unittest.TestCase):
             },
         ]
 
-    def _write_v2_fixture(self):
-        self.fixture.metadata = self._v2_metadata()
-        self.fixture.frame_columns = self._V2_COLUMNS
-        self.fixture.frame_rows = self._v2_rows()
-        self.fixture.write()
-
-    def test_v2_snapshot_returns_stamp_camera_and_pose_metadata(self):
-        self._write_v2_fixture()
-        result = self.fixture.validate()
-        self.assertEqual(result.snapshot_version, 2)
-        self.assertEqual(result.camera_name, "camera4")
-        self.assertEqual(result.image_topic, "/camera4/image_raw")
-        self.assertIsNone(result.camera_role)
-        self.assertIsNone(result.camera_frame_id)
-        self.assertEqual(
-            [(stamp.sec, stamp.nsec) for stamp in result.frame_stamps],
-            [(10, 0), (12, 500000000)],
-        )
-        self.assertEqual(result.pose_valid, (True, False))
-        self.assertEqual(result.pose_delta_ms, (12.5, None))
-        self.assertEqual(result.odometry_gap_ms, (0.0, 240.0))
-        self.assertTrue(result.has_odometry)
-        self.assertFalse(result.has_camera_info)
-
-    def _v3_metadata(self):
-        metadata = self._v2_metadata()
-        metadata["version"] = 3
-        metadata["scene_id"] = "scene-v3"
-        metadata["camera_role"] = "front"
-        metadata["camera_frame_id"] = "front_camera_optical_frame"
-        return metadata
-
-    def _write_v3_fixture(self):
-        self.fixture.metadata = self._v3_metadata()
-        self.fixture.frame_columns = self._V2_COLUMNS
-        self.fixture.frame_rows = self._v2_rows()
-        self.fixture.write()
-
-    def test_v3_snapshot_returns_role_and_frame_metadata(self):
-        self._write_v3_fixture()
-        result = self.fixture.validate()
-        self.assertEqual(result.snapshot_version, 3)
-        self.assertEqual(result.camera_name, "camera4")
-        self.assertEqual(result.image_topic, "/camera4/image_raw")
-        self.assertEqual(result.camera_role, "front")
-        self.assertEqual(result.camera_frame_id, "front_camera_optical_frame")
-        self.assertEqual(result.frame_count, 2)
-
-    def test_v3_rejects_invalid_role_and_frame(self):
-        for field, value, code in (
-            ("camera_role", "", "INVALID_CAMERA_ROLE"),
-            ("camera_role", "bad role", "INVALID_CAMERA_ROLE"),
-            ("camera_frame_id", "", "INVALID_CAMERA_FRAME"),
-            ("camera_frame_id", "/leading", "INVALID_CAMERA_FRAME"),
-        ):
-            with self.subTest(field=field, value=value):
-                fixture = SnapshotFixture(self.temp.name + "-" + field + "-" + str(value))
-                fixture.metadata = self._v3_metadata()
-                fixture.metadata[field] = value
-                fixture.frame_columns = self._V2_COLUMNS
-                fixture.frame_rows = self._v2_rows()
-                fixture.write()
-                self.assertInvalid(code, fixture.validate)
-
-    def test_v3_rejects_endpoint_stamp_mismatch(self):
-        self._write_v3_fixture()
-        metadata = self._v3_metadata()
-        metadata["last_stamp_sec"] = 13
-        self.fixture.metadata = metadata
-        self.fixture.frame_rows = self._v2_rows()
-        self.fixture.write()
-        self.assertInvalid("STAMP_MISMATCH")
-
     # ---- v4 完整辅助数据契约 ----
 
-    _V4_COLUMNS = _V2_COLUMNS + (
-        "auxiliary_path",
-        "camera_info_delta_ms",
-        "odometry_delta_ms",
-        "depth_path",
-        "depth_delta_ms",
-    )
+    _V4_COLUMNS = FRAME_COLUMNS
 
     def _v4_camera_info(self):
         return {
@@ -764,52 +733,83 @@ class SnapshotValidatorTest(unittest.TestCase):
         self.fixture.write()
         self.assertInvalid("MANIFEST_COVERAGE")
 
-    def test_v1_snapshot_metadata_fields_are_explicitly_unknown(self):
+    def test_v4_snapshot_returns_stamp_camera_role_and_pose_metadata(self):
+        self._write_v4_fixture()
         result = self.fixture.validate()
-        self.assertEqual(result.snapshot_version, 1)
-        self.assertIsNone(result.camera_name)
-        self.assertIsNone(result.image_topic)
-        self.assertIsNone(result.camera_role)
-        self.assertIsNone(result.camera_frame_id)
-        self.assertTrue(all(stamp is None for stamp in result.frame_stamps))
-        self.assertTrue(all(valid is None for valid in result.pose_valid))
-        self.assertIsNone(result.has_odometry)
+        self.assertEqual(result.camera_name, "camera4")
+        self.assertEqual(result.image_topic, "/camera4/image_raw")
+        self.assertEqual(result.camera_role, "front")
+        self.assertEqual(result.camera_frame_id, "front_camera_optical_frame")
+        self.assertEqual(result.frame_count, 2)
+        self.assertEqual(
+            [(stamp.sec, stamp.nsec) for stamp in result.frame_stamps],
+            [(10, 0), (12, 500000000)],
+        )
+        self.assertEqual(result.pose_valid, (True, False))
+        self.assertEqual(result.pose_delta_ms, (12.5, None))
+        self.assertEqual(result.odometry_gap_ms, (0.0, 240.0))
+        self.assertTrue(result.has_odometry)
 
-    def test_v2_rejects_non_monotonic_frame_stamps(self):
-        self._write_v2_fixture()
-        rows = self._v2_rows()
+    def test_older_snapshot_versions_are_rejected(self):
+        """v1–v3 (no auxiliary columns) are refused with an explicit message."""
+        old_columns = FRAME_COLUMNS[:7]
+        for version in (1, 2, 3):
+            with self.subTest(version=version):
+                fixture = SnapshotFixture(self.temp.name + "-old" + str(version))
+                metadata = {key: fixture.metadata[key] for key in
+                            ("schema", "status", "scene_id", "frame_count")}
+                metadata["version"] = version
+                fixture.metadata = metadata
+                fixture.frame_columns = ("frame_index", "image_path") if version == 1 else old_columns
+                fixture.frame_rows = [{key: row[key] for key in fixture.frame_columns}
+                                      for row in fixture.frame_rows]
+                fixture.write()
+                with self.assertRaisesRegex(SnapshotInvalidError,
+                                            "only snapshot version 4 is supported") as caught:
+                    fixture.validate()
+                self.assertEqual("UNSUPPORTED_SCHEMA", caught.exception.code)
+
+    def test_invalid_role_and_frame_are_rejected(self):
+        for field, value, code in (
+            ("camera_role", "", "INVALID_CAMERA_ROLE"),
+            ("camera_role", "bad role", "INVALID_CAMERA_ROLE"),
+            ("camera_frame_id", "", "INVALID_CAMERA_FRAME"),
+            ("camera_frame_id", "/leading", "INVALID_CAMERA_FRAME"),
+        ):
+            with self.subTest(field=field, value=value):
+                fixture = SnapshotFixture(self.temp.name + "-" + field + "-" + str(value))
+                fixture.metadata[field] = value
+                fixture.write()
+                self.assertInvalid(code, fixture.validate)
+
+    def test_rejects_non_monotonic_frame_stamps(self):
+        self._write_v4_fixture()
+        rows = self._v4_rows()
         rows[1]["stamp_sec"] = "10"
         rows[1]["stamp_nsec"] = "0"
         self.fixture.frame_rows = rows
         self.fixture.write()
         self.assertInvalid("STAMP_ORDER")
 
-    def test_v2_rejects_endpoint_stamp_mismatch(self):
-        self._write_v2_fixture()
-        metadata = self._v2_metadata()
-        metadata["last_stamp_sec"] = 13
-        self.fixture.metadata = metadata
-        self.fixture.frame_rows = self._v2_rows()
+    def test_rejects_endpoint_stamp_mismatch(self):
+        self._write_v4_fixture()
+        self.fixture.metadata["last_stamp_sec"] = 13
         self.fixture.write()
         self.assertInvalid("STAMP_MISMATCH")
 
-    def test_v2_rejects_nul_image_topic(self):
-        self._write_v2_fixture()
-        metadata = self._v2_metadata()
-        metadata["image_topic"] = "/camera\u0000escape"
-        self.fixture.metadata = metadata
-        self.fixture.frame_rows = self._v2_rows()
+    def test_rejects_nul_image_topic(self):
+        self._write_v4_fixture()
+        self.fixture.metadata["image_topic"] = "/camera\u0000escape"
         self.fixture.write()
         self.assertInvalid("INVALID_IMAGE_TOPIC")
 
-    def test_v2_rejects_valid_pose_with_unavailable_delta(self):
-        self._write_v2_fixture()
-        rows = self._v2_rows()
+    def test_rejects_valid_pose_with_unavailable_delta(self):
+        self._write_v4_fixture()
+        rows = self._v4_rows()
         rows[0]["pose_delta_ms"] = "-1"
         self.fixture.frame_rows = rows
         self.fixture.write()
         self.assertInvalid("MALFORMED_FRAMES")
-
 
 if __name__ == "__main__":
     unittest.main()
