@@ -37,6 +37,7 @@ Incremental drone reconstruction · Interactive digital twin · Differentiable v
 - [License](#license)
 - [Citation](#citation)
 - [Acknowledgements](#acknowledgements)
+- [Community](#community)
 
 ## Overview
 
@@ -233,3 +234,9 @@ Fly2Twin is developed and maintained by ZKHC (中科华创). Author: Lu Xu. Proj
 - [three.js](https://github.com/mrdoob/three.js) and [Spark](https://github.com/sparkjsdev/spark) for the browser viewer.
 
 Questions and bug reports are welcome on [GitHub Issues](https://github.com/ZKHC-Lab/fly2twin/issues).
+
+## Community
+
+<p align="center"><img src="assets/wechat_group.png" width="240" alt="Fly2Twin WeChat group QR code"/></p>
+
+The group is Chinese-speaking. The WeChat invite QR code is valid for 7 days; if it has expired, ask for a new one in [GitHub Issues](https://github.com/ZKHC-Lab/fly2twin/issues).

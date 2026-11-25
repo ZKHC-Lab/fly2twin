@@ -37,6 +37,7 @@
 - [许可](#许可)
 - [引用](#引用)
 - [致谢](#致谢)
+- [交流群](#交流群)
 
 ## 概览
 
@@ -233,3 +234,9 @@ fly2twin/
 - [three.js](https://github.com/mrdoob/three.js) 与 [Spark](https://github.com/sparkjsdev/spark)：浏览器查看器。
 
 问题与缺陷欢迎在 [GitHub Issues](https://github.com/ZKHC-Lab/fly2twin/issues) 提出。
+
+## 交流群
+
+<p align="center"><img src="assets/wechat_group.png" width="240" alt="飞境 Fly2Twin 微信交流群二维码"/></p>
+
+微信群二维码 7 天内有效，过期后请在 [GitHub Issues](https://github.com/ZKHC-Lab/fly2twin/issues) 留言索取新码。
