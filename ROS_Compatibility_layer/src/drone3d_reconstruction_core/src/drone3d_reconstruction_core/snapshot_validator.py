@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Iterable, Tuple
 from urllib.parse import unquote_to_bytes, urlsplit
+from ._common import is_relative_to as _is_relative_to
 
 
 SNAPSHOT_SCHEMA = "drone3d.reconstruction.snapshot"
@@ -334,15 +335,6 @@ def _canonical_allowed_roots(allowed_snapshot_roots: Iterable[os.PathLike]) -> T
             raise _invalid("INVALID_ALLOWED_ROOT", "allowed root must be a real directory")
         canonical.append(root.resolve(strict=True))
     return tuple(canonical)
-
-
-def _is_relative_to(path: Path, root: Path) -> bool:
-    """判断 path 是否位于 root 之下。"""
-    try:
-        path.relative_to(root)
-        return True
-    except ValueError:
-        return False
 
 
 def _reject_symlinks_from(root: Path, path: Path) -> None:

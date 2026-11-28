@@ -34,6 +34,7 @@ from .odom_local import (
 )
 from .odom_local import valid_sim3_alignment
 from .result_transaction import ResultTransaction
+from ._common import reject_duplicate_json_fields as _reject_duplicate_json_fields
 
 FORMAL_RECORD_SCHEMA = "drone3d.continuous.formal_record"
 # v2 makes the provenance checksum sidecar mandatory; scanner keeps real v1 records.
@@ -78,16 +79,6 @@ def valid_odom_local_alignment(alignment: Any) -> bool:
         and alignment.get("coordinate_state") == COORDINATE_ODOM_LOCAL_APPROX
         and valid_sim3_alignment(alignment)
     )
-
-
-def _reject_duplicate_json_fields(pairs):
-    """JSON object_pairs_hook：拒绝重复键。"""
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate JSON field: {key!r}")
-        result[key] = value
-    return result
 
 
 def _sha256(data: bytes) -> str:

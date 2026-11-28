@@ -30,6 +30,7 @@ from drone3d_reconstruction_msgs.srv import (
 from .capture import CaptureConfig, CaptureConfigError
 from .capture_action_server import CaptureActionServer
 from .snapshot_validator import SnapshotSafetyLimits
+from ._common import converts_to_finite as _finite
 
 NODE_NAME = "capture_production_node"
 DEFAULT_ACTION_NAME = "capture_segment"
@@ -526,17 +527,6 @@ def _optional_string(params, key):
     if not isinstance(value, str) or "\x00" in value:
         raise CaptureNodeConfigError(f"{key} must be empty or a string")
     return value
-
-
-def _finite(value):
-    """校验数值有限（拒绝 NaN/无穷）。"""
-    try:
-        converted = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return False
-    import math
-
-    return math.isfinite(converted)
 
 
 def _finite_number(value, key):

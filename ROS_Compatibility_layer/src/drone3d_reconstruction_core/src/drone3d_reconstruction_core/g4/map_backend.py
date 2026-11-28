@@ -23,6 +23,7 @@ from g4_backend import (FRAME_POSE_METHOD_ID, Sim3, FramePoseConfig, sim3,
                         interpolate_poses, resize_intrinsics, rotation_mean, shared_depth_ratio,
                         solve_window_scales, trajectory_prior, window_translation)
 from .input_adapter import WindowInputReader, sha256
+from .._common import fsync_directory as _sync_dir
 
 
 def _plain(value):
@@ -53,14 +54,6 @@ def _digest(value):
 
 def _read(path):
     return json.loads(Path(path).read_text())
-
-
-def _sync_dir(path):
-    fd = os.open(str(path), os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 def _commit_directory(staging, final):
@@ -487,7 +480,7 @@ class G4MapBackend:
         return final
 
     def _publish_revision(self, metadata, signature):
-        """Per-frame localization poses + one VGGT depth scale per window."""
+        """Per-frame localization poses with window or per-frame VGGT depth scales."""
         cfg = self.frame_pose_config
         ids = [m["window_id"] for m in metadata]
         cams, entries = {}, []

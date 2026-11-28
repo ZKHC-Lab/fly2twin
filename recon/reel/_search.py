@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Sampled path coverage scoring."""
+
 import numpy as np
 from . import path as P
 from . import render as R
 from .coverage import stats
+
 
 def evaluate(sc, cov, shot_spec, K):
     shot = P.Shot('x', shot_spec['keys'], speed=shot_spec.get('speed', 0.5), ease=shot_spec.get('ease', 1.0))
@@ -18,4 +20,3 @@ def evaluate(sc, cov, shot_spec, K):
         tiers.append(R.tier(st))
     a, b, c = (tiers.count(x) for x in 'ABC')
     return dict(score=(a + 0.5 * b) / len(tiers), A=a, B=b, C=c, seconds=float(t[-1]))
-

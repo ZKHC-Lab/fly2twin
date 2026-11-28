@@ -9,8 +9,13 @@ diagnostics_period_sec: 1.0
 journal_root: "/REPLACE_ME/session_journal"
 result_root: "/REPLACE_ME/results"
 min_free_disk_gb: 2.0
-# Sessions are never pruned automatically; docs/ONBOARD_V1.md lists what may be
-# deleted by hand once the delivery package is exported.
+# Automatic cleanup at node start and after STOP_ALL: the newest
+# retention_max_sessions sessions are kept; an older session is deleted only when
+# its delivery package was exported and still verifies, otherwise it is kept and
+# reported on /diagnostics (docs/ONBOARD_V1.md, section 3).
+retention_max_sessions: 3
+# Unreferenced worker results and leftover staging directories older than this.
+retention_orphan_grace_sec: 86400.0
 action_connect_timeout_sec: 10.0
 capture_wait_margin_sec: 30.0
 reconstruct_wait_timeout_sec: 3600.0
@@ -34,20 +39,23 @@ initial_overlap_frames: 5
 # See docs/ONBOARD_V1.md.
 g4_placement: "frame_pose"
 # frame_pose only: localization pose is taken at RGB time + this offset (ms).
-# Measured on the D435i + FAST-LIO rig: +40 ms (capture drops FAST-LIO's repeated
-# poses since 2026-10-19; before that +70 ms indoor, +80 ms outdoor).
+# Measured on the D435i + FAST-LIO rig: +40 ms (NX bench and bag replay profiles,
+# with pose_time_offset_stage capture).
 pose_time_offset_ms: 0.0
-# capture: require matching offset marker in retained snapshots, do not shift twice.
-# backend: legacy keyframe-time interpolation. See docs/ONBOARD_V1.md.
+# capture: the capture node applied the offset; snapshots must carry the same value.
+# backend: the map backend interpolates at RGB time + offset. drone3d_onboard.export
+# only accepts capture, so sessions run with backend cannot be exported.
 pose_time_offset_stage: backend
-# Opt-in reference multiview filtering + adaptive voxel fusion for frame_pose Web.
+# Web only: multiview-consistent fusion for the live cloud (the Web node must also
+# enable it); false keeps the old per-window display. The map backend ignores it.
 frame_pose_fusion: false
 # frame_pose window scales: weight of each cross-window overlapping-frame depth row
 # (0 = trajectory prior + adjacent shared frames only). Needs pose_time_offset_stage
-# capture. 0.3 validated on office_gs_04, see docs/ONBOARD_V1.md.
+# capture. The NX bench and bag replay profiles leave it 0 and use g4_frame_scales.
 g4_cross_window_weight: 0.0
 # frame_pose: one depth scale per frame, solved jointly from frame-pair depth rows inside
-# and across windows (needs capture stage and g4_cross_window_weight 0). See docs/ONBOARD_V1.md.
+# and across windows (needs capture stage and g4_cross_window_weight 0); false = one
+# scale per window. The NX bench and bag replay profiles set true. See docs/ONBOARD_V1.md.
 g4_frame_scales: false
 # frame_pose only: calibrated pinhole of the source RGB image. Unset uses the
 # snapshot CameraInfo; without either the backend falls back to VGGT's own K,
@@ -57,8 +65,7 @@ initial_queue_mode: "lossless_fifo"
 # Pending high-water mark: lossless pauses new captures at this threshold, and
 # every frame that arrives while paused is lost for the whole delivery. Keep it
 # large so that only min_free_disk_gb limits a flight: when reconstruction is
-# slower than capture (NX ~32 s/window vs a new window every ~14 s) the backlog
-# queues on disk and drains after landing.
+# slower than capture the backlog queues on disk and drains after landing.
 initial_queue_capacity: 1000
 initial_max_retries: 0
 initial_keep_snapshot_on_success: true
@@ -76,7 +83,9 @@ web_port: 8080
 # Web preview frame rate; independent from and hot-tunable separately from
 # the reconstruction sample_fps. The Web UI can adjust this at runtime.
 web_preview_fps: 5.0
-# Optional Web tuning (the node falls back to these defaults if omitted):
+# Optional Web tuning, read only by the Web node. If omitted the node uses its code
+# defaults; conf_percentile defaults to 20, but the old display path always uses 50
+# for G4 windows.
 max_point_cloud_points: 1000000
 max_session_windows: 64
 conf_percentile: 50.0

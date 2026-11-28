@@ -1,10 +1,10 @@
 """ROS1 连续 session 调度器节点。
 
 把 ContinuousSession 核心挂到 rospy：
-  - `ContinuousSessionCommand` 服务（选源/启动/暂停/恢复/停止/状态/热调）；
+  - `ContinuousSessionCommand` 服务（选源/启动/暂停/恢复/停止/状态；热调请求被拒绝）；
   - `/diagnostics` 周期发布连续 session 状态；
-  - 只通过现有 Capture/Reconstruct Action 与 CaptureControl 服务工作，
-    不订阅图像、不读 bag、不启动 worker。
+  - 通过现有 Capture/Reconstruct Action 与 CaptureControl 服务采集和重建，
+    不订阅图像、不读 bag；会话另行启动 G4 后台子进程放置窗口。
 """
 
 from __future__ import annotations
@@ -47,12 +47,12 @@ from .continuous_session import (
     JOB_RUNNING,
     JOB_SUCCEEDED,
     QUEUE_LOSSLESS,
-    RECONSTRUCTION_MODES,
     ReconstructionBackend,
     SESSION_FATAL_OOM,
     SESSION_MEMORY_PAUSED,
     SESSION_IDLE,
 )
+from .storage_retention import StoragePolicy, prune_storage
 from .action_types import CameraRole
 from .reconstruct_action_client import ActionlibReconstructClient
 
@@ -264,6 +264,7 @@ class ContinuousSessionNode:
         self._config = None
         self._core = None
         self._not_ready_error: str | None = None
+        self._retention_report: dict | None = None
         self._service = None
         self._publisher = None
         self._timer = None
@@ -283,6 +284,10 @@ class ContinuousSessionNode:
         else:
             self._config = config
             try:
+                # No session of this node exists yet, so leftover staging directories older
+                # than the grace period are orphans; the newest sessions and any session whose
+                # map backend still holds its lock are kept by prune_storage itself.
+                self._prune_storage((), remove_staging=True)
                 self._core = ContinuousSession(
                     config,
                     capture_client_factory=self._capture_client_factory,
@@ -377,6 +382,23 @@ class ContinuousSessionNode:
         if code != 0:
             print(f"continuous auto-start failed to start session: {message}")
 
+    def _prune_storage(self, protected_session_ids, remove_staging: bool = False) -> dict:
+        config = self._config
+        report = prune_storage(
+            result_root=config.result_root,
+            worker_result_root=config.expected_result_root,
+            journal_root=config.journal_root,
+            snapshot_roots=tuple(role.capture_config.snapshot_root for role in config.roles),
+            policy=StoragePolicy(
+                max_sessions=config.retention_max_sessions,
+                orphan_grace_sec=config.retention_orphan_grace_sec,
+            ),
+            protected_session_ids=protected_session_ids,
+            remove_staging=remove_staging,
+        )
+        self._retention_report = report
+        return report
+
     def publish_once(self) -> None:
         self._publish_callback(None)
 
@@ -389,6 +411,7 @@ class ContinuousSessionNode:
             ),
             config=self._config,
             not_ready_error=self._not_ready_error,
+            retention_report=self._retention_report,
         )
         try:
             message.header.stamp = rospy.Time.now()
@@ -438,6 +461,12 @@ class ContinuousSessionNode:
             code, message = self._core.resume()
         elif command == ContinuousSessionCommandRequest.STOP_ALL:
             code, message = self._core.stop_all()
+            if code == 0:
+                # The stopped (or still draining) session is never a removal candidate, and
+                # staging directories are left alone: a draining window may be writing one.
+                report = self._prune_storage((self._core.get_status().session_id,))
+                if report["errors"]:
+                    message += "; storage cleanup warning: " + "; ".join(report["errors"])
             if code == 0 and self._release_worker:
                 try:
                     self._release_worker()
@@ -544,7 +573,7 @@ def load_continuous_config(
     resolution = expected.get("image_resolution")
     if isinstance(resolution, bool) or not isinstance(resolution, int) or resolution <= 0 or resolution % 16:
         raise ContinuousNodeConfigError("G4 requires expected_reconstruction/image_resolution to be a multiple of 16")
-    total = _positive_integer(params.get("initial_window_frames", 16), "initial_window_frames")
+    total = _required(params, "initial_window_frames")
     if expected.get("frame_group_size") != total:
         raise ContinuousNodeConfigError(
             "G4 frame_group_size must equal the model input frames "
@@ -571,101 +600,27 @@ def load_continuous_config(
                 capture_config=capture_config,
             )
         )
-    journal_root = str(Path(_required(params, "journal_root")))
-    if not Path(journal_root).is_absolute() or not Path(journal_root).is_dir():
-        raise ContinuousNodeConfigError("journal_root must be an existing directory")
-    config = ContinuousConfig(
-        roles=tuple(roles),
-        reconstruct_action=_absolute_ros_name(
-            _required(params, "reconstruct_action"), "reconstruct_action"
-        ),
-        journal_root=journal_root,
-        result_root=str(Path(_required(params, "result_root"))),
-        service_name=_absolute_ros_name(
-            _required(params, "service_name"), "service_name"
-        ),
-        diagnostics_topic=_absolute_ros_name(
-            _required(params, "diagnostics_topic"), "diagnostics_topic"
-        ),
-        diagnostics_period_sec=_positive_finite(
-            _required(params, "diagnostics_period_sec"),
-            "diagnostics_period_sec",
-        ),
-        min_free_disk_gb=_positive_finite(
-            _required(params, "min_free_disk_gb"), "min_free_disk_gb"
-        ),
-        action_connect_timeout_sec=_positive_finite(
-            _required(params, "action_connect_timeout_sec"),
-            "action_connect_timeout_sec",
-        ),
-        capture_wait_margin_sec=_positive_finite(
-            _required(params, "capture_wait_margin_sec"), "capture_wait_margin_sec"
-        ),
-        reconstruct_wait_timeout_sec=_positive_finite(
-            _required(params, "reconstruct_wait_timeout_sec"),
-            "reconstruct_wait_timeout_sec",
-        ),
-        stop_timeout_sec=_positive_finite(
-            _required(params, "stop_timeout_sec"), "stop_timeout_sec"
-        ),
-        reconstruct_frame_group_size=_positive_integer(
-            _required(params, "reconstruct_frame_group_size"),
-            "reconstruct_frame_group_size",
-        ),
-        initial_sample_fps=_positive_finite(
-            _required(params, "initial_sample_fps"), "initial_sample_fps"
-        ),
-        initial_window_frames=_positive_integer(
-            _required(params, "initial_window_frames"), "initial_window_frames"
-        ),
-        initial_overlap_frames=_nonnegative_integer(
-            params.get("initial_overlap_frames", 0), "initial_overlap_frames"
-        ),
-        g4_placement=str(params.get("g4_placement", "frame_pose")),
-        pose_time_offset_ms=_finite_number(params.get("pose_time_offset_ms", 0.0), "pose_time_offset_ms"),
-        pose_time_offset_stage=str(params.get("pose_time_offset_stage", "backend")),
-        frame_pose_fusion=_required_bool(params.get("frame_pose_fusion", False), "frame_pose_fusion"),
-        g4_cross_window_weight=_finite_number(params.get("g4_cross_window_weight", 0.0), "g4_cross_window_weight"),
-        g4_frame_scales=_required_bool(params.get("g4_frame_scales", False), "g4_frame_scales"),
-        camera_intrinsics=_optional_intrinsics(params.get("camera_intrinsics")),
-        initial_queue_mode=_queue_mode(_required(params, "initial_queue_mode")),
-        initial_queue_capacity=_positive_integer(
-            _required(params, "initial_queue_capacity"), "initial_queue_capacity"
-        ),
-        initial_max_retries=_nonnegative_integer(
-            _required(params, "initial_max_retries"), "initial_max_retries"
-        ),
-        initial_keep_snapshot_on_success=_required_bool(
-            _required(params, "initial_keep_snapshot_on_success"),
-            "initial_keep_snapshot_on_success",
-        ),
-        initial_inference_resolution=_optional_inference_resolution(
-            params.get("initial_inference_resolution", 0)
-        ),
-        initial_worker_timeout_sec=_optional_worker_timeout(
-            params.get("initial_worker_timeout_sec", 0.0)
-        ),
-        initial_reconstruction_mode=_reconstruction_mode(
-            params.get("initial_reconstruction_mode", "per_window")
-        ),
-        alignment_backend=alignment_backend,
-        reconstruction_backend=str((params.get("expected_reconstruction") or {}).get("backend", "omega")),
-        expected_checkpoint_sha256=_expected_reconstruction_field(
-            params, "checkpoint_sha256"
-        ),
-        expected_checkpoint_path=_expected_reconstruction_field(
-            params, "checkpoint_path"
-        ),
-        expected_result_root=str(
-            Path(_expected_reconstruction_field(params, "result_root"))
-        ),
-        expected_algorithm_revision=_expected_reconstruction_field(
-            params, "algorithm_revision"
-        ),
-        expected_ros_revision=_expected_reconstruction_field(params, "ros_revision"),
-        worker_python=_expected_reconstruction_field(params, "worker_python"),
-        cuda_visible_devices=str(os.environ.get("CUDA_VISIBLE_DEVICES", "")),
-    )
+    # Defaults and validation of every session setting live on ContinuousConfig; the
+    # node resolves only what comes from elsewhere: capture roles, the paths it
+    # normalizes, the reconstruct profile and the process environment.
+    try:
+        config = ContinuousConfig.from_params(
+            params,
+            roles=tuple(roles),
+            journal_root=str(Path(_required(params, "journal_root"))),
+            result_root=str(Path(_required(params, "result_root"))),
+            alignment_backend=alignment_backend,
+            reconstruction_backend=str(expected.get("backend", "omega")),
+            expected_checkpoint_sha256=_expected_reconstruction_field(params, "checkpoint_sha256"),
+            expected_checkpoint_path=_expected_reconstruction_field(params, "checkpoint_path"),
+            expected_result_root=str(Path(_expected_reconstruction_field(params, "result_root"))),
+            expected_algorithm_revision=_expected_reconstruction_field(params, "algorithm_revision"),
+            expected_ros_revision=_expected_reconstruction_field(params, "ros_revision"),
+            worker_python=_expected_reconstruction_field(params, "worker_python"),
+            cuda_visible_devices=str(os.environ.get("CUDA_VISIBLE_DEVICES", "")),
+        )
+    except TypeError as error:
+        raise ContinuousNodeConfigError(f"invalid continuous parameter: {error}") from error
     return config
 
 
@@ -737,10 +692,11 @@ def assemble_continuous_diagnostics(
     core_snapshot: Mapping[str, Any] | None,
     config: ContinuousConfig | None,
     not_ready_error: str | None,
+    retention_report: Mapping[str, Any] | None = None,
 ) -> DiagnosticArray:
     message = DiagnosticArray()
     message.status = [
-        _server_status(config, core_snapshot, not_ready_error),
+        _server_status(config, core_snapshot, not_ready_error, retention_report),
         _capture_status(core_snapshot, not_ready_error),
         _map_backend_status(core_snapshot, not_ready_error),
         _fifo_status(core_snapshot, not_ready_error),
@@ -749,7 +705,7 @@ def assemble_continuous_diagnostics(
     return message
 
 
-def _server_status(config, core_snapshot, not_ready_error):
+def _server_status(config, core_snapshot, not_ready_error, retention_report=None):
     status = DiagnosticStatus()
     status.name = "drone3d/session/server"
     if not_ready_error is not None or config is None:
@@ -760,7 +716,12 @@ def _server_status(config, core_snapshot, not_ready_error):
     state = core_snapshot.get("state", SESSION_IDLE) if core_snapshot else SESSION_IDLE
     if state in (SESSION_FATAL_OOM, SESSION_MEMORY_PAUSED):
         status.level = DiagnosticStatus.ERROR
-    elif core_snapshot.get("disk_redline") or core_snapshot.get("worker_disk_blocked"):
+    elif (
+        core_snapshot.get("disk_redline")
+        or core_snapshot.get("worker_disk_blocked")
+        or (retention_report or {}).get("kept_unexported")
+        or (retention_report or {}).get("errors")
+    ):
         status.level = DiagnosticStatus.WARN
     else:
         status.level = DiagnosticStatus.OK
@@ -776,6 +737,12 @@ def _server_status(config, core_snapshot, not_ready_error):
         _kv("last_alignment_state", core_snapshot.get("last_alignment_state") if core_snapshot else None),
         _kv("formal_windows", core_snapshot.get("formal_windows") if core_snapshot else None),
         _kv("formal_records_root", core_snapshot.get("formal_records_root") if core_snapshot else None),
+        # Last automatic cleanup (node start or STOP_ALL). Sessions beyond
+        # retention_max_sessions without a verified delivery package are kept.
+        _kv("retention_kept_unexported_sessions",
+            len((retention_report or {}).get("kept_unexported", ()))),
+        _kv("retention_removed_paths", len((retention_report or {}).get("removed", ()))),
+        _kv("retention_errors", "; ".join((retention_report or {}).get("errors", ()))),
     ]
     return status
 
@@ -908,94 +875,28 @@ def _required(params, key):
     return params[key]
 
 
-def _absolute_ros_name(value, label):
-    if not isinstance(value, str) or not value.startswith("/") or " " in value:
-        raise ContinuousNodeConfigError(f"{label} must be an absolute ROS name")
-    return value
 
 
-def _positive_finite(value, label):
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ContinuousNodeConfigError(f"{label} must be a finite number")
-    converted = float(value)
-    if not math.isfinite(converted) or converted <= 0:
-        raise ContinuousNodeConfigError(f"{label} must be positive and finite")
-    return converted
 
 
-def _finite_number(value, label):
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
-        raise ContinuousNodeConfigError(f"{label} must be a finite number")
-    return float(value)
 
 
-def _optional_intrinsics(value):
-    """Calibrated source-image pinhole mapping, or None (use snapshot CameraInfo)."""
-    if value is None or value == "" or value == {}:
-        return None
-    if not isinstance(value, Mapping):
-        raise ContinuousNodeConfigError("camera_intrinsics must be a mapping {width, height, fx, fy, cx, cy}")
-    return {str(k): (v if isinstance(v, bool) else float(v) if isinstance(v, (int, float)) else v)
-            for k, v in value.items()}
 
 
-def _positive_integer(value, label):
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise ContinuousNodeConfigError(f"{label} must be a positive integer")
-    return value
 
 
-def _nonnegative_integer(value, label):
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ContinuousNodeConfigError(f"{label} must be a nonnegative integer")
-    return value
 
 
-def _optional_inference_resolution(value):
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ContinuousNodeConfigError(
-            "initial_inference_resolution must be an integer"
-        )
-    if value == 0:
-        return 0
-    if value < 32 or value > 4096:
-        raise ContinuousNodeConfigError(
-            "initial_inference_resolution must be 0 (inherit) or in [32, 4096]"
-        )
-    return value
 
 
-def _optional_worker_timeout(value):
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ContinuousNodeConfigError(
-            "initial_worker_timeout_sec must be a finite number"
-        )
-    converted = float(value)
-    if not math.isfinite(converted) or converted < 0:
-        raise ContinuousNodeConfigError(
-            "initial_worker_timeout_sec must be 0.0 or positive finite"
-        )
-    return converted
 
 
-def _queue_mode(value):
-    if value != QUEUE_LOSSLESS:
-        raise ContinuousNodeConfigError("queue mode must be lossless_fifo")
-    return value
 
 
-def _reconstruction_mode(value):
-    if value not in RECONSTRUCTION_MODES:
-        raise ContinuousNodeConfigError(
-            f"reconstruction_mode must be one of {RECONSTRUCTION_MODES!r}"
-        )
-    return value
 
 
-def _required_bool(value, label):
-    if type(value) is not bool:
-        raise ContinuousNodeConfigError(f"{label} must be a bool")
-    return value
+
+
 
 
 def _min_free_disk_gb(config: ContinuousConfig) -> float:

@@ -22,6 +22,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
+from ._common import sha256_file as _sha256_file
 
 _SNAPSHOT_SCHEMA = "drone3d.reconstruction.snapshot"
 _JSON_INDENT = 2
@@ -626,14 +627,6 @@ def _path_size(path: Path) -> int:
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise FramePoolError(f"path is not a trusted regular file: {path}")
     return int(info.st_size)
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with open(str(path), "rb") as stream:
-        for chunk in iter(lambda: stream.read(65536), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def _csv_bytes(columns: Sequence[str], rows: Sequence[dict[str, str]]) -> bytes:

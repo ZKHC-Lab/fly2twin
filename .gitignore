@@ -17,3 +17,4 @@ build/
 *.bag
 /third_party/vggt-omega/.native/
 /viewer/tools/node_modules/
+.vscode/settings.json

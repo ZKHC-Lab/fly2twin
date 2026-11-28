@@ -11,6 +11,7 @@ and at least path_clearance + resolution/sqrt(2) from every point; endpoints nee
 the same 4-connected component. Pairs are drawn with a fixed seed until `count` pairs exist, the first
 `blocked_min` of them with the straight segment blocked (some point closer than 0.1 m).
 """
+
 from collections import deque
 import json
 from pathlib import Path
@@ -21,11 +22,11 @@ from scipy.spatial import cKDTree
 
 from ..io.ply import read_ply
 
-FLOOR_BAND = .18          # |z| below this after levelling counts as floor
-CEILING_GRID = .02
-CEILING_DILATION = .5     # ceiling footprint = floor cells dilated by this distance
-REAL_CEILING_BELOW = .25  # real points this far below ceiling_z suppress synthetic samples
-REAL_CEILING_CELL = .1
+FLOOR_BAND = 0.18  # |z| below this after levelling counts as floor
+CEILING_GRID = 0.02
+CEILING_DILATION = 0.5  # ceiling footprint = floor cells dilated by this distance
+REAL_CEILING_BELOW = 0.25  # real points this far below ceiling_z suppress synthetic samples
+REAL_CEILING_CELL = 0.1
 
 
 def load_cloud(export):
@@ -59,7 +60,7 @@ def level_floor(points, seed=20261020):
             normal *= -1
         if normal[2] < np.cos(np.deg2rad(25)):
             continue
-        mask = np.abs(sample @ normal - p[0] @ normal) < .07
+        mask = np.abs(sample @ normal - p[0] @ normal) < 0.07
         if mask.sum() > best:
             best, best_mask = int(mask.sum()), mask
     if best_mask is None:
@@ -70,12 +71,12 @@ def level_floor(points, seed=20261020):
         _, _, vt = np.linalg.svd(fit - center, full_matrices=False)
         normal = vt[-1] * (1 if vt[-1, 2] > 0 else -1)
         d = -normal @ center
-        best_mask = np.abs(sample @ normal + d) < .07
+        best_mask = np.abs(sample @ normal + d) < 0.07
     angle = float(np.degrees(np.arccos(np.clip(normal[2], -1, 1))))
     rotation = np.eye(3)
     if angle > 3:
-        cross = np.cross(normal, [0., 0., 1.])
-        skew = np.array([[0., -cross[2], cross[1]], [cross[2], 0., -cross[0]], [-cross[1], cross[0], 0.]])
+        cross = np.cross(normal, [0.0, 0.0, 1.0])
+        skew = np.array([[0.0, -cross[2], cross[1]], [cross[2], 0.0, -cross[0]], [-cross[1], cross[0], 0.0]])
         rotation += skew + skew @ skew / (1 + normal[2])
     reference_xy = np.median(sample[best_mask, :2], axis=0)
     ground_z = float(-(d + normal[:2] @ reference_xy) / normal[2])
@@ -99,8 +100,9 @@ def ceiling_samples(observed, ceiling_z):
     distance = ndimage.distance_transform_edt(~occupancy, sampling=CEILING_GRID)
     y, x = np.nonzero(distance <= CEILING_DILATION + 1e-12)
     origin = low * CEILING_GRID
-    ceiling = np.column_stack([origin[0] + (x + .5) * CEILING_GRID, origin[1] + (y + .5) * CEILING_GRID,
-                               np.full(len(x), ceiling_z)]).astype(np.float32)
+    ceiling = np.column_stack(
+        [origin[0] + (x + 0.5) * CEILING_GRID, origin[1] + (y + 0.5) * CEILING_GRID, np.full(len(x), ceiling_z)]
+    ).astype(np.float32)
     # Keep real ceiling observations; no synthetic sample in a 10 cm cell that has one.
     real = observed[observed[:, 2] >= round(ceiling_z - REAL_CEILING_BELOW, 6)]
     real_cells = np.floor(real[:, :2].astype(float) / REAL_CEILING_CELL).astype(np.int64)
@@ -117,15 +119,19 @@ def prepare(export, ceiling_z=None, seed=20261020):
     points, colors = load_cloud(export)
     transform, info = level_floor(points, seed)
     observed = (points @ transform[:3, :3].T + transform[:3, 3]).astype(np.float32)
-    if ceiling_z is None:   # top of the reconstruction, rounded down to 5 cm
-        ceiling_z = float(np.floor(np.percentile(observed[:, 2], 99.9) / .05) * .05)
+    if ceiling_z is None:  # top of the reconstruction, rounded down to 5 cm
+        ceiling_z = float(np.floor(np.percentile(observed[:, 2], 99.9) / 0.05) * 0.05)
     ceiling = ceiling_samples(observed, ceiling_z)
     info.update(ceiling_z=ceiling_z, observed_points=len(observed), synthetic_ceiling_points=len(ceiling))
-    return dict(points=np.concatenate([observed, ceiling]),
-                colors=np.concatenate([colors, np.full(ceiling.shape, 190, np.uint8)]),
-                observed_count=np.int64(len(observed)), ceiling_z=np.float64(ceiling_z),
-                world_from_export=transform, export_from_world=np.linalg.inv(transform),
-                info=np.array(json.dumps(info)))
+    return dict(
+        points=np.concatenate([observed, ceiling]),
+        colors=np.concatenate([colors, np.full(ceiling.shape, 190, np.uint8)]),
+        observed_count=np.int64(len(observed)),
+        ceiling_z=np.float64(ceiling_z),
+        world_from_export=transform,
+        export_from_world=np.linalg.inv(transform),
+        info=np.array(json.dumps(info)),
+    )
 
 
 def _bfs(free, start, goal):
@@ -152,10 +158,20 @@ def _bfs(free, start, goal):
     return route[::-1]
 
 
-def sample_pairs(scene, count=50, seed=20261030, height=1.2, resolution=.1, path_clearance=.6,
-                 endpoint_clearance=.9, distance_range=(6., 20.), blocked_min=None, max_proposals=100000):
+def sample_pairs(
+    scene,
+    count=50,
+    seed=20261030,
+    height=1.2,
+    resolution=0.1,
+    path_clearance=0.6,
+    endpoint_clearance=0.9,
+    distance_range=(6.0, 20.0),
+    blocked_min=None,
+    max_proposals=100000,
+):
     blocked_min = count // 2 if blocked_min is None else blocked_min
-    observed = scene['points'][:int(scene['observed_count'])]
+    observed = scene['points'][: int(scene['observed_count'])]
     points = np.ascontiguousarray(scene['points'], np.float32)
     origin = np.floor(observed[:, :2].min(0) / resolution) * resolution
     stop = np.ceil(observed[:, :2].max(0) / resolution) * resolution
@@ -166,7 +182,7 @@ def sample_pairs(scene, count=50, seed=20261030, height=1.2, resolution=.1, path
     distance = tree.query(query, workers=1)[0].reshape(h, w)
     floor = observed[np.abs(observed[:, 2]) < FLOOR_BAND]
     floor_distance = cKDTree(floor[:, :2]).query(query[:, :2], workers=1)[0].reshape(h, w)
-    known = (floor_distance <= .6) & (distance <= 3)
+    known = (floor_distance <= 0.6) & (distance <= 3)
     free = (distance >= path_clearance + resolution / np.sqrt(2)) & known
     candidates = np.flatnonzero(free & (distance >= endpoint_clearance))
     labels = ndimage.label(free)[0].ravel()
@@ -184,9 +200,9 @@ def sample_pairs(scene, count=50, seed=20261030, height=1.2, resolution=.1, path
         length = float(np.linalg.norm(goal - start))
         if not distance_range[0] <= length <= distance_range[1]:
             continue
-        line = np.linspace(start, goal, int(np.ceil(length / .025)) + 1)
+        line = np.linspace(start, goal, int(np.ceil(length / 0.025)) + 1)
         line_min = float(tree.query(line, workers=1)[0].min())
-        blocked = line_min < .1
+        blocked = line_min < 0.1
         if blocked_count < blocked_min and not blocked:
             continue
         route = _bfs(free, int(a), int(b))
@@ -195,16 +211,24 @@ def sample_pairs(scene, count=50, seed=20261030, height=1.2, resolution=.1, path
         routes.append(query[route].astype(np.float32))
         blocked_count += int(blocked)
     if len(pairs) < count or blocked_count < blocked_min:
-        raise RuntimeError(f'Only {len(pairs)} pairs ({blocked_count} blocked) after {proposals} proposals; '
-                           'the free space may be too small for the distance range')
+        raise RuntimeError(
+            f'Only {len(pairs)} pairs ({blocked_count} blocked) after {proposals} proposals; '
+            'the free space may be too small for the distance range'
+        )
     cells = np.asarray([p[:2] for p in pairs], np.int64)
     starts, goals = query[cells[:, 0]].astype(np.float32), query[cells[:, 1]].astype(np.float32)
     back = scene['export_from_world']
-    return dict(starts=starts, goals=goals,
-                starts_export=starts @ back[:3, :3].T + back[:3, 3], goals_export=goals @ back[:3, :3].T + back[:3, 3],
-                distances=np.asarray([p[2] for p in pairs], np.float32),
-                straight_blocked=np.asarray([p[3] for p in pairs], bool),
-                shortest_lengths=np.asarray([p[4] for p in pairs], np.float32),
-                path_points=np.concatenate(routes),
-                path_offsets=np.r_[0, np.cumsum([len(r) for r in routes])].astype(np.int64),
-                seed=np.int64(seed), height=np.float64(height), proposals=np.int64(proposals))
+    return dict(
+        starts=starts,
+        goals=goals,
+        starts_export=starts @ back[:3, :3].T + back[:3, 3],
+        goals_export=goals @ back[:3, :3].T + back[:3, 3],
+        distances=np.asarray([p[2] for p in pairs], np.float32),
+        straight_blocked=np.asarray([p[3] for p in pairs], bool),
+        shortest_lengths=np.asarray([p[4] for p in pairs], np.float32),
+        path_points=np.concatenate(routes),
+        path_offsets=np.r_[0, np.cumsum([len(r) for r in routes])].astype(np.int64),
+        seed=np.int64(seed),
+        height=np.float64(height),
+        proposals=np.int64(proposals),
+    )

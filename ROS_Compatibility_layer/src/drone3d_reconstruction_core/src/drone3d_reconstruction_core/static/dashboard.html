@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>无人机三维重建地面站软件</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--border:#30363d;--fg:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--danger:#f85149;--warn:#d29922;--ok:#3fb950}
+[hidden]{display:none!important}*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,-apple-system,"Segoe UI","Noto Sans CJK SC",sans-serif;background:var(--bg);color:var(--fg)}
+header{padding:10px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+header h1{font-size:18px;margin:0}
+.badge{font-size:12px;padding:2px 8px;border-radius:10px;border:1px solid var(--border);color:var(--muted)}
+.badge.approx{color:var(--warn);border-color:var(--warn)}
+.badge.unreliable{color:var(--danger);border-color:var(--danger)}
+.layout{display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:12px;padding:12px;align-items:start}
+.panel{min-width:0;background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:10px}
+.panel h2{font-size:14px;margin:0 0 8px;color:var(--fg);display:flex;justify-content:space-between;align-items:center}
+.panel h2 .hint{font-size:12px;color:var(--muted);font-weight:normal}
+#viewer{position:relative;height:calc(100vh - 150px);min-height:420px;background:#000;border-radius:6px;overflow:hidden}
+#viewer canvas{width:100%;height:100%;display:block}
+#viewer-toolbar{position:absolute;left:8px;right:8px;top:8px;display:flex;flex-direction:column;align-items:flex-start;gap:6px;pointer-events:none}
+#viewer .pc-badge{max-width:100%;overflow-wrap:anywhere;font-size:12px;background:rgba(0,0,0,.72);padding:4px 8px;border-radius:6px;color:var(--fg)}
+#viewer-controls{display:flex;flex-wrap:wrap;gap:5px;align-items:center;align-self:flex-end;max-width:100%;background:rgba(0,0,0,.72);padding:4px;border-radius:6px;pointer-events:auto}
+#viewer-controls label{display:flex;gap:4px;align-items:center;min-width:0;max-width:100%;font-size:12px}
+#viewer-controls select{min-width:0;max-width:220px}
+#viewer-controls input[type=range]{width:128px;max-width:100%}
+#axis-legend{position:absolute;left:8px;bottom:8px;font:12px ui-monospace,monospace;background:rgba(0,0,0,.72);padding:4px 6px;border-radius:4px}
+.three-col{display:grid;grid-template-rows:auto auto auto;gap:10px}
+.live{width:100%;height:190px;background:#000;border-radius:6px;object-fit:contain;border:1px solid var(--border)}
+.live-label{font-size:12px;color:var(--muted);margin:4px 0}
+table{width:100%;border-collapse:collapse;font-size:12px}
+td,th{border:1px solid var(--border);padding:3px 6px;text-align:left;vertical-align:top;overflow-wrap:anywhere}
+th{color:var(--muted);font-weight:normal;white-space:nowrap}
+.mono{font-family:ui-monospace,monospace}
+.muted{color:var(--muted)}
+.ok{color:var(--ok)} .warn{color:var(--warn)} .err{color:var(--danger)}
+select,input[type=text],input[type=number]{background:#0d1117;color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:4px 6px;font-size:12px;max-width:100%}
+button{background:#21262d;color:var(--fg);border:1px solid var(--border);border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer}
+button:hover{background:#30363d}
+button.danger{background:#3d1519;border-color:var(--danger);color:#ffb3b8}
+button.primary{background:#0c2d6b;border-color:var(--accent)}
+form label{font-size:12px;color:var(--muted)}
+.msg{margin-top:6px;font-size:12px;min-height:16px}
+button:disabled{opacity:.45;cursor:default}
+@media(max-width:960px){.layout{grid-template-columns:minmax(0,1fr)!important}#viewer{height:65vh;min-height:380px}.three-col{grid-template-columns:repeat(3,minmax(0,1fr));grid-template-rows:auto}.live{height:150px}}
+@media(max-width:620px){.three-col{grid-template-columns:minmax(0,1fr)}header h1{font-size:16px}#viewer-controls select{max-width:140px}}
+</style>
+</head>
+<body>
+<header>
+  <h1>无人机三维重建地面站软件</h1>
+  <span class="badge" id="alignment-badge">对齐状态: --</span>
+  <span class="badge unreliable" id="g4-badge" hidden>地图后端出错，采集继续</span>
+  <span class="badge" id="view-session-badge">查看: --</span>
+  <span class="badge" id="live-session-badge">控制: --</span>
+</header>
+<div class="layout">
+  <div class="panel">
+    <h2><span id="pointcloud-title">累计点云</span>
+      <span class="hint">只读预览 · 正式结果保留</span>
+    </h2>
+    <div id="viewer">
+      <canvas id="pointcloud-canvas"></canvas>
+      <div id="viewer-toolbar">
+      <div class="pc-badge" id="pc-badge">等待加载…</div>
+      <div id="viewer-controls">
+        <button id="btn-fit" type="button" title="主体视野；只改变相机，不删除点">Fit</button>
+        <button id="btn-reset" type="button" title="完整范围（包含异常窗口）">Reset/全景</button>
+        <label class="muted">地图分量 <select id="map-select"></select></label>
+        <label class="muted"><input id="include-rejected" type="checkbox"> 显示未过配准门限窗口</label>
+        <label class="muted">点径 <input id="point-size" type="range" min="1" max="6" step="0.5" value="2"></label>
+      </div>
+      </div>
+      <div id="axis-legend"><span style="color:#ff5d5d">X</span> <span style="color:#57d163">Y</span> <span style="color:#5f8fff">Z</span> · <span id="axis-convention">--</span></div>
+    </div>
+  </div>
+  <div class="panel three-col">
+    <div>
+      <h2>实时 RGB</h2>
+      <img class="live" id="live-rgb" hidden alt="实时 RGB">
+      <div class="live-label" id="live-rgb-label">等待流…</div>
+    </div>
+    <div>
+      <h2>实时传感器深度</h2>
+      <img class="live" id="live-depth" hidden alt="实时传感器深度">
+      <div class="live-label" id="live-depth-label">等待流…</div>
+    </div>
+    <div>
+      <h2>Omega 首帧深度 <span class="hint" id="omega-window-label">--</span></h2>
+      <img class="live" id="omega-first-depth" hidden alt="Omega 首帧深度">
+      <div class="live-label" id="omega-depth-label">等待最新窗口…</div>
+    </div>
+  </div>
+</div>
+<div class="layout" style="grid-template-columns:repeat(3,minmax(0,1fr))">
+  <div class="panel">
+    <h2>运行状态</h2>
+    <table id="status-table"></table>
+  </div>
+  <div class="panel">
+    <h2>会话与历史 <span class="hint">历史会话 · 仅改变本浏览器的查看对象</span></h2>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+      <select id="session-select"></select>
+      <label><input type="checkbox" id="follow-latest"> 查看时跟随 live</label>
+    </div>
+    <div class="msg" id="session-msg"></div>
+    <table id="formal-table"></table>
+  </div>
+  <div class="panel">
+    <h2>控制 <span class="hint" id="control-target">live session: --</span></h2>
+    <div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap">
+      <select id="start-role" title="新重建使用的相机角色"></select>
+      <button id="btn-start" class="primary command-control" title="在 IDLE/STOPPED 时开始新重建">开始新重建</button>
+      <button id="btn-pause-resume" class="command-control" title="运行中暂停；暂停后恢复">暂停/恢复</button>
+      <button id="btn-stop" class="danger command-control" title="停止采集；已采集的窗口继续重建完再结束">停止</button>
+    </div>
+    <form id="preview-form" style="margin-top:8px">
+      <label>Web 预览帧率 <span class="muted">web_preview_fps</span> <input type="number" id="p-preview-fps" step="0.5" min="0.5" max="30"></label>
+      <button type="submit" class="command-control">应用预览帧率</button>
+    </form>
+    <div class="msg" id="command-msg"></div>
+  </div>
+</div>
+<script>
+"use strict";
+var state = {selected_session:"", view_session:"", sessions:[], roles:[], preview_fps:5, formal_records:[], status:{}, diagnostics:{}};
+var stateTimer=null, stateInFlight=false, stateFailures=0, lastStateOk=0, recordsKey="", recordsInFlight=false;
+var omegaFailures=0,pcFailures=0,omegaRetryTimer=null,pcRetryTimer=null,omegaInFlight="",pcInFlight="";
+var commandInFlight=false, previewDirty=false, mapDirty=false, rendererState="new";
+var pc = {count:0, positions:null, colors:null, positionBuffer:null, colorBuffer:null, axisPositionBuffer:null, axisColorBuffer:null, bounds:null, zUp:false};
+var gl = null, glProgram=null, omegaObjectUrl="";
+var viewSession=storageGet("drone3d.view_session","");
+var viewFollowLatest=storageGet("drone3d.follow_live","1")!=="0";
+var viewMap="",includeRejected=false;
+function $(id){return document.getElementById(id)}
+function storageGet(key,fallback){try{var value=window.localStorage.getItem(key);return value===null?fallback:value}catch(_e){return fallback}}
+function storageSet(key,value){try{window.localStorage.setItem(key,value)}catch(_e){}}
+function fetchWithTimeout(url,options,timeoutMs){var controller=new AbortController(),timedOut=false;var timer=setTimeout(function(){timedOut=true;controller.abort()},timeoutMs);var request=Object.assign({},options||{},{signal:controller.signal});return fetch(url,request).then(function(response){return response.arrayBuffer().then(function(body){return new Response(response.status===204?null:body,{status:response.status,statusText:response.statusText,headers:response.headers})})}).catch(function(error){if(timedOut){var timeoutError=new Error("请求超时");timeoutError.code="REQUEST_TIMEOUT";throw timeoutError}throw error}).finally(function(){clearTimeout(timer)})}
+function headerText(response,name){var value=response.headers.get(name)||"";try{return decodeURIComponent(value)}catch(_e){return value}}
+function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
+function fmt(s){return s==null||s===""?"未接入":esc(s)}
+function fmtBytes(n){if(n===undefined||n===null||n==="")return "未接入"; var v=Number(n); if(!Number.isFinite(v)||v<0)return esc(n); if(v<1024)return v+" B"; var units=["KB","MB","GB","TB"]; var u=-1; do{v/=1024;u++}while(v>=1024&&u<units.length-1); return v.toFixed(v>=100?0:1)+" "+units[u]}
+function parseDiagValues(d){var out={}; if(!d||typeof d!=="object")return out;
+ Object.keys(d).forEach(function(k){var v=d[k]; if(typeof v!=="object"||v===null){out[k]=v}});
+ if(Array.isArray(d.diagnostics)){d.diagnostics.forEach(function(item){if(item&&item.values){Object.keys(item.values).forEach(function(k){out[k]=item.values[k]})}})}
+ return out}
+function vget(vals){for(var i=0;i<vals.length;i++){var v=vals[i]; if(v!==undefined&&v!==null&&v!=="")return v} return undefined}
+function fmtOrNA(s){return (s===undefined||s===null||s==="")?"未接入":esc(s)}
+function boolLabel(v){if(v===undefined||v===null||v==="")return "未接入"; if(v===true||v==="true"||v==="True"||v==="1")return "是"; if(v===false||v==="false"||v==="False"||v==="0")return "否"; return esc(v)}
+function runningActive(st){return !!st.worker_running_active || (st.running_window!==undefined&&st.running_window!==null&&typeof st.running_window==="object")}
+function runningLabel(rw,active){if(rw!==undefined&&rw!==null&&typeof rw==="object"){if(rw.window_index!==undefined&&rw.window_index!==null)return "窗口 "+esc(rw.window_index); return "空闲"} if(active)return "窗口 "+esc(rw); if(rw===undefined||rw===null||rw===""||rw===0)return "空闲"; return "窗口 "+esc(rw)}
+function depthMetricsLabel(records){for(var i=(records||[]).length-1;i>=0;i--){var r=records[i]||{}; var dm=r.depth_metrics; if(dm&&typeof dm==="object"){if(dm.status==="unavailable")return "不可用: "+esc(dm.reason||r.depth_metrics_error||"计算失败"); if(dm.coverage!==undefined&&dm.abs_rel!==undefined&&dm.rmse!==undefined)return esc(dm.coverage)+" / "+esc(dm.abs_rel)+" / "+esc(dm.rmse)} if(r.depth_metrics_error)return "不可用: "+esc(r.depth_metrics_error)} return "无深度对照指标"}
+function g4Failed(g4s){return !!g4s&&(g4s.state==="error"||(g4s.exit_code!=null&&Number(g4s.exit_code)!==0))}
+function updateStatus(compact,raw){var d=(raw&&typeof raw==="object")?raw:compact; state.status=compact||{}; state.diagnostics=raw||d||{}; var v=parseDiagValues(d); var rows=[];
+ function row(a,b){rows.push("<tr><th>"+a+"</th><td class='mono'>"+b+"</td></tr>")}
+ var eff=(d&&d.effective)||{}; var st=d||{};
+ var rw=vget([st.running_window, v.running_window]);
+ var workerTime=vget([v.worker_wall_time_sec, v.wall_time_sec, st.worker_wall_time_sec]);
+ var mem=vget([v.memory_mb, v.memory, v.mem]); var gpuName=vget([v.gpu_name, v.gpu]); var gpuUtil=vget([v.gpu_util]); var temp=vget([v.temp_c, v.temp, v.temperature]);
+ row("live session", fmt(st.session_id)); row("运行/暂停", fmt(st.state));
+ row("本次新增采集帧 k/N", fmt(st.captured_frames)+" / "+fmt(st.capture_target_frames));
+ if(st.alignment_backend==="global_g4"){
+  row("配准方法", "G4 全局配准");
+  row("G4 状态 / 地图版本",fmt((st.g4||{}).state)+" / "+fmt((st.g4||{}).revision));
+  var g4s=(st.g4||{}); var g4Bad=(g4s.state==="error"||g4s.state==="stopped"||g4s.exit_code!=null);
+  var g4Badge=$("g4-badge"); g4Badge.hidden=!g4Failed(g4s); g4Badge.title=g4Failed(g4s)?String(g4s.error||("状态 "+g4s.state+" 退出码 "+g4s.exit_code))+"。窗口照常采集和重建，但没有被放进地图；落地后可以重算。":"";
+  row("G4 提示",fmt(g4s.error || (g4Bad ? ("状态 "+fmtOrNA(g4s.state)+" 退出码 "+fmtOrNA(g4s.exit_code)) : (g4s.state ? "无错误" : "等待后台启动"))));
+  row("每批新增 / 共享 / 模型输入",fmt(st.new_input_frames)+" / "+fmt(st.shared_input_frames)+" / "+fmt(st.model_input_frames));
+ }else{row("重建窗口总帧", fmt(vget([(eff&&eff.window_frames), st.window_frames])));}
+ row("已采集窗口", fmt(vget([st.window_index, v.window_index])));
+ row("实际采样 fps", fmt(vget([(eff&&eff.sample_fps), st.sample_fps])));
+ row("窗口重叠帧", fmt(vget([(eff&&eff.overlap_frames), st.overlap_frames])));
+ row("队列模式", fmt(vget([(eff&&eff.queue_mode), v.queue_mode]))); row("队列长度", fmt(st.pending_windows));
+ row("项目存储总占用", fmtBytes(st.storage_total_bytes));
+ row("采集快照", fmtBytes(st.storage_capture_bytes)+" · "+fmt(st.storage_capture_roots));
+ row("Worker 结果", fmtBytes(st.storage_worker_bytes)+" · "+fmt(st.storage_worker_root));
+ row("正式记录", fmtBytes(st.storage_formal_bytes)+" · "+fmt(st.storage_formal_root));
+ row("共享帧缓存", fmtBytes(st.storage_frame_pool_bytes)+" · "+fmt(st.storage_frame_pool_root));
+ row("会话日志", fmtBytes(st.storage_journal_bytes)+" · "+fmt(st.storage_journal_root));
+ row("运行日志", fmtBytes(st.storage_runtime_log_bytes)+" · "+fmt(st.storage_runtime_log_root)+"/*.log*");
+ row("ROS 日志", fmtBytes(st.storage_ros_log_bytes)+" · "+fmt(st.storage_ros_log_root));
+ if(st.storage_scan_error)row("存储统计错误",fmt(st.storage_scan_error));
+ row("FIFO 字节", fmtBytes(vget([v.fifo_bytes, st.fifo_bytes]))); row("最老等待(秒)", fmt(vget([v.fifo_oldest_wait_sec, st.fifo_oldest_wait_sec])));
+ row("队列满暂停采集", boolLabel(st.capture_queue_blocked));
+ row("整窗处理耗时(秒)", fmtOrNA(st.service_wall_time_sec)); row("名义产窗间隔(秒)", fmtOrNA(st.service_budget_sec));
+ row("worker 窗口", runningLabel(rw, runningActive(st))); row("worker 状态", runningActive(st)?"运行中":"空闲"); row("worker 耗时", fmtOrNA(workerTime));
+ row("持续失败", fmt(vget([st.last_error, v.last_error]))); row("未恢复失败窗口数", fmt(st.failed_windows)); row("缺位姿帧（累计）", fmt(st.missing_pose_frames));
+ row("失败尝试 / 人工重试",fmt(st.attempt_failures)+" / "+fmt(st.manual_retries));
+ if(st.memory_paused)row("资源失败窗口",fmt(st.retry_window));
+ row("辅助覆盖", fmt(vget([v.aux_coverage, v.aux])));
+ row("磁盘红线", boolLabel(vget([v.disk_redline, st.disk_redline])));
+ row("磁盘剩余 GB", fmt(vget([v.disk_free_gb, st.disk_free_gb])));
+ row("系统可用内存", fmtBytes(vget([v.mem_available_bytes, st.mem_available_bytes])));
+ row("逻辑 swap", fmtBytes(vget([v.swap_used_bytes, st.swap_used_bytes])));
+ row("GPU", gpuName!==undefined?esc(gpuName)+(gpuUtil!==undefined?" @ "+esc(gpuUtil):""):"未接入");
+ row("温度", temp!==undefined?esc(temp)+" ℃":"未接入");
+ row("最新结果", fmt(st.succeeded_windows)+" 成功 / "+fmt(st.formal_windows)+" 正式"); row("对齐状态", fmt(vget([st.last_alignment_state, v.last_alignment_state])));
+ if((vget([st.last_alignment_state, v.last_alignment_state])||"MODEL_LOCAL_UNALIGNED")==="MODEL_LOCAL_UNALIGNED" && String(vget([v.aux_coverage, st.aux_coverage])||"").indexOf("odom-")>=0)row("点云叠加","未接入里程计 · 仅显示最新单窗口");
+ row("深度对照", depthMetricsLabel(state.formal_records));
+ refreshControls(st);
+ $("status-table").innerHTML=rows.join("");
+}
+function qualityPassed(r){return r.quality_passed!==false}
+function qualityLabel(r){if(r.alignment_method==="global_g4")return r.pending?"G4 待定":"G4 地图 v"+r.map_revision+(r.map_stale?" · 旧版本，等待新解":" · 数值可放置");if(r.component_anchor)return "锚点";var ratio=r.inlier_ratio==null?"--":Number(r.inlier_ratio).toFixed(3),rms=r.normalized_residual_rms==null?"--":Number(r.normalized_residual_rms).toFixed(3);return (qualityPassed(r)?"通过 ":"拒绝 ")+ratio+" / "+rms}
+function buildFormalTable(){var rows=[]; rows.push("<tr><th>窗口</th><th>状态</th><th>门限</th><th>方法 / 根 / 参考窗</th><th>map</th><th>原因</th></tr>");
+ state.formal_records.forEach(function(r){rows.push("<tr><td>"+esc(r.window_index)+"</td><td>"+esc(r.coordinate_state)+"</td><td>"+esc(qualityLabel(r))+"</td><td>"+esc(r.alignment_method)+" / "+esc(r.root_window_index)+" / "+esc(r.reference_window_index)+"</td><td class='mono'>"+esc(r.map_id)+"</td><td class='muted'>"+esc(r.reason)+"</td></tr>")});
+ $("formal-table").innerHTML=rows.join("")||"<tr><td class='muted'>无正式窗口</td></tr>"
+}
+var streamState={initialized:false,lastRole:""};
+function refreshStreams(){var role=currentRole(); if(streamState.initialized&&streamState.lastRole===role)return; streamState.initialized=true; streamState.lastRole=role;
+ var q="?t="+Date.now();
+ $("live-rgb").src="stream/"+encodeURIComponent(role)+"/rgb"+q;
+ $("live-rgb").onload=function(){$("live-rgb").hidden=false;$("live-rgb-label").textContent="最近收到的 RGB 帧"};
+ $("live-depth").onload=function(){$("live-depth").hidden=false;$("live-depth-label").textContent="最近收到的传感器深度"};
+ $("live-depth").src="stream/"+encodeURIComponent(role)+"/depth"+q;
+ $("live-rgb").onerror=function(){$("live-rgb").hidden=true;$("live-rgb-label").textContent="实时 RGB 不可用"};
+ $("live-depth").onerror=function(){$("live-depth").hidden=true;$("live-depth-label").textContent="实时传感器深度不可用"};
+}
+function currentRole(){return (state.status&&state.status.role)||"front"}
+function latestRecord(records){var latest=null; (records||[]).forEach(function(r){if(!latest){latest=r;return}var current=Number(r.window_index),previous=Number(latest.window_index);if(!Number.isFinite(current))current=-1;if(!Number.isFinite(previous))previous=-1;if(current>previous)latest=r});return latest}
+function omegaSpec(){var r=latestRecord(state.formal_records); if(!viewSession||!r)return null; var w=String(r.window_index); return {session:viewSession,window:w,key:viewSession+"|"+w+"|"+(r.result_manifest_sha256||"")}}
+function clearOmega(){if(omegaObjectUrl){URL.revokeObjectURL(omegaObjectUrl);omegaObjectUrl=""} $("omega-first-depth").hidden=true;$("omega-first-depth").removeAttribute("src"); $("omega-window-label").textContent="--"; $("omega-depth-label").textContent="等待最新窗口…"}
+function refreshOmega(spec){if(!spec)return; fetchWithTimeout("api/latest_first_depth?session="+encodeURIComponent(spec.session)+"&t="+Date.now(),{},15000).then(function(r){if(!r.ok)throw new Error("HTTP "+r.status); if(r.headers.get("X-Session")!==spec.session||r.headers.get("X-Window")!==spec.window)throw new Error("窗口已变更"); return r.blob()}).then(function(b){if(window.__omegaKey!==spec.key)return; $("omega-window-label").textContent="session/window: "+esc(spec.session)+" / "+esc(spec.window); $("omega-depth-label").textContent="已更新"; if(omegaObjectUrl)URL.revokeObjectURL(omegaObjectUrl);omegaObjectUrl=URL.createObjectURL(b);$("omega-first-depth").onload=function(){$("omega-first-depth").hidden=false};$("omega-first-depth").src=omegaObjectUrl}).catch(function(e){if(window.__omegaKey===spec.key){window.__omegaKey=""; $("omega-depth-label").textContent="不可用: "+e.message}})}
+function renderRecords(){buildFormalTable();updateAlignmentBadge();updateStatus(state.status,state.diagnostics);updateMapOptions();var omega=omegaSpec(),omegaKey=omega?omega.key:"";if(omegaKey!==window.__omegaKey){clearTimeout(omegaRetryTimer);omegaFailures=0;omegaInFlight="";window.__omegaKey=omegaKey;clearOmega();if(omega)refreshOmega(omega)}var pcSpec=pointCloudSpec();if(pcSpec.key!==window.__pcKey){clearTimeout(pcRetryTimer);pcFailures=0;pcInFlight="";window.__pcKey=pcSpec.key; clearPointCloud(); if(pcSpec.hasRecords)refreshPointCloud(pcSpec)}}
+function refreshRecords(key){if(recordsInFlight||!viewSession)return; recordsInFlight=true; var requested=viewSession; fetchWithTimeout("api/state?include_records=1&session="+encodeURIComponent(requested),{},8000).then(function(r){if(!r.ok)throw new Error("HTTP "+r.status);return r.json()}).then(function(detail){if(requested!==viewSession)return; state.formal_records=detail.formal_records||[];recordsKey=key;renderRecords();$("session-msg").textContent="已读取 "+state.formal_records.length+" 个正式窗口"}).catch(function(e){if(requested===viewSession)$("session-msg").textContent="历史记录请求失败: "+e.message}).finally(function(){recordsInFlight=false})}
+function refreshState(){if(stateInFlight)return; stateInFlight=true; fetchWithTimeout("api/state?include_records=0",{},3000).then(function(r){if(!r.ok)throw new Error("HTTP "+r.status);return r.json()}).then(function(s){state.selected_session=s.selected_session||"";state.sessions=s.sessions||[];state.roles=s.roles||[];state.preview_fps=s.preview_fps||5;state.status=s.status||{};state.diagnostics=s.diagnostics||{}; var live=(state.status&&state.status.session_id)||""; var known=state.sessions.some(function(x){return x.session_id===viewSession}); if(viewFollowLatest||!viewSession||!known)viewSession=live||(state.sessions[0]&&state.sessions[0].session_id)||""; state.view_session=viewSession;storageSet("drone3d.view_session",viewSession); var sel=$("session-select");sel.innerHTML="";state.sessions.forEach(function(x){var o=document.createElement("option");o.value=x.session_id;o.textContent=x.session_id+" ("+x.window_count+" 窗口)";sel.appendChild(o)});sel.value=viewSession;$("follow-latest").checked=viewFollowLatest;if(!previewDirty)$("p-preview-fps").value=state.preview_fps;$("view-session-badge").textContent="查看: "+(viewSession||"--");$("live-session-badge").textContent="控制: "+(live||"--");$("control-target").textContent="live session: "+(live||"--");var available=(state.status&&Array.isArray(state.status.available_roles))?state.status.available_roles:null;var roleSel=$("start-role"),oldRole=roleSel.value||"";roleSel.innerHTML="";(state.roles.length?state.roles:["front"]).forEach(function(name){var o=document.createElement("option");var ok=!available||available.indexOf(name)>=0;o.value=name;o.textContent=name+(ok?"":"（无图像源）");o.disabled=!ok;roleSel.appendChild(o)});roleSel.value=(oldRole&&state.roles.indexOf(oldRole)>=0&&(!available||available.indexOf(oldRole)>=0))?oldRole:((available&&available[0])||(state.roles[0])||"front");updateStatus(state.status,state.diagnostics);refreshStreams(); var item=state.sessions.filter(function(x){return x.session_id===viewSession})[0]||{}; var nextKey=viewSession+"|"+(item.window_count||0)+"|"+(item.latest_window_index==null?-1:item.latest_window_index)+"|"+(item.map_revision_sha256||"");if(nextKey!==recordsKey)refreshRecords(nextKey); if(stateFailures&&$("session-msg").textContent.indexOf("state 请求失败: ")===0)$("session-msg").textContent=""; lastStateOk=Date.now();stateFailures=0}).catch(function(e){stateFailures++;$("session-msg").textContent="state 请求失败: "+e.message}).finally(function(){stateInFlight=false;scheduleState()})}
+function scheduleState(){if(stateTimer)return;var delay=stateFailures?Math.min(5000,1000*Math.pow(2,Math.min(3,stateFailures-1))):1000;stateTimer=setTimeout(function(){stateTimer=null;refreshState()},delay)}
+function updateAlignmentBadge(){var rec=null; for(var i=state.formal_records.length-1;i>=0;i--){if(state.formal_records[i].coordinate_state==="ODOM_LOCAL_APPROX"){rec=state.formal_records[i];break}} var badge=$("alignment-badge"); if(rec){var passed=qualityPassed(rec);badge.textContent=(passed?rec.coordinate_state:"配准未过门限")+" "+rec.map_id; badge.className=passed?"badge approx":"badge unreliable"} else {badge.textContent="MODEL_LOCAL_UNALIGNED"; badge.className="badge unreliable"} }
+function deletePointBuffers(){if(!gl)return;[pc.positionBuffer,pc.colorBuffer,pc.axisPositionBuffer,pc.axisColorBuffer].forEach(function(buffer){if(buffer)gl.deleteBuffer(buffer)})}
+function clearPointCloud(){deletePointBuffers();pc={count:0,positions:null,colors:null,positionBuffer:null,colorBuffer:null,axisPositionBuffer:null,axisColorBuffer:null,bounds:null,zUp:false};if(gl){gl.clearColor(0.04,0.05,0.07,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT)}if(rendererState==="ready")$("pc-badge").textContent="等待正式窗口…"}
+function updateMapOptions(){var maps=[];(state.formal_records||[]).forEach(function(r){var aligned=r.coordinate_state==="ODOM_LOCAL_APPROX";if(aligned&&r.map_id&&(includeRejected||qualityPassed(r))&&maps.indexOf(r.map_id)<0)maps.push(r.map_id)});if(!mapDirty||maps.indexOf(viewMap)<0)viewMap=maps.length?maps[maps.length-1]:"";var sel=$("map-select");sel.innerHTML="";if(!maps.length){var empty=document.createElement("option");empty.value="";empty.textContent="无可显示分量";sel.appendChild(empty)}else maps.forEach(function(map){var o=document.createElement("option");o.value=map;o.textContent=map;sel.appendChild(o)});sel.value=viewMap;sel.disabled=maps.length<2}
+function pointCloudSpec(){var records=state.formal_records||[],map=viewMap||"latest",selected=[];if(viewMap){selected=records.filter(function(r){return (r.coordinate_state==="ODOM_LOCAL_APPROX")&&r.map_id===viewMap&&(includeRejected||qualityPassed(r))})}else{var latest=latestRecord(records);if(latest)selected=[latest]}var fingerprint=selected.map(function(r){return r.window_index+":"+(r.result_manifest_sha256||"")+":"+(r.map_revision_sha256||"")}).join(","); return {session:viewSession,map:map,includeRejected:includeRejected,key:viewSession+"|"+map+"|"+(includeRejected?"all":"passed")+"|"+fingerprint,hasRecords:selected.some(function(r){return r.alignment_method!=="global_g4"||!r.pending})}}
+function refreshPointCloud(spec){if(!spec||!spec.hasRecords||window.__pcKey!==spec.key||pcInFlight===spec.key)return;pcInFlight=spec.key;$("pc-badge").textContent="点云加载中…";var url="api/pointcloud?session="+encodeURIComponent(spec.session)+"&map="+encodeURIComponent(spec.map)+"&include_rejected="+(spec.includeRejected?"1":"0")+"&max_points="+(window.PC_MAX_POINTS||1000000);fetchWithTimeout(url,{},30000).then(function(r){if(!r.ok)throw new Error("HTTP "+r.status); if(r.headers.get("X-Session")!==spec.session)throw new Error("session 已变更"); var aligned=r.headers.get("X-Aligned")==="1"; var original=Number(r.headers.get("X-Original-Points")||0); var displayed=Number(r.headers.get("X-Displayed-Points")||0); var sampling=r.headers.get("X-Sampling")||""; var equivalentStride=Number(r.headers.get("X-Equivalent-Stride")||0); var conf=Number(r.headers.get("X-Conf-Percentile")||0); var mapId=headerText(r,"X-Map-Id"); var reason=headerText(r,"X-Reason"); var stateName=r.headers.get("X-Coordinate-State")||""; var rejected=r.headers.get("X-Include-Rejected")==="1"; return r.arrayBuffer().then(function(buf){if(window.__pcKey===spec.key){pcFailures=0;loadPointCloud(buf,aligned,mapId,original,displayed,sampling,equivalentStride,conf,stateName,reason,rejected)}})}).catch(function(e){if(window.__pcKey===spec.key){pcFailures++;var delay=Math.min(10000,1000*Math.pow(2,Math.min(3,pcFailures-1)));$("pc-badge").textContent="点云加载失败: "+e.message+" · "+(delay/1000)+"秒后重试";clearTimeout(pcRetryTimer);pcRetryTimer=setTimeout(function(){refreshPointCloud(spec)},delay)}}).finally(function(){if(pcInFlight===spec.key)pcInFlight=""})}
+function loadPointCloud(buf,aligned,mapId,original,displayed,sampling,equivalentStride,conf,stateName,reason,rejected){if(buf.byteLength<4)throw new Error("点云响应过短");var dv=new DataView(buf),count=dv.getUint32(0,true),expected=4+count*15;if(count<1||expected!==buf.byteLength)throw new Error("点云响应长度非法");var positions=new Float32Array(count*3),colors=new Uint8Array(count*3),colorOffset=4+count*12;for(var i=0;i<count*3;i++){positions[i]=dv.getFloat32(4+i*4,true);colors[i]=dv.getUint8(colorOffset+i)}deletePointBuffers();var zUp=stateName==="ODOM_LOCAL_APPROX";pc={count:count,positions:positions,colors:colors,positionBuffer:null,colorBuffer:null,axisPositionBuffer:null,axisColorBuffer:null,bounds:null,zUp:zUp};uploadPointCloud();orbit.yaw=0.6;orbit.pitch=0.5;fitPointCloud();var sample="sampling "+esc(sampling)+" · 等效倍率 ×"+equivalentStride;var badge=$("pc-badge"),quality=stateName==="ODOM_LOCAL_APPROX"?"<span class='err'>不可靠·未经真值验证</span>":"相对尺度·非公制";if(rejected)quality+=" · <span class='err'>含未过门限窗口</span>";if(aligned){badge.innerHTML=esc(stateName)+" + <span class='mono'>"+esc(mapId)+"</span> · "+quality+" · 原始 "+original+" · 显示 "+displayed+" · "+sample+" · conf P"+conf+" · Fit=主体 / Reset=含异常全景"}else{badge.innerHTML=esc(stateName)+"（不累计）· Omega/OpenCV model-local · 原因: "+esc(reason)+" · 原始 "+original+" · 显示 "+displayed+" · "+sample+" · conf P"+conf+" · Fit=主体 / Reset=含异常全景"}$("axis-convention").textContent=zUp?"ROS odom · Z-up":"Omega/OpenCV session · Y-down"}
+function initGL(){var canvas=$("pointcloud-canvas");gl=canvas.getContext("webgl",{antialias:true,preserveDrawingBuffer:true});if(!gl){rendererState="unavailable";$("pc-badge").textContent="WebGL 不可用；请启用浏览器硬件加速";return}var vs="attribute vec3 aPos; attribute vec3 aCol; uniform mat4 uProj; uniform mat4 uView; uniform float uPointSize; varying vec3 vCol; void main(){gl_Position=uProj*uView*vec4(aPos,1.0); gl_PointSize=uPointSize; vCol=aCol;}";var fs="precision mediump float; varying vec3 vCol; void main(){gl_FragColor=vec4(vCol,1.0);}";function sh(type,src){var s=gl.createShader(type);gl.shaderSource(s,src);gl.compileShader(s);if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw new Error("shader compile: "+gl.getShaderInfoLog(s));return s}var program=gl.createProgram();gl.attachShader(program,sh(gl.VERTEX_SHADER,vs));gl.attachShader(program,sh(gl.FRAGMENT_SHADER,fs));gl.linkProgram(program);if(!gl.getProgramParameter(program,gl.LINK_STATUS))throw new Error("program link: "+gl.getProgramInfoLog(program));glProgram={program:program,uProj:gl.getUniformLocation(program,"uProj"),uView:gl.getUniformLocation(program,"uView"),uPointSize:gl.getUniformLocation(program,"uPointSize"),aPos:gl.getAttribLocation(program,"aPos"),aCol:gl.getAttribLocation(program,"aCol")};if(glProgram.aPos<0||glProgram.aCol<0||!glProgram.uProj||!glProgram.uView||!glProgram.uPointSize)throw new Error("shader location missing");gl.useProgram(program);gl.enable(gl.DEPTH_TEST);rendererState="ready"}
+function uploadPointCloud(){if(!gl||rendererState!=="ready"||!pc.count)return;pc.positionBuffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,pc.positionBuffer);gl.bufferData(gl.ARRAY_BUFFER,pc.positions,gl.STATIC_DRAW);pc.colorBuffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,pc.colorBuffer);gl.bufferData(gl.ARRAY_BUFFER,pc.colors,gl.STATIC_DRAW)}
+var orbit={yaw:0.6,pitch:0.5,dist:6,target:[0,0,0],radius:1};
+function quantileBounds(){var stride=Math.max(1,Math.floor(pc.count/10000)),bounds=[];for(var k=0;k<3;k++){var values=[];for(var i=0;i<pc.count;i+=stride){var value=pc.positions[i*3+k];if(Number.isFinite(value))values.push(value)}values.sort(function(a,b){return a-b});if(!values.length)return null;var lo=values[Math.floor((values.length-1)*0.05)],hi=values[Math.ceil((values.length-1)*0.95)];if(!(hi>lo)){lo=values[0];hi=values[values.length-1]}bounds.push([lo,hi])}return bounds}
+function fullBounds(){var bounds=[[Infinity,-Infinity],[Infinity,-Infinity],[Infinity,-Infinity]];for(var i=0;i<pc.count;i++){for(var k=0;k<3;k++){var value=pc.positions[i*3+k];if(Number.isFinite(value)){bounds[k][0]=Math.min(bounds[k][0],value);bounds[k][1]=Math.max(bounds[k][1],value)}}}return bounds[0][0]===Infinity?null:bounds}
+function updateAxisBuffers(){if(!gl||!pc.bounds)return;[pc.axisPositionBuffer,pc.axisColorBuffer].forEach(function(b){if(b)gl.deleteBuffer(b)});var t=[0,0,0],s=Math.max(orbit.radius*0.28,0.01),positions=new Float32Array([t[0],t[1],t[2],t[0]+s,t[1],t[2],t[0],t[1],t[2],t[0],t[1]+s,t[2],t[0],t[1],t[2],t[0],t[1],t[2]+s]),colors=new Uint8Array([255,70,70,255,70,70,70,220,90,70,220,90,80,120,255,80,120,255]);pc.axisPositionBuffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,pc.axisPositionBuffer);gl.bufferData(gl.ARRAY_BUFFER,positions,gl.STATIC_DRAW);pc.axisColorBuffer=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,pc.axisColorBuffer);gl.bufferData(gl.ARRAY_BUFFER,colors,gl.STATIC_DRAW)}
+function applyViewBounds(b){if(!b)return;pc.bounds=b;orbit.target=[(b[0][0]+b[0][1])/2,(b[1][0]+b[1][1])/2,(b[2][0]+b[2][1])/2];orbit.radius=Math.hypot(b[0][1]-b[0][0],b[1][1]-b[1][0],b[2][1]-b[2][0])/2||1;orbit.dist=Math.max(orbit.radius*2.6,0.01);updateAxisBuffers();drawPointCloud()}
+function fitPointCloud(){if(pc.count)applyViewBounds(quantileBounds())}
+function resetView(){orbit.yaw=0.6;orbit.pitch=0.5;if(pc.count)applyViewBounds(fullBounds())}
+function drawPointCloud(){if(!gl||!glProgram||rendererState!=="ready")return;var canvas=$("pointcloud-canvas"),width=Math.max(1,canvas.clientWidth),height=Math.max(1,canvas.clientHeight);if(canvas.width!==width||canvas.height!==height){canvas.width=width;canvas.height=height}gl.viewport(0,0,width,height);gl.clearColor(0.04,0.05,0.07,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);if(!pc.count||!pc.positionBuffer)return;var radius=orbit.radius||1,near=Math.max(0.0001,radius/500),far=Math.max(radius*100,orbit.dist+radius*4),target=orbit.target,eye,up;if(pc.zUp){eye=[target[0]+orbit.dist*Math.cos(orbit.pitch)*Math.cos(orbit.yaw),target[1]+orbit.dist*Math.cos(orbit.pitch)*Math.sin(orbit.yaw),target[2]+orbit.dist*Math.sin(orbit.pitch)];up=[0,0,1]}else{eye=[target[0]+orbit.dist*Math.cos(orbit.pitch)*Math.sin(orbit.yaw),target[1]+orbit.dist*Math.sin(orbit.pitch),target[2]+orbit.dist*Math.cos(orbit.pitch)*Math.cos(orbit.yaw)];up=[0,-1,0]}var proj=matPerspective(45*Math.PI/180,width/height,near,far),view=matLookAt(eye,target,up),p=glProgram;gl.useProgram(p.program);gl.uniformMatrix4fv(p.uProj,false,proj);gl.uniformMatrix4fv(p.uView,false,view);gl.uniform1f(p.uPointSize,Number($("point-size").value)||2);gl.bindBuffer(gl.ARRAY_BUFFER,pc.positionBuffer);gl.enableVertexAttribArray(p.aPos);gl.vertexAttribPointer(p.aPos,3,gl.FLOAT,false,0,0);gl.bindBuffer(gl.ARRAY_BUFFER,pc.colorBuffer);gl.enableVertexAttribArray(p.aCol);gl.vertexAttribPointer(p.aCol,3,gl.UNSIGNED_BYTE,true,0,0);gl.drawArrays(gl.POINTS,0,pc.count);if(pc.axisPositionBuffer){gl.uniform1f(p.uPointSize,1);gl.bindBuffer(gl.ARRAY_BUFFER,pc.axisPositionBuffer);gl.vertexAttribPointer(p.aPos,3,gl.FLOAT,false,0,0);gl.bindBuffer(gl.ARRAY_BUFFER,pc.axisColorBuffer);gl.vertexAttribPointer(p.aCol,3,gl.UNSIGNED_BYTE,true,0,0);gl.drawArrays(gl.LINES,0,6)}canvas.dataset.drawCount=String(pc.count);canvas.dataset.glError=String(gl.getError());canvas.dataset.orbit=JSON.stringify({target:target,radius:radius,dist:orbit.dist,eye:eye,near:near,far:far})}
+function matPerspective(fov,aspect,near,far){var f=1/Math.tan(fov/2),nf=1/(near-far); return [f/aspect,0,0,0, 0,f,0,0, 0,0,(far+near)*nf,-1, 0,0,2*far*near*nf,0]}
+function matLookAt(eye,center,up){var z=[eye[0]-center[0],eye[1]-center[1],eye[2]-center[2]]; var l=Math.hypot(z[0],z[1],z[2])||1; z=[z[0]/l,z[1]/l,z[2]/l]; var x=[up[1]*z[2]-up[2]*z[1],up[2]*z[0]-up[0]*z[2],up[0]*z[1]-up[1]*z[0]]; l=Math.hypot(x[0],x[1],x[2])||1; x=[x[0]/l,x[1]/l,x[2]/l]; var y=[z[1]*x[2]-z[2]*x[1],z[2]*x[0]-z[0]*x[2],z[0]*x[1]-z[1]*x[0]]; return [x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0, -(x[0]*eye[0]+x[1]*eye[1]+x[2]*eye[2]), -(y[0]*eye[0]+y[1]*eye[1]+y[2]*eye[2]), -(z[0]*eye[0]+z[1]*eye[1]+z[2]*eye[2]), 1]}
+function bindViewer(){var c=$("pointcloud-canvas"),drag=false,lx=0,ly=0;c.addEventListener("webglcontextlost",function(e){e.preventDefault();rendererState="lost";gl=null;glProgram=null;$("pc-badge").textContent="WebGL context 已丢失，等待自动恢复…"});c.addEventListener("webglcontextrestored",function(){try{initGL();uploadPointCloud();updateAxisBuffers();drawPointCloud()}catch(e){rendererState="error";$("pc-badge").textContent="WebGL 恢复失败: "+e.message}});c.addEventListener("mousedown",function(e){drag=true;lx=e.clientX;ly=e.clientY});window.addEventListener("mouseup",function(){drag=false});window.addEventListener("mousemove",function(e){if(!drag)return;orbit.yaw+=(e.clientX-lx)*0.01;orbit.pitch=Math.max(-1.4,Math.min(1.4,orbit.pitch+(e.clientY-ly)*0.01));lx=e.clientX;ly=e.clientY;drawPointCloud()});c.addEventListener("wheel",function(e){e.preventDefault();orbit.dist=Math.max(0.01,orbit.dist*Math.exp(e.deltaY*0.001));drawPointCloud()},{passive:false});window.addEventListener("resize",drawPointCloud);$("btn-fit").onclick=fitPointCloud;$("btn-reset").onclick=resetView;$("point-size").oninput=drawPointCloud}
+function refreshControls(st){var s=(st&&st.state)||""; var startable=(s==="IDLE"||s==="STOPPED"); var pausable=(s==="RUNNING"||s==="DISK_PAUSED"); var retryable=(s==="MEMORY_PAUSED"); var resumable=(s==="PAUSED"||retryable); var stoppable=(s==="RUNNING"||s==="PAUSED"||s==="DISK_PAUSED"||s==="FATAL_OOM"||s==="MEMORY_PAUSED"||s==="DRAINING");var roleSel=$("start-role"),roleOk=!(roleSel.selectedOptions&&roleSel.selectedOptions[0]&&roleSel.selectedOptions[0].disabled);
+ $("btn-start").disabled=commandInFlight||!startable||!roleOk;
+ $("btn-pause-resume").disabled=commandInFlight||!(pausable||resumable);
+ $("btn-pause-resume").textContent=retryable?"重试资源失败窗":(resumable?"恢复":(pausable?"暂停":"暂停/恢复"));
+  $("btn-pause-resume").title=retryable?"只重试被资源门拒绝的那一个窗口：复用已保留输入，阈值与门禁不变；已完成的窗口不重采。":(resumable?"恢复采集":"运行中暂停；暂停后恢复");
+ $("btn-stop").disabled=commandInFlight||!stoppable;
+ $("btn-stop").textContent=s==="DRAINING"?"立即停止":"停止";
+ $("btn-stop").title=s==="DRAINING"?"丢弃还没重建的窗口并立即停止":"停止采集；已采集的窗口继续重建完再结束";
+}
+function setCommandsDisabled(value){["#btn-pause-resume",".command-control"].forEach(function(selector){document.querySelectorAll(selector).forEach(function(button){button.disabled=value})})}
+function postCommand(cmd,args,timeoutMs){if(commandInFlight)return Promise.resolve({ok:false,error:"已有命令执行中"});commandInFlight=true;setCommandsDisabled(true);$("command-msg").textContent="执行中: "+cmd;var commandTimeout=timeoutMs||{"start_session":30000,"stop_all":30000,"select_source":15000,"pause":15000,"resume":15000}[cmd]||15000;return fetchWithTimeout("api/command",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(Object.assign({command:cmd},args||{}))},commandTimeout).then(function(response){return response.json().catch(function(){throw new Error("HTTP "+response.status+" 且响应不是 JSON")}).then(function(payload){if(!response.ok||!payload.ok)throw new Error(payload.error||("HTTP "+response.status));return payload})}).then(function(result){$("command-msg").textContent="OK: "+cmd+" · "+JSON.stringify(result.response||{});refreshState();return result}).catch(function(error){$("command-msg").textContent="ERR: "+cmd+" · "+error.message;return {ok:false,error:error.message}}).finally(function(){commandInFlight=false;setCommandsDisabled(false);refreshControls(state.status)})}
+function wire(){var canvas=$("pointcloud-canvas");bindViewer();try{initGL()}catch(e){rendererState="error";gl=null;$("pc-badge").textContent="WebGL 初始化失败: "+e.message}
+ $("follow-latest").addEventListener("change",function(){viewFollowLatest=this.checked;storageSet("drone3d.follow_live",viewFollowLatest?"1":"0");recordsKey="";refreshState()});
+ $("map-select").addEventListener("change",function(){viewMap=this.value;mapDirty=true;renderRecords()});
+ $("include-rejected").addEventListener("change",function(){includeRejected=this.checked;renderRecords()});
+ $("session-select").addEventListener("change",function(){if(!this.value)return;viewFollowLatest=false;$("follow-latest").checked=false;storageSet("drone3d.follow_live","0");viewSession=this.value;viewMap="";mapDirty=false;storageSet("drone3d.view_session",viewSession);state.formal_records=[];recordsKey="";window.__pcKey="";window.__omegaKey="";clearPointCloud();clearOmega();refreshRecords(viewSession+"|manual")});
+ $("btn-start").onclick=function(){var role=$("start-role").value; if(!role){$("command-msg").textContent="ERR: start_session · 未选择相机角色";return} postCommand("start_session",{role:role})};
+ $("btn-pause-resume").onclick=function(){var s=(state.status&&state.status.state)||""; postCommand((s==="PAUSED"||s==="MEMORY_PAUSED")?"resume":"pause",{})};
+ $("btn-stop").onclick=function(){var st=state.status||{},n=(st.pending_windows||0)+(runningActive(st)?1:0);var text=st.state==="DRAINING"?"立即停止：还没重建的 "+n+" 个窗口将被丢弃，确定吗？":"停止采集：正在采的窗口丢弃，已采集的窗口继续重建完再结束会话。确定吗？";if(window.confirm(text))postCommand("stop_all",{})};
+ $("p-preview-fps").addEventListener("input",function(){previewDirty=true});
+ $("preview-form").addEventListener("submit",function(e){e.preventDefault();var value=Number($("p-preview-fps").value);if(Number.isFinite(value)&&value>=0.5&&value<=30)postCommand("set_preview_fps",{value:value}).then(function(result){if(result.ok)previewDirty=false});else $("command-msg").textContent="ERR: web_preview_fps 必须在 [0.5, 30]"});
+ refreshState()}
+var controlPanel=$("preview-form").closest(".panel"),side=document.querySelector(".three-col");
+var advanced=document.createElement("details"),summary=document.createElement("summary");summary.textContent="预览参数";summary.style.cssText="cursor:pointer;color:var(--muted);font-size:12px;margin:8px 0";advanced.append(summary);controlPanel.append(advanced);advanced.append($("preview-form"));side.prepend(controlPanel);
+if(window.top!==window){var nav=document.querySelector("header nav");if(nav)nav.hidden=true}
+wire();
+</script>
+</body>
+</html>

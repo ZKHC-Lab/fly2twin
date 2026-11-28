@@ -9,9 +9,26 @@ from recon.io.scene import load_scene, read_gaussians
 
 def gaussian_ply(path, n=5, rest=45):
     rng = np.random.default_rng(0)
-    cols = ['x', 'y', 'z', 'nx', 'ny', 'nz', 'f_dc_0', 'f_dc_1', 'f_dc_2',
-            *[f'f_rest_{i}' for i in range(rest)], 'opacity', 'scale_0', 'scale_1', 'scale_2',
-            'rot_0', 'rot_1', 'rot_2', 'rot_3']
+    cols = [
+        'x',
+        'y',
+        'z',
+        'nx',
+        'ny',
+        'nz',
+        'f_dc_0',
+        'f_dc_1',
+        'f_dc_2',
+        *[f'f_rest_{i}' for i in range(rest)],
+        'opacity',
+        'scale_0',
+        'scale_1',
+        'scale_2',
+        'rot_0',
+        'rot_1',
+        'rot_2',
+        'rot_3',
+    ]
     v = np.empty(n, dtype=[(c, '<f4') for c in cols])
     for c in cols:
         v[c] = rng.normal(size=n)
@@ -33,11 +50,19 @@ def test_load_scene_split_and_intrinsics(tmp_path):
     write_ply(tmp_path / 'cloud.ply', point_vertices(np.zeros((3, 3), np.float32), np.ones((3, 3), np.float32)))
     c2w = np.tile(np.eye(4), (3, 1, 1))
     c2w[:, 0, 3] = [0, 1, 2]
-    K = np.tile(np.array([[100., 0, 63.5], [0, 100, 47.5], [0, 0, 1]]), (3, 1, 1))
+    K = np.tile(np.array([[100.0, 0, 63.5], [0, 100, 47.5], [0, 0, 1]]), (3, 1, 1))
     np.savez(tmp_path / 'cameras.npz', frame_ids=np.array([10, 20, 30]), c2w=c2w, K=K, resolution=[128, 96])
-    (tmp_path / 'scene.json').write_text(json.dumps(dict(
-        preferred_model=dict(path='gaussians.ply'), cameras='cameras.npz', cloud='cloud.ply',
-        capture_corridor=dict(training_frame_ids=[10, 30]), world_up=[0, 0, 2])))
+    (tmp_path / 'scene.json').write_text(
+        json.dumps(
+            dict(
+                preferred_model=dict(path='gaussians.ply'),
+                cameras='cameras.npz',
+                cloud='cloud.ply',
+                capture_corridor=dict(training_frame_ids=[10, 30]),
+                world_up=[0, 0, 2],
+            )
+        )
+    )
     s = load_scene(tmp_path, width=64)
     assert list(s.train_ids) == [10, 30] and list(s.test_ids) == [20]
     assert (s.width, s.height) == (64, 48)

@@ -6,7 +6,7 @@
 ROS 消息、磁盘缓存、模型推理、线程调度和地图发布由调用方负责（`drone3d_reconstruction_core.g4`）。
 
 早期的 G4 图配准（`legacy_g4_20260916`：E1 共享点配准、定位因子、每窗一个 Sim(3) 的整图求解）和长窗分组的窗口清单
-在 2026-11-23 删除，代码可从提交 `f0c0aa3` 恢复；算法定义和核验记录见 [G4 算法基线与移植规范](../../../../docs/G4_BASELINE_SPEC.md)。
+在 2026-11-23 删除，代码可从提交 `f0c0aa3` 恢复。
 
 ## 安装和核查
 
@@ -24,7 +24,7 @@ python -m unittest discover -s ROS_Compatibility_layer/src/drone3d_reconstructio
 | `types.py` | `Sim3`、`WindowGeometry` 两个数据契约和数值验证 |
 | `sim3.py` | Sim(3) 复合与作用于点 |
 | `geometry.py` | 预测转为首相机规范、像素中心约定下的内参缩放 |
-| `frame_pose.py` | 逐帧外部位姿放置：位姿插值、窗口尺度、共享帧深度比；方法身份 `frame_pose_window_scale_20261008` |
+| `frame_pose.py` | 逐帧外部位姿放置：配置校验、位姿插值、窗口平移，转发 `recon_core.scale` 的窗口尺度与共享帧深度比；方法身份 `frame_pose_window_scale_20261008`。逐帧尺度由 `g4/map_backend.py` 直接调用 `recon_core.scale.solve_frame_scales` |
 
 ## 数据契约
 

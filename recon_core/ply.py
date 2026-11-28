@@ -1,4 +1,5 @@
 """Binary little-endian PLY point cloud writer (XYZ float32, RGB uint8)."""
+
 import numpy as np
 
 
@@ -7,8 +8,9 @@ def write_ply(path, xyz, rgb, comment="meters Z-up"):
     xyz, rgb = np.asarray(xyz), np.asarray(rgb)
     if xyz.shape != rgb.shape or xyz.ndim != 2 or xyz.shape[1] != 3 or not np.isfinite(xyz).all():
         raise ValueError("PLY requires finite Nx3 XYZ and matching RGB")
-    data = np.empty(len(xyz), dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"),
-                                     ("red", "u1"), ("green", "u1"), ("blue", "u1")])
+    data = np.empty(
+        len(xyz), dtype=[("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("red", "u1"), ("green", "u1"), ("blue", "u1")]
+    )
     for i, name in enumerate(("x", "y", "z")):
         data[name] = xyz[:, i]
     for i, name in enumerate(("red", "green", "blue")):

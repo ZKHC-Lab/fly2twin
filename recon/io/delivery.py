@@ -4,6 +4,7 @@ Frames are the package keyframes in package order; K is the shared CameraInfo K.
 Poses are the landing-BA cameras when the package records a completed onboard BA,
 otherwise the onboard LIO frame_pose poses. Both are metric camera-to-world.
 """
+
 from pathlib import Path
 import json
 import numpy as np
@@ -34,6 +35,8 @@ def load(package):
     if not np.allclose(K, K[0]):
         raise ValueError('Delivery frames do not share one camera')
     width, height = meta['resolution']
-    frames = [dict(frame_id=int(i), timestamp_ns=int(t), path=str(package / row['path']), c2w=pose.tolist())
-              for i, t, row, pose in zip(ids, stamps, meta['frames'], c2w)]
+    frames = [
+        dict(frame_id=int(i), timestamp_ns=int(t), path=str(package / row['path']), c2w=pose.tolist())
+        for i, t, row, pose in zip(ids, stamps, meta['frames'], c2w)
+    ]
     return dict(K=K[0].tolist(), resolution=[width, height], frames=frames), source

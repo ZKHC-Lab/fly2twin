@@ -370,6 +370,8 @@ class ContinuousSessionNodeTest(unittest.TestCase):
         self.assertEqual(config.worker_python, "/usr/bin/python3")
         self.assertEqual(config.initial_inference_resolution, 384)
         self.assertEqual(config.initial_worker_timeout_sec, 0.0)
+        self.assertEqual(config.retention_max_sessions, 3)
+        self.assertEqual(config.retention_orphan_grace_sec, 86400.0)
 
 
 
@@ -402,6 +404,9 @@ class ContinuousSessionNodeTest(unittest.TestCase):
         invalid = [
             {"initial_queue_mode": "realtime_latest"},
             {"initial_keep_snapshot_on_success": False},
+            {"retention_max_sessions": 0},
+            {"retention_orphan_grace_sec": -1.0},
+            {"retention_orphan_grace_sec": float("inf")},
             {"initial_overlap_frames": 0},
             {"initial_inference_resolution": True},
             {"initial_inference_resolution": 31},
@@ -472,6 +477,53 @@ class ContinuousSessionNodeTest(unittest.TestCase):
         node.shutdown(timeout_sec=2.0)
         self.assertTrue(service.shutdown_calls)
 
+    def test_storage_is_pruned_at_start_and_after_stop_protecting_the_session(self):
+        calls = []
+
+        def fake_prune(**kwargs):
+            calls.append(kwargs)
+            return {"removed": [], "freed_bytes": 0, "errors": [], "kept_sessions": [],
+                    "kept_unexported": ["s" + "a" * 16], "kept_locked": []}
+
+        service_holder = []
+        with mock.patch(
+            "drone3d_reconstruction_core.continuous_session_node.prune_storage",
+            side_effect=fake_prune,
+        ):
+            node = ContinuousSessionNode(
+                self.make_params(),
+                service_factory=lambda *a, **k: service_holder.append(FakeService(*a, **k))
+                or service_holder[-1],
+                publisher_factory=lambda *a, **k: FakePublisher(*a, **k),
+                timer_factory=lambda *a, **k: FakeTimer(*a, **k),
+                capture_client_factory=lambda role: FakeCaptureClient(role),
+                backend_factory=lambda action: None,
+            )
+            self.assertTrue(node.is_ready())
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(tuple(calls[0]["protected_session_ids"]), ())
+            self.assertTrue(calls[0]["remove_staging"])
+            self.assertEqual(calls[0]["policy"].max_sessions, 3)
+            service = service_holder[0]
+            service.callback(ContinuousSessionCommandRequest(
+                command=ContinuousSessionCommandRequest.SELECT_SOURCE, role="front"))
+            started = service.callback(ContinuousSessionCommandRequest(
+                command=ContinuousSessionCommandRequest.START_SESSION, role=""))
+            stopped = service.callback(ContinuousSessionCommandRequest(
+                command=ContinuousSessionCommandRequest.STOP_ALL))
+            self.assertEqual(stopped.error_code, ContinuousSessionCommandResponse.OK)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(tuple(calls[1]["protected_session_ids"]), (started.session_id,))
+            self.assertFalse(calls[1]["remove_staging"])
+            message = assemble_continuous_diagnostics(
+                core_snapshot=node._core.diagnostics_snapshot(), config=node._config,
+                not_ready_error=None, retention_report=node._retention_report)
+            server = {status.name: status for status in message.status}["drone3d/session/server"]
+            values = {item.key: item.value for item in server.values}
+            self.assertEqual(values["retention_kept_unexported_sessions"], "1")
+            self.assertEqual(server.level, DiagnosticStatus.WARN)
+            node.shutdown(timeout_sec=2.0)
+
     def test_auto_start_session_selects_role_and_starts(self):
         params = self.make_params()
         params.update(
@@ -518,6 +570,102 @@ class ContinuousSessionNodeTest(unittest.TestCase):
         self.assertEqual(
             statuses["drone3d/session/server"].level, DiagnosticStatus.ERROR
         )
+
+
+class ProfileLoadingTest(unittest.TestCase):
+    """The committed continuous profiles load through the node into the intended combination."""
+
+    PACKAGE = Path(__file__).resolve().parents[1]
+    WORKSPACE = PACKAGE.parents[1]
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def load_profile(self, path):
+        """YAML with its placeholders and deployment paths pointed into a temporary tree."""
+        import re
+        import yaml
+        text = path.read_text()
+        for placeholder, value in (("${OUT}", str(self.root / "out")), ("${REPO}", str(self.root / "repo")),
+                                   ("${CONDA}", str(self.root / "conda")), ("${INTERVAL_MS}", "250"),
+                                   ("${SWAP_BYTES}", "1073741824"), ("/REPLACE_ME", str(self.root / "replace"))):
+            text = text.replace(placeholder, value)
+        # The NX bench profiles carry the bench machine's home directory.
+        text = re.sub(r"/home/[^/\s\"']+", str(self.root / "home"), text)
+        return yaml.safe_load(text)
+
+    def load(self, continuous, roles, reconstruct):
+        params = self.load_profile(continuous)
+        params["roles"] = {name: self.load_profile(path) for name, path in roles.items()}
+        params["expected_reconstruction"] = self.load_profile(reconstruct)
+        for directory in [params["journal_root"], params["result_root"]] + [
+                role["snapshot_root"] for role in params["roles"].values()]:
+            Path(directory).mkdir(parents=True, exist_ok=True)
+        return load_continuous_config(params)
+
+    def test_bag_replay_profile_is_the_mainline_combination(self):
+        profiles = self.WORKSPACE / "tools/bag/profiles"
+        if not profiles.is_dir():
+            self.skipTest("tools/bag is not part of the public repository")
+        config = self.load(profiles / "continuous_profile.yaml",
+                           {"front": profiles / "capture_profile.front.yaml",
+                            "down": profiles / "capture_profile.down.yaml"},
+                           profiles / "reconstruct_profile.yaml")
+        self.assertEqual(
+            (config.alignment_backend, config.g4_placement, config.pose_time_offset_ms,
+             config.pose_time_offset_stage, config.g4_frame_scales, config.frame_pose_fusion,
+             config.g4_cross_window_weight, config.initial_window_frames, config.initial_overlap_frames,
+             config.reconstruct_frame_group_size, config.initial_inference_resolution,
+             config.initial_queue_mode, config.initial_keep_snapshot_on_success,
+             config.initial_reconstruction_mode, config.retention_max_sessions),
+            ("global_g4", "frame_pose", 40.0, "capture", True, True, 0.0, 40, 5, 40, 384,
+             QUEUE_LOSSLESS, True, "per_window", 3),
+        )
+        self.assertEqual([role.role for role in config.roles], ["front", "down"])
+
+    def test_nx_bench_profile_loads_with_frame_pose_placement(self):
+        profiles = self.WORKSPACE / "tools/nx_bench/profiles"
+        if not profiles.is_dir():
+            self.skipTest("tools/nx_bench is not part of the public repository")
+        config = self.load(profiles / "continuous_profile.yaml",
+                           {"front": profiles / "capture_profile.front.yaml",
+                            "down": profiles / "capture_profile.down.yaml"},
+                           profiles / "reconstruct_profile.yaml")
+        self.assertEqual(
+            (config.g4_placement, config.pose_time_offset_ms, config.pose_time_offset_stage,
+             config.g4_frame_scales, config.initial_window_frames, config.initial_overlap_frames,
+             config.reconstruct_frame_group_size, config.initial_inference_resolution),
+            ("frame_pose", 40.0, "capture", True, 40, 5, 40, 384),
+        )
+        bag = self.WORKSPACE / "tools/bag/profiles"
+        if not bag.is_dir():
+            return
+        # How frames are picked, windowed, scaled and placed is the same on the bench as in bag replay.
+        for name, keys in (
+            ("capture_profile.front.yaml", (
+                "keyframe_min_translation_m", "keyframe_min_rotation_deg", "keyframe_max_interval_sec",
+                "handoff_buffer_frames", "handoff_buffer_max_bytes", "pose_time_offset_ms",
+                "odometry_association", "max_goal_frames", "min_captured_frames", "max_sample_fps")),
+            ("continuous_profile.yaml", (
+                "alignment_backend", "g4_placement", "pose_time_offset_ms", "pose_time_offset_stage",
+                "frame_pose_fusion", "g4_frame_scales", "initial_sample_fps", "initial_window_frames",
+                "initial_overlap_frames", "reconstruct_frame_group_size", "initial_inference_resolution",
+                "initial_reconstruction_mode", "initial_queue_mode", "max_session_windows", "conf_percentile")),
+            ("reconstruct_profile.yaml", (
+                "image_resolution", "frame_group_size", "aggregator_frame_chunk_size", "load_mode")),
+        ):
+            bench, replay = (self.load_profile(folder / name) for folder in (profiles, bag))
+            self.assertEqual({key: bench[key] for key in keys}, {key: replay[key] for key in keys}, name)
+
+    def test_template_profile_loads(self):
+        templates = self.PACKAGE / "config"
+        config = self.load(templates / "continuous_profile.template.yaml",
+                           {"front": templates / "capture_profile.template.yaml"},
+                           templates / "reconstruct_profile.template.yaml")
+        self.assertEqual(config.g4_placement, "frame_pose")
+        self.assertEqual(config.retention_max_sessions, 3)
 
 
 class ContinuousDiagnosticsAssemblyTest(unittest.TestCase):

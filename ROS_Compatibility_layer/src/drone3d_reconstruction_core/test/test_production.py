@@ -572,7 +572,7 @@ class ProductionPlannerTest(ProductionTestBase):
         planner = self.make_planner()
         snapshot_uri, manifest_sha256 = make_snapshot(self.snapshots_root)
         with mock.patch(
-            "drone3d_reconstruction_core.production.ProductionCompletionVerifier",
+            "drone3d_reconstruction_core.production_planner.ProductionCompletionVerifier",
             side_effect=ValueError("injected construction failure"),
         ):
             with self.assertRaises(ValueError):

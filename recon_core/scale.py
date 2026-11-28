@@ -1,6 +1,6 @@
-"""Window scale: one metric scale per VGGT-Omega window, solved in the log domain.
+"""Window or per-frame metric depth scales, solved in the log domain.
 
-VGGT depth inside a window is known up to one scale. Two constraint types fix it:
+Window scales use trajectory priors and depth-ratio constraints:
 
 * trajectory prior: the window's VGGT camera centres, rotated by the mean
   provider/VGGT orientation difference, are fitted to the pose provider's
@@ -16,9 +16,12 @@ VGGT depth inside a window is known up to one scale. Two constraint types fix it
   frame pair with its own weight. This also links revisits that are far apart in
   time, where the adjacent chain alone drifts.
 
+The per-frame solver adds frame-pair rows, frame deviations from the window
+scale, and temporal constraints within each window.
 A connected component of windows without any trajectory prior has no metric
 scale and is reported as unconstrained.
 """
+
 import numpy as np
 
 MIN_EXTENT_M = 0.3
@@ -26,8 +29,8 @@ EXTENT_WEIGHT_CAP = 2.0
 EDGE_WEIGHT = 3.0
 MIN_PIXELS = 500
 MIN_SHARED_FRAMES = 3
-CROSS_GATE_LOG = 0.25          # |log depth ratio| counted for a cross-window pair
-CROSS_MIN_PIXELS = 500         # in model-resolution pixels
+CROSS_GATE_LOG = 0.25  # |log depth ratio| counted for a cross-window pair
+CROSS_MIN_PIXELS = 500  # in model-resolution pixels
 CROSS_DEPTH_RANGE_M = (0.3, 4.0)
 
 
@@ -60,12 +63,11 @@ def trajectory_prior(local_centers, local_rotations, ref_centers, ref_rotations,
     R = rotation_mean(np.einsum("nij,nkj->nik", ref_rotations, local_rotations))
     a = local_centers @ R.T
     da, db = a - a.mean(0), ref_centers - ref_centers.mean(0)
-    denom = float((da ** 2).sum())
+    denom = float((da**2).sum())
     extent = float(np.linalg.norm(db, axis=1).max())
     scale = float((da * db).sum() / denom) if denom > 0 else 0.0
     residual = float(np.sqrt(((scale * da - db) ** 2).sum(1).mean())) if scale > 0 else float("inf")
-    return {"scale": scale, "rotation": R, "extent_m": extent, "residual_rms_m": residual,
-            "frames": len(local_centers)}
+    return {"scale": scale, "rotation": R, "extent_m": extent, "residual_rms_m": residual, "frames": len(local_centers)}
 
 
 def frame_depth_ratio(depth_a, conf_a, depth_b, conf_b, min_pixels=MIN_PIXELS):
@@ -87,8 +89,18 @@ def shared_depth_ratio(frames, min_pixels=MIN_PIXELS):
     return float(np.median(ratios)), len(ratios)
 
 
-def cross_view_log_ratio(depth_i, K_i, pose_i, depth_j, K_j, pose_j, stride=1,
-                         gate=CROSS_GATE_LOG, min_pixels=CROSS_MIN_PIXELS, depth_range=CROSS_DEPTH_RANGE_M):
+def cross_view_log_ratio(
+    depth_i,
+    K_i,
+    pose_i,
+    depth_j,
+    K_j,
+    pose_j,
+    stride=1,
+    gate=CROSS_GATE_LOG,
+    min_pixels=CROSS_MIN_PIXELS,
+    depth_range=CROSS_DEPTH_RANGE_M,
+):
     """Median log(z / d_j) of frame i's metric depth moved into camera j.
 
     ``depth_*`` are metric depth maps sampled every ``stride`` model pixels
@@ -119,8 +131,9 @@ def cross_view_log_ratio(depth_i, K_i, pose_i, depth_j, K_j, pose_j, stride=1,
     return float(np.median(ratio[ok])), count
 
 
-def solve_window_scales(window_ids, priors, edges, min_extent_m=MIN_EXTENT_M,
-                        extent_weight_cap=EXTENT_WEIGHT_CAP, edge_weight=EDGE_WEIGHT):
+def solve_window_scales(
+    window_ids, priors, edges, min_extent_m=MIN_EXTENT_M, extent_weight_cap=EXTENT_WEIGHT_CAP, edge_weight=EDGE_WEIGHT
+):
     """Log-scale weighted least squares.
 
     ``priors``: id -> trajectory_prior result or None. ``edges``: iterable of
@@ -178,24 +191,38 @@ def solve_window_scales(window_ids, priors, edges, min_extent_m=MIN_EXTENT_M,
     for w in ids:
         p = priors.get(w)
         diagnostics[w] = {
-            "scale": scales.get(w), "constrained": w in constrained, "trajectory_prior_used": w in anchored,
+            "scale": scales.get(w),
+            "constrained": w in constrained,
+            "trajectory_prior_used": w in anchored,
             "trajectory_scale": None if p is None else p["scale"],
             "trajectory_extent_m": None if p is None else p["extent_m"],
             "trajectory_residual_rms_m": None if p is None else p["residual_rms_m"],
-            "adjacent_edges": len(adjacency[w])}
+            "adjacent_edges": len(adjacency[w]),
+        }
     return scales, constrained, diagnostics
 
 
-SIGMA_PRIOR = 0.04      # log-scale noise of a trajectory prior (office_gs_04, LiDAR-fitted truth)
-SIGMA_EDGE = 0.04       # adjacent shared-frame edge
-SIGMA_ROW = 0.08        # one directed frame-pair row (rows of one window pair are correlated)
-SIGMA_FRAME = 0.04      # a frame's deviation from its window scale
-SIGMA_TEMPORAL = 0.02   # deviation change between consecutive frames of one window
+SIGMA_PRIOR = 0.04  # log-scale noise of a trajectory prior (office_gs_04, LiDAR-fitted truth)
+SIGMA_EDGE = 0.04  # adjacent shared-frame edge
+SIGMA_ROW = 0.08  # one directed frame-pair row (rows of one window pair are correlated)
+SIGMA_FRAME = 0.04  # a frame's deviation from its window scale
+SIGMA_TEMPORAL = 0.02  # deviation change between consecutive frames of one window
 
 
-def solve_frame_scales(window_ids, priors, edges, frame_window, frame_rows, temporal_pairs,
-                       sigma_prior=SIGMA_PRIOR, sigma_edge=SIGMA_EDGE, sigma_row=SIGMA_ROW,
-                       sigma_frame=SIGMA_FRAME, sigma_temporal=SIGMA_TEMPORAL, min_extent_m=MIN_EXTENT_M):
+def solve_frame_scales(
+    window_ids,
+    priors,
+    edges,
+    frame_window,
+    frame_rows,
+    temporal_pairs,
+    sigma_prior=SIGMA_PRIOR,
+    sigma_edge=SIGMA_EDGE,
+    sigma_row=SIGMA_ROW,
+    sigma_frame=SIGMA_FRAME,
+    sigma_temporal=SIGMA_TEMPORAL,
+    min_extent_m=MIN_EXTENT_M,
+):
     """Joint per-frame depth scales: log s_f = x_w(f) + d_f, sparse weighted least squares.
 
     ``priors``: id -> trajectory_prior result or None, anchoring x_w = log scale when the
@@ -209,6 +236,7 @@ def solve_frame_scales(window_ids, priors, edges, frame_window, frame_rows, temp
     """
     from scipy.sparse import coo_matrix
     from scipy.sparse.linalg import lsqr
+
     ids = list(window_ids)
     index = {w: k for k, w in enumerate(ids)}
     frame_window = np.asarray(frame_window)
@@ -223,10 +251,13 @@ def solve_frame_scales(window_ids, priors, edges, frame_window, frame_rows, temp
             k = parent[k]
         return k
 
-    anchored = [w for w in ids if priors.get(w) is not None and priors[w]["scale"] > 0
-                and priors[w]["extent_m"] > min_extent_m]
+    anchored = [
+        w for w in ids if priors.get(w) is not None and priors[w]["scale"] > 0 and priors[w]["extent_m"] > min_extent_m
+    ]
     links = [(index[a], index[b]) for a, b, r in edges if a in index and b in index and np.isfinite(r) and r > 0]
-    links += [(frame_w[i], frame_w[j]) for i, j, v in frame_rows if frame_w[i] >= 0 and frame_w[j] >= 0 and np.isfinite(v)]
+    links += [
+        (frame_w[i], frame_w[j]) for i, j, v in frame_rows if frame_w[i] >= 0 and frame_w[j] >= 0 and np.isfinite(v)
+    ]
     for a, b in links:
         parent[find(a)] = find(b)
     roots = {find(index[w]) for w in anchored}
@@ -240,25 +271,35 @@ def solve_frame_scales(window_ids, priors, edges, frame_window, frame_rows, temp
     def add(entries, value, sigma):
         row = len(rhs)
         for col, coeff in entries:
-            rr.append(row); cc.append(col); vv.append(coeff / sigma)
+            rr.append(row)
+            cc.append(col)
+            vv.append(coeff / sigma)
         rhs.append(value / sigma)
 
     for w in anchored:
         if w in cols:
-            add([(cols[w], 1.)], np.log(priors[w]["scale"]), sigma_prior)
+            add([(cols[w], 1.0)], np.log(priors[w]["scale"]), sigma_prior)
     for a, b, r in edges:
         if a in cols and b in cols and np.isfinite(r) and r > 0:
-            add([(cols[b], 1.), (cols[a], -1.)], np.log(r), sigma_edge)
+            add([(cols[b], 1.0), (cols[a], -1.0)], np.log(r), sigma_edge)
     in_solve = np.array([frame_w[q] >= 0 and ids[frame_w[q]] in cols for q in range(n_f)])
     for i, j, value in frame_rows:
         if in_solve[i] and in_solve[j] and np.isfinite(value):
-            add([(cols[ids[frame_w[i]]], 1.), (frame_col[i], 1.),
-                 (cols[ids[frame_w[j]]], -1.), (frame_col[j], -1.)], value, sigma_row)
+            add(
+                [
+                    (cols[ids[frame_w[i]]], 1.0),
+                    (frame_col[i], 1.0),
+                    (cols[ids[frame_w[j]]], -1.0),
+                    (frame_col[j], -1.0),
+                ],
+                value,
+                sigma_row,
+            )
     for q in np.flatnonzero(in_solve):
-        add([(frame_col[q], 1.)], 0., sigma_frame)
+        add([(frame_col[q], 1.0)], 0.0, sigma_frame)
     for i, j in temporal_pairs:
         if in_solve[i] and in_solve[j]:
-            add([(frame_col[i], 1.), (frame_col[j], -1.)], 0., sigma_temporal)
+            add([(frame_col[i], 1.0), (frame_col[j], -1.0)], 0.0, sigma_temporal)
     A = coo_matrix((vv, (rr, cc)), shape=(len(rhs), n_w + n_f)).tocsr()
     x = lsqr(A, np.asarray(rhs), atol=1e-12, btol=1e-12, iter_lim=50 * (n_w + n_f))[0]
     window_scales = {w: float(np.exp(x[k])) for w, k in cols.items()}
@@ -282,8 +323,9 @@ def batch_window_scales(windows, ids, poses):
         p = poses[np.searchsorted(ids, win["idx"])]
         prior = trajectory_prior(win["vc"], win["vR"], p[:, :3, 3], p[:, :3, :3])
         priors[win["id"]] = prior
-        trajectory.append(dict(id=win["id"], scale=prior["scale"] if prior else 0.0,
-                               extent_m=prior["extent_m"] if prior else 0.0))
+        trajectory.append(
+            dict(id=win["id"], scale=prior["scale"] if prior else 0.0, extent_m=prior["extent_m"] if prior else 0.0)
+        )
     links, edges = [], []
     for a, b in zip(windows, windows[1:]):
         shared = np.intersect1d(a["idx"], b["idx"])

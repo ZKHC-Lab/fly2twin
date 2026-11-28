@@ -1181,7 +1181,7 @@ class AuxiliaryContractV4Test(CaptureTestBase):
         self.assertFalse((committed / "depth").exists())
 
     def test_depth_write_failure_rewrites_aux_json_without_depth(self):
-        import drone3d_reconstruction_core.capture as capture_module
+        import drone3d_reconstruction_core.capture_snapshot as capture_module
 
         config = self.make_aux_config(max_frames=1)
         goal = validate_capture_goal(self.make_goal(max_frames=1), config)

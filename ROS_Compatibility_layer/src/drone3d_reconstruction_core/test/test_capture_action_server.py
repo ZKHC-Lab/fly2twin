@@ -2,8 +2,10 @@
 
 from dataclasses import replace
 from pathlib import Path
+import sys
 import tempfile
 import threading
+import weakref
 import time
 import unittest
 from types import SimpleNamespace
@@ -13,14 +15,16 @@ from actionlib_msgs.msg import GoalStatus
 
 from drone3d_reconstruction_msgs.msg import CaptureSegmentResult
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from actionlib_goal_handle import RecordingGoalHandle, assert_no_refused_transitions  # noqa: E402
 from drone3d_reconstruction_core.capture import (
     CaptureConfig,
     CaptureSession,
     FrameStamp,
 )
 from drone3d_reconstruction_core.capture_action_server import (
-    _CaptureRecord,
     CaptureActionServer,
+    allocate_snapshot_transaction,
 )
 from drone3d_reconstruction_core.snapshot_validator import SnapshotSafetyLimits
 
@@ -38,9 +42,15 @@ class FakeSubscriber:
 
 
 class FakeActionServer:
+    """Stands in for actionlib.ActionServer. Tests deliver goals and cancels through the
+    callbacks the server registered here, the way actionlib calls them."""
+
+    by_server = weakref.WeakKeyDictionary()
+
     def __init__(self, name, action_type, goal_cb, cancel_cb, auto_start):
         self.goal_cb = goal_cb
         self.cancel_cb = cancel_cb
+        FakeActionServer.by_server[goal_cb.__self__] = self
         self.started = False
         self.stop_calls = 0
 
@@ -50,102 +60,32 @@ class FakeActionServer:
     def stop(self):
         self.stop_calls += 1
 
+    @classmethod
+    def of(cls, server):
+        """The fake actionlib endpoint a server registered its callbacks with."""
+        return cls.by_server[server]
 
-class FakeGoalHandle:
+
+def _default_capture_goal():
+    return SimpleNamespace(
+        scene_id="scene-capture",
+        sample_fps=2.0,
+        max_frames=2,
+        max_duration=SimpleNamespace(to_sec=lambda: 5.0),
+    )
+
+
+class FakeGoalHandle(RecordingGoalHandle):
+    """actionlib's real ServerGoalHandle: illegal transitions are refused as on the robot,
+    and there is no set_preempted (the capture server falls back to set_canceled)."""
+
     def __init__(self, identifier, goal=None, status=GoalStatus.PENDING):
-        self._goal_id = SimpleNamespace(
-            id=identifier,
-            stamp=SimpleNamespace(secs=1, nsecs=len(identifier)),
-        )
-        self._goal = goal or SimpleNamespace(
-            scene_id="scene-capture",
-            sample_fps=2.0,
-            max_frames=2,
-            max_duration=SimpleNamespace(to_sec=lambda: 5.0),
-        )
-        self._goal_status = SimpleNamespace(status=status)
-        self.events = []
-        self.feedbacks = []
-
-    def publish_feedback(self, feedback):
-        self.feedbacks.append(feedback)
-
-    def get_goal_status(self):
-        return self._goal_status
-
-    def get_goal(self):
-        return self._goal
-
-    def set_accepted(self, text):
-        self._goal_status.status = GoalStatus.ACTIVE
-        self.events.append(("accepted", None, text))
-
-    def set_rejected(self, result, text):
-        self._goal_status.status = GoalStatus.REJECTED
-        self.events.append(("rejected", result, text))
-
-    def set_succeeded(self, result, text):
-        self._goal_status.status = GoalStatus.SUCCEEDED
-        self.events.append(("succeeded", result, text))
-
-    def set_aborted(self, result, text):
-        self._goal_status.status = GoalStatus.ABORTED
-        self.events.append(("aborted", result, text))
-
-    def set_preempted(self, result, text):
-        self._goal_status.status = GoalStatus.PREEMPTED
-        self.events.append(("preempted", result, text))
-
-    def set_canceled(self, result, text):
-        if self._goal_status.status in (GoalStatus.PENDING, GoalStatus.RECALLING):
-            self._goal_status.status = GoalStatus.RECALLED
-        else:
-            self._goal_status.status = GoalStatus.PREEMPTED
-        self.events.append(("canceled", result, text))
+        super().__init__(identifier, goal or _default_capture_goal(), status)
 
 
-class ActionServerStyleGoalHandle:
-    """Minimal ``actionlib.ActionServer`` GoalHandle 形状。
-
-    与 SimpleActionServer 的关键差异：goal id 通过 ``get_goal_id()`` 提供，
-    取消终态只有 ``set_canceled``、没有 ``set_preempted``。
-    """
-
-    def __init__(self, identifier, goal=None):
-        self._goal_id = SimpleNamespace(id=identifier)
-        self._goal = goal or SimpleNamespace(
-            scene_id="scene-capture",
-            sample_fps=2.0,
-            max_frames=2,
-            max_duration=SimpleNamespace(to_sec=lambda: 5.0),
-        )
-        self._goal_status = SimpleNamespace(status=GoalStatus.PENDING)
-        self.events = []
-        self.feedbacks = []
-
-    def publish_feedback(self, feedback):
-        self.feedbacks.append(feedback)
-
-    def get_goal_id(self):
-        return self._goal_id
-
-    def get_goal_status(self):
-        return self._goal_status
-
-    def get_goal(self):
-        return self._goal
-
-    def set_accepted(self, text):
-        self._goal_status.status = GoalStatus.ACTIVE
-        self.events.append(("accepted", None, text))
-
-    def set_rejected(self, result, text):
-        self._goal_status.status = GoalStatus.REJECTED
-        self.events.append(("rejected", result, text))
-
-    def set_canceled(self, result, text):
-        self._goal_status.status = GoalStatus.PREEMPTED
-        self.events.append(("canceled", result, text))
+class ActionServerStyleGoalHandle(FakeGoalHandle):
+    """The handle actionlib.ActionServer passes to callbacks: a cancel arrives on a
+    different wrapper object carrying the same goal id."""
 
 
 class FailingSuccessGoalHandle(FakeGoalHandle):
@@ -162,6 +102,7 @@ class FailingSuccessGoalHandle(FakeGoalHandle):
 
 class CaptureActionServerTest(unittest.TestCase):
     def setUp(self):
+        RecordingGoalHandle.created = []
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -214,6 +155,7 @@ class CaptureActionServerTest(unittest.TestCase):
 
     def tearDown(self):
         self.server.shutdown()
+        assert_no_refused_transitions(self)
 
     def make_server(self, **kwargs):
         return CaptureActionServer(
@@ -259,12 +201,42 @@ class CaptureActionServerTest(unittest.TestCase):
     def image_callback(self):
         return [s.callback for s in self.subscribers if s.topic == "/camera4/image_raw"][0]
 
+    def sensor(self, server, topic):
+        """The callback a server subscribed to a topic with, as rospy would call it."""
+        return [s.callback for s in self.subscribers
+                if s.topic == topic and s.callback.__self__ is server][-1]
+
+    def recording_session_factory(self, sessions):
+        """The real session factory, keeping each session and the callbacks it was given."""
+        def factory(*args, **kwargs):
+            session = CaptureSession(*args, **kwargs)
+            sessions.append((session, kwargs))
+            return session
+        return factory
+
+    def recording_transaction_factory(self, transactions):
+        def factory(*args, **kwargs):
+            transaction = allocate_snapshot_transaction(*args, **kwargs)
+            transactions.append(transaction)
+            return transaction
+        return factory
+
+    def wait_session_visible(self, server, timeout=3.0):
+        """Until the accepted goal's session receives sensor callbacks."""
+        deadline = time.monotonic() + timeout
+        while server.diagnostics_snapshot()["session"] is None and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertIsNotNone(server.diagnostics_snapshot()["session"])
+
     def _handoff_server(self):
+        self.sessions, self.transactions = [], []
         server = CaptureActionServer(
             action_name="/test_handoff", config=replace(self.config,
                 odometry_association="interpolate", pose_gap_max_ms=600.0,
                 handoff_buffer_frames=8),
             action_server_factory=FakeActionServer, subscriber_factory=self.subscriber_factory,
+            session_factory=self.recording_session_factory(self.sessions),
+            transaction_factory=self.recording_transaction_factory(self.transactions),
         )
         self.addCleanup(server.shutdown)
         return server
@@ -272,22 +244,17 @@ class CaptureActionServerTest(unittest.TestCase):
     def _handoff_goal(self, server, scene):
         goal = FakeGoalHandle(scene, SimpleNamespace(scene_id=scene, sample_fps=2.0,
             max_frames=2, max_duration=SimpleNamespace(to_sec=lambda: 5.0)))
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
-            with server._lock:
-                if server._active and server._active.session is not None:
-                    break
-            time.sleep(.005)
+        self.wait_session_visible(server)
         return goal
 
     def _handoff_image(self, server, sec, nsec=0):
         import sys
         sys.path.insert(0, str(Path(__file__).resolve().parent))
         from test_capture import CaptureTestBase
-        server._odometry_callback(CaptureTestBase.odometry_message(sec, nsec))
-        server._image_callback(self.image_message(sec, nsec))
+        self.sensor(server, "/Odometry")(CaptureTestBase.odometry_message(sec, nsec))
+        self.sensor(server, "/camera4/image_raw")(self.image_message(sec, nsec))
 
     def test_handoff_replays_gap_frames_with_their_pose_and_without_duplicates(self):
         import csv
@@ -316,9 +283,8 @@ class CaptureActionServerTest(unittest.TestCase):
         # callbacks and the server lock, so the next window lost its first frames.
         server = self._handoff_server()
         goal = self._handoff_goal(server, "cs-s0123456789abcdef-w0")
-        with server._lock:
-            session = server._active.session
-            transaction = server._active.transaction
+        session = self.sessions[-1][0]
+        transaction = self.transactions[-1]
         gates = {name: (threading.Event(), threading.Event()) for name in ("seal", "commit")}
 
         def blocking(name, original):
@@ -355,8 +321,7 @@ class CaptureActionServerTest(unittest.TestCase):
         self.wait_events(first, 2)
         self._handoff_image(server, 11)
         second = self._handoff_goal(server, "cs-s1123456789abcdef-w1")
-        with server._lock:
-            self.assertEqual(server._active.session.writer.frame_count, 0)
+        self.assertEqual(server.diagnostics_snapshot()["session"]["selected_frames"], 0)
         self._handoff_image(server, 12)
         self._handoff_image(server, 12, 500000000)
         self.wait_events(second, 2)
@@ -378,12 +343,11 @@ class CaptureActionServerTest(unittest.TestCase):
         server = self._handoff_server()
         first = self._handoff_goal(server, "cs-s0123456789abcdef-w0")
         self._handoff_image(server, 10)
-        server._cancel_callback(first)
+        FakeActionServer.of(server).cancel_cb(first)
         self.wait_events(first, 2)
         self._handoff_image(server, 11)
         second = self._handoff_goal(server, "cs-s0123456789abcdef-w1")
-        with server._lock:
-            self.assertEqual(server._active.session.writer.frame_count, 0)
+        self.assertEqual(server.diagnostics_snapshot()["session"]["selected_frames"], 0)
         self._handoff_image(server, 12)
         self._handoff_image(server, 12, 500000000)
         self.wait_events(second, 2)
@@ -391,12 +355,21 @@ class CaptureActionServerTest(unittest.TestCase):
 
     def test_image_time_reset_discards_handoff_history(self):
         server = self._handoff_server()
-        server._handoff_predecessor = ("cs-s0123456789abcdef-w0", 10 * 10**9)
-        server._image_callback(self.image_message(11))
-        server._image_callback(self.image_message(9))
-        self.assertIsNone(server._handoff_predecessor)
-        self.assertEqual(len(server._handoff.queue), 1)
-        self.assertEqual(server._handoff.pop_after(0)[0], 9 * 10**9)
+        first = self._handoff_goal(server, "cs-s0123456789abcdef-w0")
+        self._handoff_image(server, 10)
+        self._handoff_image(server, 10, 500000000)
+        self.wait_events(first, 2)
+        # Between goals the clock jumps back: history before the jump is dropped, so
+        # only the frame at 9 s stays buffered ...
+        self._handoff_image(server, 11)
+        self._handoff_image(server, 9)
+        self.assertEqual(server.diagnostics_snapshot()["handoff_queued_frames"], 1)
+        # ... and the consecutive next window starts live instead of replaying it.
+        second = self._handoff_goal(server, "cs-s0123456789abcdef-w1")
+        self.assertEqual(server.diagnostics_snapshot()["session"]["selected_frames"], 0)
+        self.assertEqual(server.diagnostics_snapshot()["handoff_replayed_frames"], 0)
+        FakeActionServer.of(server).cancel_cb(second)
+        self.wait_events(second, 2)
 
     def test_image_subscriber_buffer_covers_maximum_raw_frame(self):
         image_subscriber = [
@@ -413,14 +386,14 @@ class CaptureActionServerTest(unittest.TestCase):
         self.assertGreaterEqual(image_subscriber.queue_size, 16)
 
     def test_shutdown_stops_action_server_once(self):
-        action_server = self.server._server
+        action_server = FakeActionServer.of(self.server)
         self.server.shutdown()
         self.server.shutdown()
         self.assertEqual(action_server.stop_calls, 1)
 
     def test_valid_goal_seals_commits_and_publishes_snapshot_metadata(self):
         goal = FakeGoalHandle("valid")
-        self.server._goal_callback(goal)
+        FakeActionServer.of(self.server).goal_cb(goal)
         self.wait_events(goal, 1)
         self.image_callback()(self.image_message(10, 0))
         self.image_callback()(self.image_message(10, 500000000))
@@ -437,7 +410,7 @@ class CaptureActionServerTest(unittest.TestCase):
 
     def test_valid_goal_fsync_failure_still_succeeds_with_warning(self):
         goal = FakeGoalHandle("valid-fsync")
-        self.server._goal_callback(goal)
+        FakeActionServer.of(self.server).goal_cb(goal)
         self.wait_events(goal, 1)
         import drone3d_reconstruction_core.result_transaction as rt
 
@@ -467,7 +440,7 @@ class CaptureActionServerTest(unittest.TestCase):
             launch_dispatch=lambda target, args: object()
         )
         goal = FakeGoalHandle("dispatch-fail")
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
         self.assertEqual(goal._goal_status.status, GoalStatus.REJECTED)
         self.assertEqual(
@@ -478,7 +451,7 @@ class CaptureActionServerTest(unittest.TestCase):
 
     def test_terminal_primary_failure_retries_and_converges(self):
         goal = FailingSuccessGoalHandle("terminal-retry")
-        self.server._goal_callback(goal)
+        FakeActionServer.of(self.server).goal_cb(goal)
         self.wait_events(goal, 1)
         self.image_callback()(self.image_message(10, 0))
         self.image_callback()(self.image_message(10, 500000000))
@@ -486,12 +459,43 @@ class CaptureActionServerTest(unittest.TestCase):
         self.assertEqual(goal._goal_status.status, GoalStatus.SUCCEEDED)
         self.assertFalse(self.server.is_busy())
 
+    def test_unconfirmed_terminal_is_logged_with_the_goal_id(self):
+        # If no terminal can be confirmed, the error log must name the actionlib goal id;
+        # it is the only trace that ties the stuck slot to a capture window. The server is
+        # left stuck on purpose and never shut down.
+        server = self.make_server()
+        goal = FakeGoalHandle("logged-goal-id")
+        real_status = goal.get_goal_status
+        status_lost = threading.Event()
+
+        def status():
+            if status_lost.is_set():
+                raise RuntimeError("status unavailable")
+            return real_status()
+
+        goal.get_goal_status = status
+        with mock.patch("drone3d_reconstruction_core.action_terminal.rospy.logerr") as logerr:
+            FakeActionServer.of(server).goal_cb(goal)
+            self.wait_events(goal, 1)
+            status_lost.set()  # from now on no status query succeeds
+            FakeActionServer.of(server).cancel_cb(goal)
+            deadline = time.monotonic() + 3.0
+            while not logerr.called and time.monotonic() < deadline:
+                time.sleep(0.005)
+        self.assertTrue(logerr.called)
+        self.assertEqual(logerr.call_args[0][1], "capture goal logged-goal-id")
+        # Nothing confirmed the terminal, so the slot stays taken. (actionlib did take the
+        # first set_canceled; the blind retry is refused, which is expected here.)
+        self.assertTrue(server.is_busy())
+        self.assertEqual(goal.refused, [("canceled", GoalStatus.PREEMPTED)])
+        goal.refused.clear()
+
     def test_second_goal_is_rejected_busy_before_accept(self):
         first = FakeGoalHandle("first")
-        self.server._goal_callback(first)
+        FakeActionServer.of(self.server).goal_cb(first)
         self.wait_events(first, 1)
         second = FakeGoalHandle("second")
-        self.server._goal_callback(second)
+        FakeActionServer.of(self.server).goal_cb(second)
         self.wait_events(second, 1)
         self.assertEqual(second._goal_status.status, GoalStatus.REJECTED)
         self.assertEqual(
@@ -499,7 +503,7 @@ class CaptureActionServerTest(unittest.TestCase):
             CaptureSegmentResult.CAMERA_UNAVAILABLE,
         )
         # Release the first slot for teardown.
-        self.server._cancel_callback(first)
+        FakeActionServer.of(self.server).cancel_cb(first)
         self.wait_events(first, 2, timeout=3.0)
 
     def test_invalid_goal_rejected_pre_accept(self):
@@ -512,7 +516,7 @@ class CaptureActionServerTest(unittest.TestCase):
                 max_duration=SimpleNamespace(to_sec=lambda: 5.0),
             ),
         )
-        self.server._goal_callback(goal)
+        FakeActionServer.of(self.server).goal_cb(goal)
         self.wait_events(goal, 1)
         self.assertEqual(goal._goal_status.status, GoalStatus.REJECTED)
         self.assertEqual(
@@ -521,7 +525,7 @@ class CaptureActionServerTest(unittest.TestCase):
 
     def test_image_stamp_regression_aborts_with_camera_unavailable(self):
         goal = FakeGoalHandle("regress")
-        self.server._goal_callback(goal)
+        FakeActionServer.of(self.server).goal_cb(goal)
         self.wait_events(goal, 1)
         self.image_callback()(self.image_message(10, 0))
         self.image_callback()(self.image_message(9, 0))
@@ -535,13 +539,13 @@ class CaptureActionServerTest(unittest.TestCase):
 
     def test_cancel_after_accept_leaves_no_snapshot(self):
         goal = FakeGoalHandle("cancel")
-        self.server._goal_callback(goal)
+        FakeActionServer.of(self.server).goal_cb(goal)
         self.wait_events(goal, 1)
         self.image_callback()(self.image_message(10, 0))
-        self.server._cancel_callback(goal)
+        FakeActionServer.of(self.server).cancel_cb(goal)
         self.wait_events(goal, 2, timeout=3.0)
         self.assertEqual(goal._goal_status.status, GoalStatus.PREEMPTED)
-        self.assertEqual(goal.events[-1][0], "preempted")
+        self.assertEqual(goal.events[-1][0], "canceled")
         self.assertEqual(
             goal.events[-1][1].error_code, CaptureSegmentResult.CANCELLED
         )
@@ -551,12 +555,12 @@ class CaptureActionServerTest(unittest.TestCase):
         # PAUSE + STOP 复现：已接受的 capture 在没有任何后续传感器回调时
         # 收到 cancel，也必须立刻 PREEMPTED，而不是停在 PREEMPTING。
         goal = FakeGoalHandle("cancel-no-frames")
-        self.server._goal_callback(goal)
+        FakeActionServer.of(self.server).goal_cb(goal)
         self.wait_events(goal, 1)
-        self.server._cancel_callback(goal)
+        FakeActionServer.of(self.server).cancel_cb(goal)
         self.wait_events(goal, 2, timeout=3.0)
         self.assertEqual(goal._goal_status.status, GoalStatus.PREEMPTED)
-        self.assertEqual(goal.events[-1][0], "preempted")
+        self.assertEqual(goal.events[-1][0], "canceled")
         self.assertEqual(
             goal.events[-1][1].error_code, CaptureSegmentResult.CANCELLED
         )
@@ -567,12 +571,20 @@ class CaptureActionServerTest(unittest.TestCase):
         # GoalHandle 包装，且没有 set_preempted。必须按 goal id 匹配目标
         # 并回退到 set_canceled，否则 PAUSE+STOP 永远停在 PREEMPTING。
         goal = ActionServerStyleGoalHandle("nx-action-server")
-        self.server._goal_callback(goal)
+        FakeActionServer.of(self.server).goal_cb(goal)
         self.wait_events(goal, 1)
+        # A cancel for another goal (another client, or a goal rejected as busy) must
+        # leave the active capture running.
+        other = ActionServerStyleGoalHandle("another-goal", goal=goal._goal)
+        FakeActionServer.of(self.server).cancel_cb(other)
+        self.assertEqual([event[0] for event in goal.events], ["accepted"])
+        self.assertEqual(goal._goal_status.status, GoalStatus.ACTIVE)
+        self.assertTrue(self.server.is_busy())
+        self.assertEqual(self.server.cancel_request_count, 0)
         cancel_handle = ActionServerStyleGoalHandle(
             "nx-action-server", goal=goal._goal
         )
-        self.server._cancel_callback(cancel_handle)
+        FakeActionServer.of(self.server).cancel_cb(cancel_handle)
         self.wait_events(goal, 2, timeout=3.0)
         self.assertEqual(goal._goal_status.status, GoalStatus.PREEMPTED)
         self.assertEqual(goal.events[-1][0], "canceled")
@@ -586,7 +598,7 @@ class CaptureActionServerTest(unittest.TestCase):
             session_factory=mock.Mock(side_effect=RuntimeError("session boom"))
         )
         goal = FakeGoalHandle("session-fail")
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
         self.assertEqual(goal._goal_status.status, GoalStatus.REJECTED)
         self.assertEqual(
@@ -596,35 +608,49 @@ class CaptureActionServerTest(unittest.TestCase):
         server.shutdown()
 
     def test_source_state_feedback_publishes_stage_and_stops_after_terminal(self):
+        # The session reports source watchdog transitions through the callback the
+        # server handed to its factory; the server turns them into Action feedback.
+        sessions = []
+        server = self.make_server(session_factory=self.recording_session_factory(sessions))
+        self.addCleanup(server.shutdown)
         handle = FakeGoalHandle("source-state")
-        record = _CaptureRecord(handle, ("source-state", 1, 1))
-        record.session = mock.Mock()
-        record.session.writer.frame_count = 3
-        with self.server._lock:
-            self.server._active = record
-        try:
-            self.server._publish_source_state(
-                record, "SOURCE_STALE", FrameStamp(10, 0)
-            )
-            self.assertEqual(handle.feedbacks[-1].stage, "SOURCE_STALE")
-            self.assertEqual(handle.feedbacks[-1].frame_count, 3)
-            self.server._publish_source_state(
-                record, "SOURCE_RECOVERED", FrameStamp(11, 0)
-            )
-            self.assertEqual(handle.feedbacks[-1].stage, "SOURCE_RECOVERED")
-            count = len(handle.feedbacks)
-            record.terminal_claimed = True
-            self.server._publish_source_state(
-                record, "SOURCE_STALE", FrameStamp(12, 0)
-            )
-            self.assertEqual(len(handle.feedbacks), count)
-        finally:
-            with self.server._lock:
-                self.server._active = None
+        FakeActionServer.of(server).goal_cb(handle)
+        self.wait_events(handle, 1)
+        self.wait_session_visible(server)
+        self.sensor(server, "/camera4/image_raw")(self.image_message(10, 0))
+        source_state = sessions[-1][1]["source_state_callback"]
+        source_state("SOURCE_STALE", FrameStamp(10, 0))
+        self.assertEqual(handle.feedbacks[-1].stage, "SOURCE_STALE")
+        self.assertEqual(handle.feedbacks[-1].frame_count, 1)
+        source_state("SOURCE_RECOVERED", FrameStamp(11, 0))
+        self.assertEqual(handle.feedbacks[-1].stage, "SOURCE_RECOVERED")
+        # Hold the cancel's terminal call: the terminal is claimed, the slot not yet released.
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)  # never leave the server blocked if an assertion fails
+        real_cancel = handle.set_canceled
+
+        def held_cancel(result=None, text=""):
+            entered.set()
+            self.assertTrue(release.wait(5.0))
+            real_cancel(result, text)
+
+        handle.set_canceled = held_cancel
+        FakeActionServer.of(server).cancel_cb(handle)
+        self.assertTrue(entered.wait(3.0))
+        self.assertTrue(server.is_busy())
+        count = len(handle.feedbacks)
+        source_state("SOURCE_STALE", FrameStamp(12, 0))
+        self.assertEqual(len(handle.feedbacks), count)
+        # ... and after the terminal took effect and the slot was released.
+        release.set()
+        self.wait_events(handle, 2)
+        self.assertFalse(server.is_busy())
+        source_state("SOURCE_RECOVERED", FrameStamp(13, 0))
+        self.assertEqual(len(handle.feedbacks), count)
 
     def test_diagnostics_snapshot_exposes_stage_and_input_counters(self):
         goal = FakeGoalHandle("diag")
-        self.server._goal_callback(goal)
+        FakeActionServer.of(self.server).goal_cb(goal)
         self.wait_events(goal, 1)
         deadline = time.monotonic() + 2.0
         while (
@@ -665,11 +691,13 @@ class CaptureActionServerTest(unittest.TestCase):
 
     def test_tf_static_latched_messages_from_all_publishers_are_replayed(self):
         config = replace(self.config, tf_static_topic="/tf_static")
+        sessions = []
         server = CaptureActionServer(
             action_name="/test_capture_tf_static_replay",
             config=config,
             action_server_factory=FakeActionServer,
             subscriber_factory=self.subscriber_factory,
+            session_factory=self.recording_session_factory(sessions),
         )
         try:
             static_callback = [
@@ -685,22 +713,11 @@ class CaptureActionServerTest(unittest.TestCase):
             static_callback(self.tf_static_message())
             static_callback(self.tf_static_message(parent="odom", child="body"))
             goal = FakeGoalHandle("tf-static-replay")
-            server._goal_callback(goal)
+            FakeActionServer.of(server).goal_cb(goal)
             self.wait_events(goal, 1)
-            deadline = time.monotonic() + 3.0
-            while time.monotonic() < deadline:
-                with server._lock:
-                    record = server._active
-                    session = record.session if record is not None else None
-                if session is not None and session.tf_received >= 3:
-                    break
-                if session is not None and session.done.is_set():
-                    break
-                time.sleep(0.005)
-            with server._lock:
-                record = server._active
-                session = record.session if record is not None else None
-            self.assertIsNotNone(session)
+            # The replay happens before the session becomes visible to callbacks.
+            self.wait_session_visible(server)
+            session = sessions[-1][0]
             self.assertEqual(session.tf_received, 3)
             self.assertTrue(session.writer.has_tf)
             self.assertEqual(session.snapshot()["tf_received"], 3)
@@ -711,11 +728,13 @@ class CaptureActionServerTest(unittest.TestCase):
         # RealSense publishes camera_aligned_depth_to_color_frame -> optical frame;
         # the rig publishes body -> optical frame. Neither may overwrite the other.
         config = replace(self.config, tf_static_topic="/tf_static")
+        sessions = []
         server = CaptureActionServer(
             action_name="/test_capture_tf_static_shared_child",
             config=config,
             action_server_factory=FakeActionServer,
             subscriber_factory=self.subscriber_factory,
+            session_factory=self.recording_session_factory(sessions),
         )
         try:
             static_callback = [
@@ -725,19 +744,43 @@ class CaptureActionServerTest(unittest.TestCase):
             ][0]
             static_callback(self.tf_static_message())
             static_callback(self.tf_static_message(parent="camera_aligned_depth", child="camera4_optical_frame"))
-            self.assertEqual(set(server._tf_static_transforms),
-                             {("body", "camera4_optical_frame"),
-                              ("camera_aligned_depth", "camera4_optical_frame")})
+            # Both edges into the optical frame are replayed into the next session.
+            goal = FakeGoalHandle("tf-static-shared-child")
+            FakeActionServer.of(server).goal_cb(goal)
+            self.wait_events(goal, 1)
+            self.wait_session_visible(server)
+            replayed = sessions[-1][0]
+            self.assertEqual(replayed.tf_received, 2)
+            self.assertTrue(replayed.writer.has_tf)
+            self.assertEqual(replayed.writer.auxiliary_errors, 0)
         finally:
             server.shutdown()
 
     def test_malformed_tf_static_update_does_not_poison_replay_cache(self):
         config = replace(self.config, tf_static_topic="/tf_static")
+        sessions = []
+        replayed = []
+        record_session = self.recording_session_factory(sessions)
+
+        def session_factory(*args, **kwargs):
+            # Keep the static transforms the server replays into the new session.
+            session = record_session(*args, **kwargs)
+            real_on_tf = session.on_tf
+
+            def on_tf(message, static=False):
+                if static:
+                    replayed.extend(message.transforms)
+                return real_on_tf(message, static=static)
+
+            session.on_tf = on_tf
+            return session
+
         server = CaptureActionServer(
             action_name="/test_capture_tf_static_valid_cache",
             config=config,
             action_server_factory=FakeActionServer,
             subscriber_factory=self.subscriber_factory,
+            session_factory=session_factory,
         )
         try:
             static_callback = [
@@ -750,37 +793,33 @@ class CaptureActionServerTest(unittest.TestCase):
             malformed.transforms[0].transform.translation.x = float("nan")
             static_callback(malformed)
 
-            cached = server._tf_static_transforms[("body", "camera4_optical_frame")]
-            self.assertEqual(cached.transform.translation.x, 1.0)
             goal = FakeGoalHandle("tf-static-valid-cache")
-            server._goal_callback(goal)
+            FakeActionServer.of(server).goal_cb(goal)
             self.wait_events(goal, 1)
-            deadline = time.monotonic() + 3.0
-            while time.monotonic() < deadline:
-                with server._lock:
-                    session = (
-                        server._active.session
-                        if server._active is not None
-                        else None
-                    )
-                if session is not None and session.tf_received == 1:
-                    break
-                time.sleep(0.005)
-            with server._lock:
-                session = server._active.session
+            self.wait_session_visible(server)
+            session = sessions[-1][0]
             self.assertEqual(session.tf_received, 1)
             self.assertTrue(session.writer.has_tf)
             self.assertEqual(session.writer.auxiliary_errors, 0)
+            # The replayed transform is the valid one, with its values unchanged.
+            self.assertEqual(len(replayed), 1)
+            cached = replayed[0]
+            self.assertEqual((cached.header.frame_id, cached.child_frame_id),
+                             ("body", "camera4_optical_frame"))
+            translation = cached.transform.translation
+            self.assertEqual((translation.x, translation.y, translation.z), (1.0, 2.0, 3.0))
         finally:
             server.shutdown()
 
     def test_malformed_tf_static_sibling_does_not_drop_valid_active_transform(self):
         config = replace(self.config, tf_static_topic="/tf_static")
+        sessions = []
         server = CaptureActionServer(
             action_name="/test_capture_tf_static_mixed_active",
             config=config,
             action_server_factory=FakeActionServer,
             subscriber_factory=self.subscriber_factory,
+            session_factory=self.recording_session_factory(sessions),
         )
         try:
             static_callback = [
@@ -789,19 +828,10 @@ class CaptureActionServerTest(unittest.TestCase):
                 if subscriber.topic == "/tf_static"
             ][0]
             goal = FakeGoalHandle("tf-static-mixed-active")
-            server._goal_callback(goal)
+            FakeActionServer.of(server).goal_cb(goal)
             self.wait_events(goal, 1)
-            deadline = time.monotonic() + 3.0
-            while time.monotonic() < deadline:
-                with server._lock:
-                    session = (
-                        server._active.session
-                        if server._active is not None
-                        else None
-                    )
-                if session is not None:
-                    break
-                time.sleep(0.005)
+            self.wait_session_visible(server)
+            session = sessions[-1][0]
 
             valid = self.tf_static_message().transforms[0]
             malformed = self.tf_static_message(
@@ -866,7 +896,7 @@ class CaptureActionServerTest(unittest.TestCase):
                     max_duration=SimpleNamespace(to_sec=lambda: 5.0),
                 ),
             )
-            server._goal_callback(goal)
+            FakeActionServer.of(server).goal_cb(goal)
             self.assertTrue(replay_started.wait(2.0))
             image_done = threading.Event()
 
@@ -951,7 +981,7 @@ class CaptureActionServerTest(unittest.TestCase):
 
         def session_factory(config, goal, transaction, cancellation_event, **kwargs):
             seen.append(config)
-            return self.server._session_factory(
+            return CaptureSession(
                 config,
                 goal,
                 transaction,
@@ -985,7 +1015,7 @@ class CaptureActionServerTest(unittest.TestCase):
                 set_save_sensor_depth=True,
             )
             handle = FakeGoalHandle("override", goal=goal_message)
-            server._goal_callback(handle)
+            FakeActionServer.of(server).goal_cb(handle)
             self.wait_events(handle, 1, timeout=3.0)
             image_cb = [
                 subscriber.callback
@@ -1012,7 +1042,7 @@ class CaptureActionServerTest(unittest.TestCase):
             set_save_sensor_depth=True,
         )
         handle = FakeGoalHandle("override-no-depth", goal=goal_message)
-        self.server._goal_callback(handle)
+        FakeActionServer.of(self.server).goal_cb(handle)
         self.wait_events(handle, 1, timeout=3.0)
         self.assertEqual(handle.events[0][0], "rejected")
         self.assertEqual(
@@ -1029,7 +1059,7 @@ class CaptureActionServerTest(unittest.TestCase):
             set_save_sensor_depth="yes",
         )
         handle = FakeGoalHandle("override-bad-flag", goal=goal_message)
-        self.server._goal_callback(handle)
+        FakeActionServer.of(self.server).goal_cb(handle)
         self.wait_events(handle, 1, timeout=3.0)
         self.assertEqual(handle.events[0][0], "rejected")
         self.assertEqual(

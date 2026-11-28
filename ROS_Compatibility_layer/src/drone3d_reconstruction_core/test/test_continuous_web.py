@@ -619,6 +619,13 @@ class WebDashboardServerTest(unittest.TestCase):
         # 热调生效时应约 3.0s。
         self.assertGreater(sum(sleeps), 2.5)
 
+    def test_page_is_served_from_the_packaged_static_file(self):
+        import drone3d_reconstruction_core.continuous_web_common as common
+        static = Path(common.__file__).with_name("static") / "dashboard.html"
+        core = self._start_core(WebDashboardCore(self._config()))
+        _status, _headers, body = self._get(core, "/")
+        self.assertEqual(body, static.read_bytes())
+
     def test_page_has_view_controls_and_no_session_param_form(self):
         core = self._start_core(WebDashboardCore(self._config()))
         _status, _headers, body = self._get(core, "/")

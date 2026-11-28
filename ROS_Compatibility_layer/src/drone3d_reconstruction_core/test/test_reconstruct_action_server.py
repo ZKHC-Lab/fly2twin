@@ -2,8 +2,10 @@
 
 from types import SimpleNamespace
 import shutil
+import sys
 import tempfile
 import threading
+import weakref
 import time
 import unittest
 from pathlib import Path
@@ -12,6 +14,8 @@ from unittest import mock
 from actionlib_msgs.msg import GoalStatus
 from drone3d_reconstruction_msgs.msg import ReconstructSegmentResult
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from actionlib_goal_handle import RecordingGoalHandle, assert_no_refused_transitions  # noqa: E402
 from drone3d_reconstruction_core import VerifiedCompletion as PublicVerifiedCompletion
 from drone3d_reconstruction_core.controller import JobFinished
 from drone3d_reconstruction_core.warm_worker_pool import WarmWorkerUnavailableError
@@ -40,8 +44,6 @@ from drone3d_reconstruction_core.reconstruct_action_server import (
     PreparedLaunch,
     ReconstructActionServer,
     VerifiedCompletion,
-    _GoalRecord,
-    _result,
 )
 
 
@@ -128,9 +130,15 @@ def resource_busy_error():
 
 
 class FakeActionServer:
+    """Stands in for actionlib.ActionServer. Tests deliver goals and cancels through the
+    callbacks the server registered here, the way actionlib calls them."""
+
+    by_server = weakref.WeakKeyDictionary()
+
     def __init__(self, name, action_type, goal_cb, cancel_cb, auto_start):
         self.goal_cb = goal_cb
         self.cancel_cb = cancel_cb
+        FakeActionServer.by_server[goal_cb.__self__] = self
         self.started = False
         self.stop_calls = 0
 
@@ -140,51 +148,19 @@ class FakeActionServer:
     def stop(self):
         self.stop_calls += 1
 
+    @classmethod
+    def of(cls, server):
+        """The fake actionlib endpoint a server registered its callbacks with."""
+        return cls.by_server[server]
 
-class FakeGoalHandle:
+
+class FakeGoalHandle(RecordingGoalHandle):
+    """actionlib's real ServerGoalHandle: illegal transitions are refused as on the robot."""
+
     def __init__(self, identifier, status=GoalStatus.PENDING):
-        self._goal_id = SimpleNamespace(
-            id=identifier,
-            stamp=SimpleNamespace(secs=1, nsecs=len(identifier)),
+        super().__init__(
+            identifier, SimpleNamespace(snapshot_uri="", manifest_sha256=""), status
         )
-        self._goal = SimpleNamespace(snapshot_uri="", manifest_sha256="")
-        self._goal_status = SimpleNamespace(status=status)
-        self.events = []
-
-    def get_goal_id(self):
-        return self._goal_id
-
-    def get_goal_status(self):
-        return self._goal_status
-
-    def get_goal(self):
-        return self._goal
-
-    def set_accepted(self, text):
-        if self._goal_status.status == GoalStatus.RECALLING:
-            self._goal_status.status = GoalStatus.PREEMPTING
-        else:
-            self._goal_status.status = GoalStatus.ACTIVE
-        self.events.append(("accepted", None, text))
-
-    def set_rejected(self, result, text):
-        self._goal_status.status = GoalStatus.REJECTED
-        self.events.append(("rejected", result, text))
-
-    def set_succeeded(self, result, text):
-        self._goal_status.status = GoalStatus.SUCCEEDED
-        self.events.append(("succeeded", result, text))
-
-    def set_aborted(self, result, text):
-        self._goal_status.status = GoalStatus.ABORTED
-        self.events.append(("aborted", result, text))
-
-    def set_canceled(self, result, text):
-        if self._goal_status.status in (GoalStatus.PENDING, GoalStatus.RECALLING):
-            self._goal_status.status = GoalStatus.RECALLED
-        else:
-            self._goal_status.status = GoalStatus.PREEMPTED
-        self.events.append(("canceled", result, text))
 
 
 class OneShotStatusFaultGoalHandle(FakeGoalHandle):
@@ -344,11 +320,23 @@ def _capture_exception(callback, errors):
 
 
 class ReconstructActionServerTest(unittest.TestCase):
+    def setUp(self):
+        RecordingGoalHandle.created = []
+
+    def tearDown(self):
+        assert_no_refused_transitions(self)
+
     def wait_events(self, goal, count, timeout=1.0):
         deadline = time.monotonic() + timeout
         while len(goal.events) < count and time.monotonic() < deadline:
             time.sleep(0.005)
         self.assertGreaterEqual(len(goal.events), count)
+
+    def wait_until_idle(self, server, timeout=1.0):
+        deadline = time.monotonic() + timeout
+        while server.is_busy() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertFalse(server.is_busy())
 
     def assert_empty_result_metadata(self, result):
         self.assertEqual(result.scene_id, "")
@@ -374,7 +362,7 @@ class ReconstructActionServerTest(unittest.TestCase):
 
     def test_shutdown_stops_action_server_once(self):
         server = self.server(FakeController())
-        action_server = server._server
+        action_server = FakeActionServer.of(server)
         server.shutdown()
         server.shutdown()
         self.assertEqual(action_server.stop_calls, 1)
@@ -508,7 +496,7 @@ class ReconstructActionServerTest(unittest.TestCase):
                 action_server_factory=FakeActionServer,
             )
             goal = FakeGoalHandle(f"malformed-{index}")
-            server._goal_callback(goal)
+            FakeActionServer.of(server).goal_cb(goal)
             self.wait_events(goal, 1)
             self.assertEqual(goal.events[0][0], "rejected")
             self.assertEqual(controller.start_calls, 0)
@@ -537,18 +525,17 @@ class ReconstructActionServerTest(unittest.TestCase):
             action_server_factory=FakeActionServer,
         )
         goal = FakeGoalHandle("plan-identity")
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
-        with server._lock:
-            record = server._active
-            self.assertIs(record.prepared_launch, plan)
         self.assertEqual(controller.start_commands, [plan.command])
         finished = controller.finish(elapsed=0.375)
         self.wait_events(goal, 2)
         self.assertEqual(len(verified), 1)
         verified_finished, cancellation_event = verified[0]
         self.assertIs(verified_finished, finished)
-        self.assertIs(cancellation_event, record.verification_cancel)
+        # The goal's own cancellation event, untouched by a goal nobody cancelled.
+        self.assertIsInstance(cancellation_event, threading.Event)
+        self.assertFalse(cancellation_event.is_set())
         self.assertEqual(verified_finished.job_id, 1)
         self.assertEqual(verified_finished.cause, "worker_exit")
         self.assertEqual(verified_finished.returncode, 0)
@@ -579,7 +566,7 @@ class ReconstructActionServerTest(unittest.TestCase):
             action_server_factory=FakeActionServer,
         )
         goal = FakeGoalHandle("warm-dispatch")
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
         self.assertEqual(goal.events[0][0], "accepted")
         self.assertEqual(controller.start_warm_calls, 1)
@@ -589,9 +576,7 @@ class ReconstructActionServerTest(unittest.TestCase):
         finished = controller.finish(elapsed=0.25)
         self.wait_events(goal, 2)
         self.assertEqual(goal.events[-1][0], "succeeded")
-        with server._lock:
-            record = server._active
-            self.assertIsNone(record)
+        self.assertFalse(server.is_busy())
         self.assertEqual(finished.job_id, 1)
 
     def test_warm_spawn_failure_falls_back_to_oneshot_start(self):
@@ -615,7 +600,7 @@ class ReconstructActionServerTest(unittest.TestCase):
             action_server_factory=FakeActionServer,
         )
         goal = FakeGoalHandle("warm-fallback")
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
         self.assertEqual(controller.start_warm_calls, 1)
         self.assertEqual(controller.start_calls, 1)
@@ -640,7 +625,7 @@ class ReconstructActionServerTest(unittest.TestCase):
             action_server_factory=FakeActionServer,
         )
         goal = FakeGoalHandle("validation-failure")
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
         controller.finish()
         self.wait_events(goal, 2)
@@ -678,7 +663,7 @@ class ReconstructActionServerTest(unittest.TestCase):
                     action_server_factory=FakeActionServer,
                 )
                 goal = FakeGoalHandle(f"completion-error-{index}")
-                server._goal_callback(goal)
+                FakeActionServer.of(server).goal_cb(goal)
                 self.wait_events(goal, 1)
                 controller.finish()
                 self.wait_events(goal, 2)
@@ -719,7 +704,7 @@ class ReconstructActionServerTest(unittest.TestCase):
                 )
                 goal = FakeGoalHandle(f"invalid-completion-{index}")
 
-                server._goal_callback(goal)
+                FakeActionServer.of(server).goal_cb(goal)
                 self.wait_events(goal, 1)
                 controller.finish()
                 self.wait_events(goal, 2)
@@ -756,7 +741,7 @@ class ReconstructActionServerTest(unittest.TestCase):
             ),
         )
         goal = FakeGoalHandle("observer-success")
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
         finished = controller.finish(elapsed=0.25)
         self.wait_events(goal, 2)
@@ -787,7 +772,7 @@ class ReconstructActionServerTest(unittest.TestCase):
             ),
         )
         goal = FakeGoalHandle("observer-faults")
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
         controller.finish()
         self.wait_events(goal, 2)
@@ -807,12 +792,12 @@ class ReconstructActionServerTest(unittest.TestCase):
             finished_observer=finished_events.append,
         )
         goal = FakeGoalHandle("observer-duplicates")
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
         finished = controller.finish()
         self.wait_events(goal, 2)
-        server._on_finished(finished)
-        server._on_finished(JobFinished("worker_exit", 0, 0.1, 99))
+        controller.on_finished(finished)
+        controller.on_finished(JobFinished("worker_exit", 0, 0.1, 99))
         self.assertEqual(len(finished_events), 1)
 
     def test_diagnostics_snapshot_exposes_stage_and_busy_transitions(self):
@@ -831,7 +816,7 @@ class ReconstructActionServerTest(unittest.TestCase):
         self.assertIsNone(idle["job_id"])
 
         goal = FakeGoalHandle("diagnostics-active")
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
         active = server.diagnostics_snapshot()
         self.assertTrue(active["running"])
@@ -859,7 +844,7 @@ class ReconstructActionServerTest(unittest.TestCase):
         server = self.server(controller, verifier=lambda _finished, _cancellation_event: metadata)
         goal = FakeGoalHandle("metadata-success")
 
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
         controller.finish(elapsed=1.75)
         self.wait_events(goal, 2)
@@ -880,7 +865,7 @@ class ReconstructActionServerTest(unittest.TestCase):
         server = self.server(controller, verifier=lambda _finished, _cancellation_event: metadata)
         goal = FakeGoalHandle("empty-glb-success")
 
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
         controller.finish()
         self.wait_events(goal, 2)
@@ -920,11 +905,11 @@ class ReconstructActionServerTest(unittest.TestCase):
         )
         goal = FakeGoalHandle("commit-order")
 
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
         controller.finish()
         self.wait_events(goal, 2)
-        server._cancel_callback(goal)
+        FakeActionServer.of(server).cancel_cb(goal)
         controller.inject_completion(1)
 
         self.assertEqual(events, ["verify", "commit"])
@@ -966,10 +951,8 @@ class ReconstructActionServerTest(unittest.TestCase):
                     )
                 return info
 
-            server._goal_callback(goal)
+            FakeActionServer.of(server).goal_cb(goal)
             self.wait_events(goal, 1)
-            with server._lock:
-                record = server._active
             with mock.patch.object(
                 transaction_module, "_lstat_at", side_effect=fail_only_after_publication
             ):
@@ -977,7 +960,6 @@ class ReconstructActionServerTest(unittest.TestCase):
             self.wait_events(goal, 2)
 
             self.assertTrue(transaction.committed)
-            self.assertTrue(record.result_committed)
             self.assertIsNone(transaction._root_fd)
             self.assertFalse(staging.exists())
             self.assertEqual(
@@ -1024,7 +1006,7 @@ class ReconstructActionServerTest(unittest.TestCase):
         )
         goal = FakeGoalHandle("commit-collision")
 
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
         controller.finish()
         self.wait_events(goal, 2)
@@ -1058,7 +1040,7 @@ class ReconstructActionServerTest(unittest.TestCase):
                         action_server_factory=FakeActionServer,
                     )
                     goal = FakeGoalHandle("preserve-" + cause)
-                    server._goal_callback(goal)
+                    FakeActionServer.of(server).goal_cb(goal)
                     self.wait_events(goal, 1)
                     controller.finish(cause, code)
                     self.wait_events(goal, 2)
@@ -1108,7 +1090,7 @@ class ReconstructActionServerTest(unittest.TestCase):
             action_server_factory=FakeActionServer,
         )
 
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
         controller.finish()
         self.wait_events(goal, 2)
@@ -1132,7 +1114,7 @@ class ReconstructActionServerTest(unittest.TestCase):
         )
         goal = FakeGoalHandle("cleanup-failure")
 
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
         controller.finish("worker_exit", 7)
         self.wait_events(goal, 2)
@@ -1164,7 +1146,7 @@ class ReconstructActionServerTest(unittest.TestCase):
                 action_server_factory=FakeActionServer,
             )
             goal = FakeGoalHandle(f"unverified-{index}")
-            server._goal_callback(goal)
+            FakeActionServer.of(server).goal_cb(goal)
             self.wait_events(goal, 1)
             controller.finish(cause, returncode)
             self.wait_events(goal, 2)
@@ -1191,23 +1173,23 @@ class ReconstructActionServerTest(unittest.TestCase):
             action_server_factory=FakeActionServer,
         )
         goal = FakeGoalHandle("blocked-verifier")
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
         finish_thread = threading.Thread(target=controller.finish)
         finish_thread.start()
         self.assertTrue(entered.wait(1.0))
-        with server._lock:
-            record = server._active
-        self.assertEqual(observed_events, [record.verification_cancel])
-        self.assertIs(observed_events[0], record.verification_cancel)
-        self.assertFalse(record.verification_cancel.is_set())
+        # The verifier holds this goal's cancellation event while the server reports it verifying.
+        self.assertEqual(server.diagnostics_snapshot()["stage"], "verifying")
+        self.assertEqual(len(observed_events), 1)
+        verification_cancel = observed_events[0]
+        self.assertFalse(verification_cancel.is_set())
 
         contender = FakeGoalHandle("verifier-contender")
-        server._goal_callback(contender)
+        FakeActionServer.of(server).goal_cb(contender)
         self.assertEqual(contender.events[0][1].error_code, ReconstructSegmentResult.BUSY)
-        server._cancel_callback(goal)
+        FakeActionServer.of(server).cancel_cb(goal)
         self.assertEqual(server.cancel_request_count, 1)
-        self.assertTrue(record.verification_cancel.is_set())
+        self.assertTrue(verification_cancel.is_set())
         self.assertEqual(controller.cancel_calls, 0)
         started = time.monotonic()
         controller.inject_completion(1)
@@ -1255,23 +1237,23 @@ class ReconstructActionServerTest(unittest.TestCase):
                     action_server_factory=FakeActionServer,
                 )
                 goal = FakeGoalHandle(f"cooperative-verifier-cancel-{outcome}")
-                server._goal_callback(goal)
+                FakeActionServer.of(server).goal_cb(goal)
                 self.wait_events(goal, 1)
 
                 finish_thread = threading.Thread(target=controller.finish)
                 finish_thread.start()
                 self.assertTrue(entered.wait(1.0))
-                with server._lock:
-                    record = server._active
-                self.assertEqual(observed_events, [record.verification_cancel])
-                self.assertFalse(record.verification_cancel.is_set())
+                self.assertEqual(server.diagnostics_snapshot()["stage"], "verifying")
+                self.assertEqual(len(observed_events), 1)
+                verification_cancel = observed_events[0]
+                self.assertFalse(verification_cancel.is_set())
 
-                server._cancel_callback(goal)
+                FakeActionServer.of(server).cancel_cb(goal)
                 finish_thread.join(1.0)
 
                 self.assertFalse(finish_thread.is_alive())
                 self.assertTrue(exited.is_set())
-                self.assertTrue(record.verification_cancel.is_set())
+                self.assertTrue(verification_cancel.is_set())
                 self.wait_events(goal, 2)
                 self.assertEqual(
                     [event[0] for event in goal.events], ["accepted", "canceled"]
@@ -1301,7 +1283,7 @@ class ReconstructActionServerTest(unittest.TestCase):
             action_server_factory=FakeActionServer,
         )
         goal = FakeGoalHandle("verifier-interrupt")
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
         with self.assertRaises(KeyboardInterrupt):
             controller.finish()
@@ -1324,7 +1306,7 @@ class ReconstructActionServerTest(unittest.TestCase):
         )
         goal = FakeGoalHandle("invalid-dispatch")
 
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
 
         self.assertEqual([event[0] for event in goal.events], ["rejected"])
         self.assertEqual(controller.start_calls, 0)
@@ -1341,7 +1323,7 @@ class ReconstructActionServerTest(unittest.TestCase):
 
         server = self.server(controller, launch_dispatch=invalid_dispatch)
         goal = FakeGoalHandle("started-dispatch")
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         release.set()
         started.join(1.0)
 
@@ -1352,12 +1334,16 @@ class ReconstructActionServerTest(unittest.TestCase):
     def test_launch_dispatch_failure_rejects_and_releases_capacity(self):
         controller = FakeController()
 
-        def fail_dispatch(target, args):
-            raise RuntimeError("thread creation failed")
+        dispatch_fails = [True]
 
-        server = self.server(controller, launch_dispatch=fail_dispatch)
+        def dispatch(target, args):
+            if dispatch_fails[0]:
+                raise RuntimeError("thread creation failed")
+            return threading.Thread(target=target, args=args)
+
+        server = self.server(controller, launch_dispatch=dispatch)
         failed = FakeGoalHandle("dispatch-failure")
-        server._goal_callback(failed)
+        FakeActionServer.of(server).goal_cb(failed)
 
         self.assertEqual([event[0] for event in failed.events], ["rejected"])
         self.assertEqual(
@@ -1368,11 +1354,9 @@ class ReconstructActionServerTest(unittest.TestCase):
         self.assertEqual(controller.start_calls, 0)
         self.assertFalse(server.is_busy())
 
-        server._launch_dispatch = lambda target, args: threading.Thread(
-            target=target, args=args
-        )
+        dispatch_fails[0] = False  # Thread creation works again for the next goal.
         replacement = FakeGoalHandle("replacement")
-        server._goal_callback(replacement)
+        FakeActionServer.of(server).goal_cb(replacement)
         self.wait_events(replacement, 1)
         controller.finish()
         self.wait_events(replacement, 2)
@@ -1386,11 +1370,11 @@ class ReconstructActionServerTest(unittest.TestCase):
         goal = FakeGoalHandle("cancelled-dispatch")
 
         def cancel_then_fail(*_):
-            server._cancel_callback(goal)
+            FakeActionServer.of(server).cancel_cb(goal)
             raise RuntimeError("thread creation failed")
 
         server = self.server(controller, launch_dispatch=cancel_then_fail)
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
 
         self.assertEqual([event[0] for event in goal.events], ["canceled"])
@@ -1416,7 +1400,7 @@ class ReconstructActionServerTest(unittest.TestCase):
             action_server_factory=FakeActionServer,
         )
         goal = FakeGoalHandle("shutdown-build")
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.assertTrue(entered.wait(1.0))
 
         shutdown_error = []
@@ -1459,7 +1443,7 @@ class ReconstructActionServerTest(unittest.TestCase):
             action_server_factory=FakeActionServer,
         )
         denied = FakeGoalHandle("resource-denied")
-        server._goal_callback(denied)
+        FakeActionServer.of(server).goal_cb(denied)
         self.wait_events(denied, 1)
 
         self.assertEqual([event[0] for event in denied.events], ["rejected"])
@@ -1469,7 +1453,7 @@ class ReconstructActionServerTest(unittest.TestCase):
         self.assertFalse(server.is_busy())
 
         replacement = FakeGoalHandle("resource-replacement")
-        server._goal_callback(replacement)
+        FakeActionServer.of(server).goal_cb(replacement)
         self.wait_events(replacement, 1)
         self.assertEqual([event[0] for event in replacement.events], ["accepted"])
         self.assertEqual(controller.start_calls, 1)
@@ -1498,62 +1482,18 @@ class ReconstructActionServerTest(unittest.TestCase):
         )
         first = FakeGoalHandle("blocked-resource")
         second = FakeGoalHandle("blocked-contender")
-        server._goal_callback(first)
+        FakeActionServer.of(server).goal_cb(first)
         self.assertTrue(entered.wait(1.0))
 
-        server._goal_callback(second)
+        FakeActionServer.of(server).goal_cb(second)
         self.assertEqual(second.events[0][0], "rejected")
         self.assertEqual(second.events[0][1].error_code, ReconstructSegmentResult.BUSY)
-        server._cancel_callback(first)
+        FakeActionServer.of(server).cancel_cb(first)
         release.set()
         self.wait_events(first, 1)
 
         self.assertEqual([event[0] for event in first.events], ["canceled"])
         self.assertEqual(first.events[0][1].error_code, ReconstructSegmentResult.CANCELLED)
-        self.assertEqual(controller.start_calls, 0)
-        self.assertFalse(server.is_busy())
-
-    def test_resource_busy_cancel_choice_and_terminal_claim_are_atomic(self):
-        controller = FakeController()
-        builder_entered = threading.Event()
-        builder_release = threading.Event()
-
-        def builder(goal):
-            builder_entered.set()
-            if not builder_release.wait(2.0):
-                raise RuntimeError("test did not release builder")
-            return prepared_launch()
-
-        server = ReconstructActionServer(
-            action_name="test_resource_atomic_claim",
-            command_builder=builder,
-            worker_timeout_sec=1.0,
-            term_grace_sec=0.1,
-            controller_factory=controller.factory,
-            action_server_factory=FakeActionServer,
-        )
-        goal = FakeGoalHandle("resource-atomic-cancel")
-        server._goal_callback(goal)
-        self.assertTrue(builder_entered.wait(1.0))
-
-        with server._lock:
-            record = server._active
-            record.cancel_requested = True
-            terminal = server._claim_resource_busy_terminal_locked(
-                record, resource_busy_error()
-            )
-            self.assertTrue(record.terminal_claimed)
-            self.assertEqual(terminal[0], "canceled")
-            self.assertEqual(
-                terminal[1].error_code, ReconstructSegmentResult.CANCELLED
-            )
-
-        server._perform_terminal_transition(record, *terminal)
-        builder_release.set()
-        self.assertTrue(record.launch_finished.wait(1.0))
-
-        self.assertEqual([event[0] for event in goal.events], ["canceled"])
-        self.assertEqual(server.terminal_attempt_count, 1)
         self.assertEqual(controller.start_calls, 0)
         self.assertFalse(server.is_busy())
 
@@ -1573,7 +1513,7 @@ class ReconstructActionServerTest(unittest.TestCase):
                 action_server_factory=FakeActionServer,
             )
             goal = FakeGoalHandle(f"resource-error-{index}")
-            server._goal_callback(goal)
+            FakeActionServer.of(server).goal_cb(goal)
             self.wait_events(goal, 1)
             self.assertEqual(goal.events[0][0], "rejected")
             self.assertEqual(
@@ -1606,7 +1546,7 @@ class ReconstructActionServerTest(unittest.TestCase):
                     action_server_factory=FakeActionServer,
                 )
                 goal = FakeGoalHandle(f"preparation-error-{index}")
-                server._goal_callback(goal)
+                FakeActionServer.of(server).goal_cb(goal)
                 self.wait_events(goal, 1)
                 self.assertEqual(goal.events[0][0], "rejected")
                 result = goal.events[0][1]
@@ -1621,8 +1561,13 @@ class ReconstructActionServerTest(unittest.TestCase):
 
     def test_preparation_error_loses_to_earlier_cancellation(self):
         controller = FakeController()
+        entered = threading.Event()
+        release = threading.Event()
 
         def builder(_goal):
+            # Fail only after the test has delivered the cancel: the cancel is earlier.
+            entered.set()
+            self.assertTrue(release.wait(2.0))
             raise PreparationError(IO_ERROR, "cannot prepare snapshot")
 
         server = ReconstructActionServer(
@@ -1634,8 +1579,10 @@ class ReconstructActionServerTest(unittest.TestCase):
             action_server_factory=FakeActionServer,
         )
         goal = FakeGoalHandle("preparation-cancel")
-        server._goal_callback(goal)
-        server._cancel_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
+        self.assertTrue(entered.wait(1.0))
+        FakeActionServer.of(server).cancel_cb(goal)
+        release.set()
         self.wait_events(goal, 1)
 
         self.assertEqual([event[0] for event in goal.events], ["canceled"])
@@ -1667,7 +1614,7 @@ class ReconstructActionServerTest(unittest.TestCase):
             controller_factory=controller.factory,
             action_server_factory=FakeActionServer,
         )
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         controller.inject_completion(1)  # A duplicate controller callback must be harmless.
         self.wait_events(goal, 2)
 
@@ -1696,7 +1643,7 @@ class ReconstructActionServerTest(unittest.TestCase):
         )
         goal = FakeGoalHandle("buffered-first-wins")
 
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 2)
 
         self.assertEqual([event[0] for event in goal.events], ["accepted", "aborted"])
@@ -1715,7 +1662,7 @@ class ReconstructActionServerTest(unittest.TestCase):
             active = None
             if mode.startswith("busy"):
                 active = FakeGoalHandle("active-{}".format(mode))
-                server._goal_callback(active)
+                FakeActionServer.of(server).goal_cb(active)
                 self.wait_events(active, 1)
             else:
                 server.shutdown()
@@ -1733,7 +1680,7 @@ class ReconstructActionServerTest(unittest.TestCase):
                 original_rejected(result, text)
 
             contender.set_rejected = fail_or_noop_once
-            server._goal_callback(contender)
+            FakeActionServer.of(server).goal_cb(contender)
 
             self.assertEqual(len(calls), 2)
             self.assertEqual(contender._goal_status.status, GoalStatus.REJECTED)
@@ -1757,6 +1704,12 @@ class ReconstructActionServerTest(unittest.TestCase):
 
         controller = FakeController(on_cancel=finish_cancel)
         transaction = FakeResultTransaction()
+        launches = []
+
+        def dispatch(target, args):
+            launches.append((target, args))
+            return threading.Thread(target=lambda: None)
+
         server = ReconstructActionServer(
             action_name="test_launch_status_fault",
             command_builder=lambda goal: prepared_launch(transaction=transaction),
@@ -1764,32 +1717,23 @@ class ReconstructActionServerTest(unittest.TestCase):
             term_grace_sec=0.1,
             controller_factory=controller.factory,
             action_server_factory=FakeActionServer,
-            launch_dispatch=lambda target, args: threading.Thread(target=lambda: None),
+            launch_dispatch=dispatch,
         )
+        # The goal arrives through actionlib (first status query); the launch task the
+        # server hands to its dispatcher then runs on this thread so the fault surfaces here.
         goal = OneShotStatusFaultGoalHandle("status-fault", KeyboardInterrupt("stop"))
-        goal.get_goal_status()  # Initial arbitration status inspection.
-        record = None
-        with server._lock:
-            record = server._active
-        self.assertIsNone(record)
-
-        record = __import__(
-            "drone3d_reconstruction_core.reconstruct_action_server",
-            fromlist=["_GoalRecord"],
-        )._GoalRecord(goal, (goal.get_goal_id().id, 1, len(goal.get_goal_id().id)))
-        with server._lock:
-            server._active = record
-            record.launch_permitted = True
-            record.launch_decided.set()
+        FakeActionServer.of(server).goal_cb(goal)
+        self.assertEqual(len(launches), 1)
+        self.assertTrue(server.is_busy())
+        target, args = launches[0]
         with self.assertRaises(KeyboardInterrupt):
-            server._launch_goal_task(record)
+            target(*args)
 
         self.assertEqual(controller.start_calls, 1)
         self.assertEqual(controller.cancel_calls, 1)
         self.assertEqual([event[0] for event in goal.events], ["accepted", "aborted"])
         self.assertEqual(transaction.cleanup_calls, 1)
-        self.assertTrue(record.done.is_set())
-        self.assertTrue(record.launch_finished.is_set())
+        self.assertEqual(server.terminal_attempt_count, 1)
         self.assertFalse(server.is_busy())
 
     def test_acceptance_remains_authoritative_when_status_queries_fail(self):
@@ -1797,7 +1741,7 @@ class ReconstructActionServerTest(unittest.TestCase):
         server = self.server(controller)
         goal = StatusFaultGoalHandle("accepted-status-faults", {2, 3})
 
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
 
         self.assertEqual([event[0] for event in goal.events], ["accepted"])
@@ -1829,11 +1773,11 @@ class ReconstructActionServerTest(unittest.TestCase):
         server = self.server(controller)
         first = FakeGoalHandle("first")
         second = FakeGoalHandle("second")
-        thread = threading.Thread(target=server._goal_callback, args=(first,))
+        thread = threading.Thread(target=FakeActionServer.of(server).goal_cb, args=(first,))
         thread.start()
         self.assertTrue(entered.wait(1.0))
 
-        server._goal_callback(second)
+        FakeActionServer.of(server).goal_cb(second)
         release.set()
         thread.join(2.0)
         self.wait_events(first, 1)
@@ -1864,11 +1808,11 @@ class ReconstructActionServerTest(unittest.TestCase):
         controller = FakeController(on_start=block_start, on_cancel=finish_cancel)
         server = self.server(controller)
         goal = FakeGoalHandle("cancel-start")
-        thread = threading.Thread(target=server._goal_callback, args=(goal,))
+        thread = threading.Thread(target=FakeActionServer.of(server).goal_cb, args=(goal,))
         thread.start()
         self.assertTrue(entered.wait(1.0))
 
-        server._cancel_callback(goal)
+        FakeActionServer.of(server).cancel_cb(goal)
         release.set()
         thread.join(2.0)
         self.wait_events(goal, 1)
@@ -1895,10 +1839,10 @@ class ReconstructActionServerTest(unittest.TestCase):
             original_accept(text)
 
         goal.set_accepted = blocked_accept
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.assertTrue(accept_entered.wait(1.0))
         controller.finish("worker_exit", 0)
-        server._cancel_callback(goal)
+        FakeActionServer.of(server).cancel_cb(goal)
         accept_release.set()
         self.wait_events(goal, 2)
 
@@ -1916,10 +1860,10 @@ class ReconstructActionServerTest(unittest.TestCase):
             )[1],
         )
         goal = FakeGoalHandle("cancel-before-callback")
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
 
-        server._cancel_callback(goal)
+        FakeActionServer.of(server).cancel_cb(goal)
         controller.finish("worker_exit", 0)
         self.wait_events(goal, 2)
 
@@ -1950,17 +1894,17 @@ class ReconstructActionServerTest(unittest.TestCase):
         )
         replacement = FakeGoalHandle("replacement-unbound")
 
-        server._goal_callback(replacement)
+        FakeActionServer.of(server).goal_cb(replacement)
         self.assertTrue(builder_entered.wait(1.0))
         controller.inject_completion(old_id)
         controller.inject_completion(999)
         time.sleep(0.02)
 
-        with server._lock:
-            record = server._active
-            self.assertIsNotNone(record)
-            self.assertIsNone(record.controller_job_id)
-            self.assertIsNone(record.buffered_finished)
+        # Neither stale completion binds to the replacement, which is still preparing.
+        diagnostics = server.diagnostics_snapshot()
+        self.assertTrue(diagnostics["running"])
+        self.assertEqual(diagnostics["stage"], "starting")
+        self.assertIsNone(diagnostics["job_id"])
         self.assertEqual(replacement.events, [])
 
         builder_release.set()
@@ -1990,17 +1934,17 @@ class ReconstructActionServerTest(unittest.TestCase):
         controller = FakeController(on_cancel=lambda current: False)
         server = self.server(controller)
         old = FakeGoalHandle("old-delayed")
-        server._goal_callback(old)
+        FakeActionServer.of(server).goal_cb(old)
         self.wait_events(old, 1)
         old_job_id = 1
 
-        server._cancel_callback(old)
+        FakeActionServer.of(server).cancel_cb(old)
         controller.inject_completion(old_job_id, "cancelled", -15)
         controller.abandon_active_job_for_fault_injection()
         self.wait_events(old, 2)
 
         replacement = FakeGoalHandle("replacement-delayed")
-        server._goal_callback(replacement)
+        FakeActionServer.of(server).goal_cb(replacement)
         self.wait_events(replacement, 1)
 
         controller.inject_completion(old_job_id, "worker_exit", 0)
@@ -2017,13 +1961,13 @@ class ReconstructActionServerTest(unittest.TestCase):
         first = FakeGoalHandle("old")
         second = FakeGoalHandle("new")
 
-        server._goal_callback(first)
+        FakeActionServer.of(server).goal_cb(first)
         self.wait_events(first, 1)
         controller.finish()
         self.wait_events(first, 2)
-        server._goal_callback(second)
+        FakeActionServer.of(server).goal_cb(second)
         self.wait_events(second, 1)
-        server._cancel_callback(first)
+        FakeActionServer.of(server).cancel_cb(first)
 
         self.assertEqual(controller.cancel_calls, 0)
         self.assertEqual([event[0] for event in second.events], ["accepted"])
@@ -2041,7 +1985,7 @@ class ReconstructActionServerTest(unittest.TestCase):
         server = self.server(controller)
         goal = FakeGoalHandle("spawn-failure")
 
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.assertTrue(start_failed.wait(1.0))
         deadline = time.monotonic() + 1.0
         while controller.cancel_calls < 1 and time.monotonic() < deadline:
@@ -2063,7 +2007,7 @@ class ReconstructActionServerTest(unittest.TestCase):
 
         replacement = FakeGoalHandle("replacement-after-spawn-failure")
         controller.on_start = None
-        server._goal_callback(replacement)
+        FakeActionServer.of(server).goal_cb(replacement)
         self.wait_events(replacement, 1)
         self.assertEqual([event[0] for event in replacement.events], ["accepted"])
         controller.finish()
@@ -2085,7 +2029,7 @@ class ReconstructActionServerTest(unittest.TestCase):
         )
         goal = FailingGoalHandle("accept-failure", {"accepted": 1})
 
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
 
         self.assertEqual([event[0] for event in goal.events], ["rejected"])
@@ -2111,7 +2055,7 @@ class ReconstructActionServerTest(unittest.TestCase):
         )
         goal = FailingGoalHandle("terminal-fallback", {"succeeded": 1})
 
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
         controller.finish()
         self.wait_events(goal, 2)
@@ -2131,12 +2075,12 @@ class ReconstructActionServerTest(unittest.TestCase):
             {"succeeded": 2},
         )
 
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
         controller.finish()
         time.sleep(0.02)
         contender = FakeGoalHandle("contender")
-        server._goal_callback(contender)
+        FakeActionServer.of(server).goal_cb(contender)
 
         self.assertEqual([event[0] for event in goal.events], ["accepted"])
         self.assertTrue(server.is_busy())
@@ -2156,7 +2100,7 @@ class ReconstructActionServerTest(unittest.TestCase):
             controller = FakeController()
             server = self.server(controller)
             goal = FakeGoalHandle(f"mapping-{index}")
-            server._goal_callback(goal)
+            FakeActionServer.of(server).goal_cb(goal)
             self.wait_events(goal, 1)
             controller.on_finished(finished)
             controller.on_finished(finished)
@@ -2169,10 +2113,10 @@ class ReconstructActionServerTest(unittest.TestCase):
         controller = FakeController()
         server = self.server(controller)
         goal = FakeGoalHandle("cancel-cleanup-failed")
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
 
-        server._cancel_callback(goal)
+        FakeActionServer.of(server).cancel_cb(goal)
         controller.finish("cleanup_failed", -9, elapsed=0.2)
         self.wait_events(goal, 2)
 
@@ -2205,77 +2149,6 @@ class ReconstructActionServerTest(unittest.TestCase):
         )
         self.assertEqual(message, "worker exited with code 2")
 
-    def test_launch_failure_cancel_choice_and_claim_are_atomic(self):
-        controller = FakeController()
-        server = self.server(controller)
-        goal = FakeGoalHandle("launch-failure-atomic")
-        server._goal_callback(goal)
-        self.wait_events(goal, 1)
-        with server._lock:
-            record = server._active
-            record.cancel_requested = True
-            terminal = server._claim_launch_failure_terminal_locked(
-                record, OSError("spawn failed")
-            )
-            self.assertTrue(record.terminal_claimed)
-            self.assertEqual(terminal[0], "canceled")
-        server._cancel_callback(goal)  # A cancellation after the claim is ignored.
-        server._perform_terminal_transition(record, *terminal)
-        self.assertEqual(goal.events[-1][0], "canceled")
-        self.assertEqual(server.cancel_request_count, 0)
-        self.assertEqual(server.terminal_attempt_count, 1)
-
-    def test_dispatch_failure_cancel_choice_and_claim_are_atomic(self):
-        controller = FakeController()
-        entered = threading.Event()
-        release = threading.Event()
-        server = ReconstructActionServer(
-            action_name="test_dispatch_atomic",
-            command_builder=lambda goal: (
-                entered.set(), release.wait(2.0), prepared_launch()
-            )[-1],
-            worker_timeout_sec=1.0,
-            term_grace_sec=0.1,
-            controller_factory=controller.factory,
-            action_server_factory=FakeActionServer,
-        )
-        goal = FakeGoalHandle("dispatch-failure-atomic")
-        server._goal_callback(goal)
-        self.assertTrue(entered.wait(1.0))
-        with server._lock:
-            record = server._active
-            record.cancel_requested = True
-            terminal = server._claim_dispatch_failure_terminal_locked(
-                record, RuntimeError("dispatch failed")
-            )
-            self.assertTrue(record.terminal_claimed)
-            self.assertEqual(terminal[0], "canceled")
-        server._perform_terminal_transition(record, *terminal)
-        release.set()
-        self.assertTrue(record.launch_finished.wait(1.0))
-        self.assertEqual([event[0] for event in goal.events], ["canceled"])
-        self.assertEqual(server.terminal_attempt_count, 1)
-
-    def test_accept_failure_choice_and_claim_preserve_accepted_contract(self):
-        for accepted, expected in ((False, "canceled"), (True, "aborted")):
-            controller = FakeController()
-            server = self.server(controller)
-            goal = FakeGoalHandle(f"accept-atomic-{accepted}")
-            server._goal_callback(goal)
-            self.wait_events(goal, 1)
-            with server._lock:
-                record = server._active
-                record.phase = "accept_failed"
-                record.accept_error = "failed to accept goal"
-                record.accepted = accepted
-                record.cancel_requested = True
-                terminal = server._claim_accept_failure_terminal_locked(record, 0.2)
-                self.assertTrue(record.terminal_claimed)
-                self.assertEqual(terminal[0], expected)
-            server._perform_terminal_transition(record, *terminal)
-            self.assertEqual(goal.events[-1][0], expected)
-            self.assertEqual(server.terminal_attempt_count, 1)
-
     def test_late_cancel_cannot_revoke_claimed_buffered_completion(self):
         controller = FakeController(on_cancel=lambda current: False)
         server = self.server(controller)
@@ -2299,12 +2172,12 @@ class ReconstructActionServerTest(unittest.TestCase):
 
         goal.set_accepted = blocked_accept
         goal.set_succeeded = blocked_succeeded
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.assertTrue(accept_entered.wait(1.0))
         controller.finish("worker_exit", 0)
         accept_release.set()
         self.assertTrue(terminal_entered.wait(1.0))
-        server._cancel_callback(goal)
+        FakeActionServer.of(server).cancel_cb(goal)
         terminal_release.set()
         self.wait_events(goal, 2)
 
@@ -2329,7 +2202,7 @@ class ReconstructActionServerTest(unittest.TestCase):
         )
         goal = FakeGoalHandle("buffered-launch-failure")
 
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
 
         self.assertEqual([event[0] for event in goal.events], ["rejected"])
@@ -2363,10 +2236,10 @@ class ReconstructActionServerTest(unittest.TestCase):
             action_server_factory=FakeActionServer,
         )
         goal = FakeGoalHandle("async-cancel")
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.assertTrue(start_entered.wait(1.0))
 
-        server._cancel_callback(goal)
+        FakeActionServer.of(server).cancel_cb(goal)
         start_release.set()
         deadline = time.monotonic() + 1.0
         while controller.cancel_calls < 1 and time.monotonic() < deadline:
@@ -2401,7 +2274,7 @@ class ReconstructActionServerTest(unittest.TestCase):
             return original_status()
 
         goal.get_goal_status = checked_status
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1)
         controller.finish()
         self.wait_events(goal, 2)
@@ -2410,75 +2283,102 @@ class ReconstructActionServerTest(unittest.TestCase):
         self.assertTrue(all(lock_observations))
 
     def test_terminal_status_faults_after_primary_and_fallback_retain_slot(self):
+        # An accepted goal whose worker fails: the primary set_aborted raises, the status
+        # query after it and the one after the fallback both fail (status calls 3 and 4;
+        # 1 is arbitration, 2 the post-accept check). Capacity must stay owned.
         controller = FakeController()
-        server = self.server(controller, launch_dispatch=lambda target, args: threading.Thread(target=lambda: None))
-        goal = StatusFaultGoalHandle("status-query-faults", {1, 2})
-        original_rejected = goal.set_rejected
-        rejection_calls = []
+        server = self.server(controller)
+        goal = StatusFaultGoalHandle("status-query-faults", {3, 4})
+        original_aborted = goal.set_aborted
+        abort_calls = []
 
         def fail_once(result, text):
-            rejection_calls.append(1)
-            if len(rejection_calls) == 1:
+            abort_calls.append(1)
+            if len(abort_calls) == 1:
                 raise RuntimeError("primary failed")
-            original_rejected(result, text)
+            original_aborted(result, text)
 
-        goal.set_rejected = fail_once
-        record = _GoalRecord(goal, ("status-query-faults", 1, 1))
-        with server._lock:
-            server._active = record
-            server._claim_terminal_locked(record)
+        goal.set_aborted = fail_once
+        FakeActionServer.of(server).goal_cb(goal)
+        self.wait_events(goal, 1)
+        controller.finish("worker_exit", 2, elapsed=0.7)
 
-        self.assertFalse(
-            server._perform_terminal_transition(
-                record,
-                "rejected",
-                _result(ReconstructSegmentResult.INTERNAL_ERROR, "failed", 0.7),
-                "failed",
-            )
-        )
-        self.assertEqual([event[0] for event in goal.events], ["rejected"])
-        self.assertAlmostEqual(goal.events[0][1].wall_time.to_sec(), 0.7)
+        self.assertEqual(len(abort_calls), 2)
+        self.assertEqual([event[0] for event in goal.events], ["accepted", "aborted"])
+        self.assertAlmostEqual(goal.events[-1][1].wall_time.to_sec(), 0.7)
+        self.assertEqual(server.terminal_attempt_count, 1)
         self.assertTrue(server.is_busy())
-        self.assertFalse(record.done.is_set())
 
     def test_cleanup_refusal_uses_legal_method_and_preserves_elapsed(self):
-        cases = (
-            (GoalStatus.PENDING, False, "rejected"),
-            (GoalStatus.RECALLING, False, "canceled"),
-            (GoalStatus.ACTIVE, True, "aborted"),
+        # Accepted: the worker fails, the staging cleanup is refused -> aborted, IO_ERROR,
+        # with the worker's elapsed time kept.
+        controller = FakeController()
+        transaction = FakeResultTransaction(
+            cleanup_error=ResultSafetyError("CLEANUP_REFUSED", "unsafe")
         )
-        for index, (status, accepted, expected_method) in enumerate(cases):
-            controller = FakeController()
-            server = self.server(controller, launch_dispatch=lambda target, args: threading.Thread(target=lambda: None))
-            goal = FakeGoalHandle(f"cleanup-legality-{index}", status=status)
-            transaction = FakeResultTransaction(
-                cleanup_error=ResultSafetyError("CLEANUP_REFUSED", "unsafe")
-            )
-            record = _GoalRecord(goal, (goal.get_goal_id().id, 1, index))
-            record.prepared_launch = prepared_launch(transaction=transaction)
-            record.accepted = accepted
-            with server._lock:
-                server._active = record
-                server._claim_terminal_locked(record)
+        server = ReconstructActionServer(
+            action_name="test_cleanup_legality_accepted",
+            command_builder=lambda goal: prepared_launch(transaction=transaction),
+            worker_timeout_sec=1.0,
+            term_grace_sec=0.1,
+            controller_factory=controller.factory,
+            action_server_factory=FakeActionServer,
+        )
+        goal = FakeGoalHandle("cleanup-legality-accepted")
+        FakeActionServer.of(server).goal_cb(goal)
+        self.wait_events(goal, 1)
+        controller.finish("worker_exit", 2, elapsed=1.25)
+        self.assertEqual([event[0] for event in goal.events], ["accepted", "aborted"])
+        self.assertEqual(goal.events[-1][1].error_code, ReconstructSegmentResult.IO_ERROR)
+        self.assertAlmostEqual(goal.events[-1][1].wall_time.to_sec(), 1.25)
+        self.assertEqual(transaction.cleanup_calls, 1)
+        self.assertFalse(server.is_busy())
 
-            server._perform_terminal_transition(
-                record,
-                "canceled",
-                _result(ReconstructSegmentResult.CANCELLED, "cancelled", 1.25),
-                "cancelled",
-            )
+        # Never accepted: cancelled while the launch is being prepared, so the prepared
+        # staging must be cleaned and is refused. The server picks rejected for PENDING
+        # and canceled for RECALLING (actionlib would also accept rejected for RECALLING).
+        for index, (status, expected_method) in enumerate((
+            (GoalStatus.PENDING, "rejected"),
+            (GoalStatus.RECALLING, "canceled"),
+        )):
+            with self.subTest(status=status):
+                controller = FakeController()
+                transaction = FakeResultTransaction(
+                    cleanup_error=ResultSafetyError("CLEANUP_REFUSED", "unsafe")
+                )
+                entered = threading.Event()
+                release = threading.Event()
 
-            self.assertEqual([event[0] for event in goal.events], [expected_method])
-            self.assertEqual(goal.events[0][1].error_code, ReconstructSegmentResult.IO_ERROR)
-            self.assertAlmostEqual(goal.events[0][1].wall_time.to_sec(), 1.25)
-            self.assertEqual(transaction.cleanup_calls, 1)
-            self.assertFalse(server.is_busy())
+                def builder(_goal, transaction=transaction, entered=entered, release=release):
+                    entered.set()
+                    self.assertTrue(release.wait(2.0))
+                    return prepared_launch(transaction=transaction)
+
+                server = ReconstructActionServer(
+                    action_name=f"test_cleanup_legality_{index}",
+                    command_builder=builder,
+                    worker_timeout_sec=1.0,
+                    term_grace_sec=0.1,
+                    controller_factory=controller.factory,
+                    action_server_factory=FakeActionServer,
+                )
+                goal = FakeGoalHandle(f"cleanup-legality-{index}", status=status)
+                FakeActionServer.of(server).goal_cb(goal)
+                self.assertTrue(entered.wait(1.0))
+                FakeActionServer.of(server).cancel_cb(goal)
+                release.set()
+                self.wait_events(goal, 1)
+                self.assertEqual([event[0] for event in goal.events], [expected_method])
+                self.assertEqual(goal.events[0][1].error_code, ReconstructSegmentResult.IO_ERROR)
+                self.assertEqual(transaction.cleanup_calls, 1)
+                self.assertEqual(controller.start_calls, 0)
+                self.wait_until_idle(server)
 
     def test_recalling_nonowned_contender_fallback_returns_cancelled(self):
         controller = FakeController()
         server = self.server(controller)
         active = FakeGoalHandle("owned-active")
-        server._goal_callback(active)
+        FakeActionServer.of(server).goal_cb(active)
         self.wait_events(active, 1)
         contender = FailingGoalHandle(
             "recalling-contender",
@@ -2486,7 +2386,7 @@ class ReconstructActionServerTest(unittest.TestCase):
             status=GoalStatus.RECALLING,
         )
 
-        server._goal_callback(contender)
+        FakeActionServer.of(server).goal_cb(contender)
 
         self.assertEqual([event[0] for event in contender.events], ["canceled"])
         self.assertEqual(
@@ -2518,7 +2418,7 @@ class ReconstructActionServerTest(unittest.TestCase):
             action_server_factory=FakeActionServer,
         )
         goal = FakeGoalHandle("shutdown-refused-cleanup")
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.assertTrue(entered.wait(1.0))
         shutdown_errors = []
         shutdown_thread = threading.Thread(
@@ -2560,7 +2460,7 @@ class ReconstructActionServerTest(unittest.TestCase):
             action_server_factory=FakeActionServer,
         )
         goal = FakeGoalHandle("shutdown-builder-failure")
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.assertTrue(entered.wait(1.0))
         shutdown_errors = []
 
@@ -2614,7 +2514,7 @@ class ReconstructActionServerTest(unittest.TestCase):
             worker_timeout_sec=9.5,
             set_worker_timeout=True,
         )
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1, timeout=3.0)
         self.assertEqual(len(builder_calls), 1)
         self.assertEqual(builder_calls[0]["image_resolution"], 128)
@@ -2646,7 +2546,7 @@ class ReconstructActionServerTest(unittest.TestCase):
             worker_timeout_sec=9.5,
             set_worker_timeout=True,
         )
-        server._goal_callback(goal)
+        FakeActionServer.of(server).goal_cb(goal)
         self.wait_events(goal, 1, timeout=3.0)
         self.assertEqual(goal.events[0][0], "rejected")
         self.assertEqual(

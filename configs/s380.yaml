@@ -6,7 +6,7 @@ time_offset_ms: 40
 # T_BC maps optical camera coordinates into body coordinates.
 # Translation m: [0.056558, -0.006717, -0.077751]
 # Quaternion xyzw: [-0.494176, 0.506142, -0.498990, 0.500618]
-# Matrix generated from the normalized quaternion; see docs/INPUTS.md.
+# Matrix generated from the normalized quaternion; see recon/docs/INPUTS.md.
 body_from_camera:
   - [-0.010342453239346627, -0.0006397069548152445, 0.9999463107767356, 0.056558]
   - [-0.9998541643207508, 0.013597179995076897, -0.010332801490130883, -0.006717]

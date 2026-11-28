@@ -1,4 +1,5 @@
 """CPU regression tests for V1.0 window planning and the shared Omega adapter."""
+
 import json
 from pathlib import Path
 import sys
@@ -27,9 +28,13 @@ def test_1200_frames():
     windows = plan_windows(range(1200))
     expected = [dict(id='K000', idx=list(range(40)), new=list(range(40)))]
     for start in range(30, 1171, 30):
-        expected.append(dict(id=f'K{len(expected):03d}',
-                             idx=list(range(start, min(start + 40, 1200))),
-                             new=list(range(start + 10, min(start + 40, 1200)))))
+        expected.append(
+            dict(
+                id=f'K{len(expected):03d}',
+                idx=list(range(start, min(start + 40, 1200))),
+                new=list(range(start + 10, min(start + 40, 1200))),
+            )
+        )
     assert windows == expected
     assert windows[-1]['new'] == list(range(1180, 1200))
     assert [i for win in windows for i in win['new']] == list(range(1200))
@@ -58,15 +63,20 @@ def test_shared_inference_contract(tmp_path, monkeypatch, custom_source):
     def inference(actual_model, images, device):
         assert actual_model is model and device == 'cuda'
         n = len(images)
-        result.update(depth=np.ones((n, 2, 4, 1), np.float32),
-                      depth_conf=np.ones((n, 2, 4), np.float32),
-                      extrinsic=np.tile(np.eye(4, dtype=np.float32)[:3], (n, 1, 1)),
-                      intrinsic=np.tile(np.eye(3, dtype=np.float32), (n, 1, 1)),
-                      additional_array=np.arange(n))
+        result.update(
+            depth=np.ones((n, 2, 4, 1), np.float32),
+            depth_conf=np.ones((n, 2, 4), np.float32),
+            extrinsic=np.tile(np.eye(4, dtype=np.float32)[:3], (n, 1, 1)),
+            intrinsic=np.tile(np.eye(3, dtype=np.float32), (n, 1, 1)),
+            additional_array=np.arange(n),
+        )
         return result.copy()
 
-    monkeypatch.setitem(sys.modules, 'reconstruct_omega', SimpleNamespace(
-        load_model=load_model, load_and_preprocess_images=preprocess, run_inference=inference))
+    monkeypatch.setitem(
+        sys.modules,
+        'reconstruct_omega',
+        SimpleNamespace(load_model=load_model, load_and_preprocess_images=preprocess, run_inference=inference),
+    )
     monkeypatch.setattr(sys, 'path', sys.path.copy())
     settings = dict(weights='weights.pt', resolution=[4, 2], first_window=4, new_frames=3, overlap=1)
     if custom_source:
@@ -92,6 +102,7 @@ def test_shared_inference_contract(tmp_path, monkeypatch, custom_source):
 
 def test_cli_resolves_omega_source(tmp_path, monkeypatch):
     import recon.cli as cli
+
     config = tmp_path / 'scene.yaml'
     config.write_text('manifest: frames.json\noutput: out\ndepth:\n  omega_source: omega\n  weights: model.pt\n')
     captured = {}

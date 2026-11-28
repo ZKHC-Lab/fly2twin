@@ -29,6 +29,7 @@ from .warm_worker_pool import (
     WarmWorkerPool,
     WarmWorkerUnavailableError,
 )
+from ._common import signal_group as _signal_group
 
 
 class BusyError(RuntimeError):
@@ -741,14 +742,6 @@ def _positive_finite(value: float) -> bool:
     except (TypeError, ValueError, OverflowError):
         return False
     return number > 0.0 and number != float("inf")
-
-
-def _signal_group(process_group: int, sig: signal.Signals) -> None:
-    """向进程组发信号；组不存在时静默忽略。"""
-    try:
-        os.killpg(process_group, sig)
-    except ProcessLookupError:
-        pass
 
 
 def _group_exists(process_group: int) -> bool:

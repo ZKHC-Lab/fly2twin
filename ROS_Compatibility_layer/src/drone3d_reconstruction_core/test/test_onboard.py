@@ -63,7 +63,8 @@ class OnboardTests(unittest.TestCase):
             ext=dict(translation=[.056558,-.006717,-.077751],rotation=Rotation.from_quat([-.494176,.506142,-.498990,.500618]).as_matrix().tolist())
             win=dict(window_id=0,source=dict(body_from_camera=ext,prediction_uri=str(pred),frame_ids=['source0'],timestamps_ns=[123]),alignment=dict(depth_scale=2.,intrinsics=K.tolist(),merge_frame_indices=[0]),selected=[(0,0)])
             result=(np.array([[1.,2.,3.]]),np.array([[1.,0.,0.]]),{},[row],[win])
-            with patch('drone3d_reconstruction_core.continuous_web._formal_records_for',return_value=[]), patch('drone3d_onboard.export.fuse_session',return_value=result):
+            window_dir=records/sid/'window-0000'; window_dir.mkdir(parents=True); (window_dir/'provenance.json').write_text('{}')
+            with patch('drone3d_reconstruction_core.continuous_web._formal_records_for',return_value=[{'window_index':0}]), patch('drone3d_onboard.export.fuse_session',return_value=result):
                 manifest=export_session(records,sid,root/'delivery',capture)
                 with self.assertRaises(FileExistsError):export_session(records,sid,root/'delivery',capture)
                 export_session(records,sid,root/'plain',capture,revisit=False)
@@ -73,7 +74,23 @@ class OnboardTests(unittest.TestCase):
                     raise OSError(28,'No space left on device')
                 with patch('drone3d_onboard.export.dump',side_effect=half_written), self.assertRaises(OSError):
                     export_session(records,sid,root/'interrupted',capture)
+                # Retention would delete a delivery written into the session's own data.
+                for inside in (backend/'delivery', records/sid/'delivery'):
+                    with self.assertRaisesRegex(ValueError, "session's own data"):
+                        export_session(records,sid,inside,capture)
+                    self.assertFalse(inside.exists())
+                other=root/'g4'/('s'+'b'*32)/'delivery'  # another session's data
+                with self.assertRaisesRegex(ValueError, 'reclaimable session storage'):
+                    export_session(records,sid,other,capture)
+                self.assertFalse(other.exists())
             self.assertFalse((root/'interrupted/manifest.json').exists())
+            # The source session records its latest complete export; a failed one leaves it alone.
+            from drone3d_reconstruction_core.storage_retention import export_marker_path, verified_export
+            marker = json.loads(export_marker_path(root, sid).read_text())
+            self.assertEqual(marker['delivery'], str((root/'plain').resolve()))
+            self.assertEqual(marker['manifest_sha256'], digest(root/'plain/manifest.json'))
+            self.assertTrue(verified_export(root, sid))
+            self.assertEqual(marker['window_count'], 1)
             self.assertEqual(json.loads((root/'delivery/manifest.json').read_text())['hashes'],manifest['hashes'])
             self.assertFalse((root/'delivery/manifest.json.tmp').exists())
             self.assertEqual(manifest['pose_time_offset_stage'],'capture')
@@ -86,6 +103,41 @@ class OnboardTests(unittest.TestCase):
             with np.load(root/'delivery/windows/000000.npz') as data:np.testing.assert_allclose(data['frame_depth_scale'],[2.*np.exp(.02)],rtol=1e-15)
             with np.load(root/'plain/windows/000000.npz') as data:np.testing.assert_array_equal(data['frame_depth_scale'],[2.])
             with np.load(root/'plain/poses.npz') as data:self.assertNotIn('revisit_log_scale',data.files)
+
+    def test_export_makes_every_created_directory_entry_durable_before_the_marker(self):
+        import cv2, json
+        from unittest.mock import patch
+        from scipy.spatial.transform import Rotation
+        import drone3d_onboard.export as export
+        import drone3d_reconstruction_core.storage_retention as retention
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); records=root/'sessions'; sid='s'+'a'*32
+            backend=root/'g4'/sid; backend.mkdir(parents=True)
+            (backend/'backend_profile.json').write_text(json.dumps({'frame_pose':{'pose_time_offset_ms':40.,'pose_time_offset_stage':'capture'}}))
+            capture=root/'capture.yaml'; capture.write_text('pose_time_offset_ms: 40.0\n')
+            image=root/'image.png'; cv2.imwrite(str(image),np.full((720,1280,3),127,np.uint8))
+            pred=root/'pred.npz'; np.savez(pred,depth=np.ones((1,16,16,1)),depth_conf=np.ones((1,16,16)))
+            K=np.array([[900.,0,640],[0,900,360],[0,0,1.]])
+            row=dict(frame_id='source0',timestamp_ns=123,image_path=str(image),c2w=np.eye(4),K=K,camera_info={'K':K.ravel().tolist(),'D':[0.]*5,'width':1280,'height':720},revisit_log_scale=.02)
+            ext=dict(translation=[.056558,-.006717,-.077751],rotation=Rotation.from_quat([-.494176,.506142,-.498990,.500618]).as_matrix().tolist())
+            win=dict(window_id=0,source=dict(body_from_camera=ext,prediction_uri=str(pred),frame_ids=['source0'],timestamps_ns=[123]),alignment=dict(depth_scale=2.,intrinsics=K.tolist(),merge_frame_indices=[0]),selected=[(0,0)])
+            result=(np.array([[1.,2.,3.]]),np.array([[1.,0.,0.]]),{},[row],[win])
+            window_dir=records/sid/'window-0000'; window_dir.mkdir(parents=True); (window_dir/'provenance.json').write_text('{}')
+            log=[]
+            real_sync, real_marker = export._fsync_path, retention.write_export_marker
+            def sync(path):
+                log.append(('fsync', str(path))); real_sync(path)
+            def marker(*args):
+                log.append(('marker',)); return real_marker(*args)
+            delivery=root/'new'/'deep'/'delivery'  # export creates new/, new/deep/ and delivery/
+            with patch('drone3d_reconstruction_core.continuous_web._formal_records_for',return_value=[{'window_index':0}]), \
+                 patch('drone3d_onboard.export.fuse_session',return_value=result), \
+                 patch.object(export,'_fsync_path',sync), patch.object(retention,'write_export_marker',marker):
+                export.export_session(records,sid,delivery,capture)
+            synced_before_marker={entry[1] for entry in log[:log.index(('marker',))] if entry[0]=='fsync'}
+            # The entry of each new directory lives in its parent; all of them must be on disk.
+            for parent in (root, root/'new', root/'new'/'deep'):
+                self.assertIn(str(parent), synced_before_marker)
 
     def test_session_skips_frames_without_localization(self):
         from types import SimpleNamespace

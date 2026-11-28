@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Per-training-camera right-composed translation and continuous 6D rotation."""
+
 import torch
 import torch.nn.functional as F
 

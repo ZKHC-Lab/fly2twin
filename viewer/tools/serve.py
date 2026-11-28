@@ -1,4 +1,5 @@
 """Loopback-only, no-store static server for demo cache sites (standard library)."""
+
 import argparse
 import functools
 import http.server

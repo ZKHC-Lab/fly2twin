@@ -29,15 +29,16 @@ max_image_height: 480
 pose_max_delta_ms: 50.0
 odometry_association: "interpolate"
 pose_interpolation_wait_ms: 500.0
-# Opt-in dense-LIO offset. Onboard v1 uses +40 with the continuous profile's
-# pose_time_offset_stage: capture; 0 preserves old snapshot behavior.
+# Pose lookup at RGB time + this offset (ms), applied at capture. The NX bench and
+# bag replay profiles use +40 with the continuous profile's
+# pose_time_offset_stage: capture; 0 = no shift.
 pose_time_offset_ms: 0.0
 # Motion keyframes (needs interpolate): a sampled frame is written only after the
 # body moved keyframe_min_translation_m or turned keyframe_min_rotation_deg since
 # the last written frame, or after keyframe_max_interval_sec (hover). Both
-# thresholds 0 disables the gate. Used with g4_placement frame_pose so every
-# window spans enough motion for its depth scale. Indoor 0.3 m / 12 deg / 2 s;
-# outdoor (faster flight) 0.5 m / 12 deg / 2 s.
+# thresholds 0 disables the gate. Frames are first sampled uniformly in time at
+# the goal sample rate. The bag replay profile uses 0.15 m / 8 deg / 2 s; the NX
+# bench profile leaves the gate off.
 keyframe_min_translation_m: 0.0
 keyframe_min_rotation_deg: 0.0
 keyframe_max_interval_sec: 2.0

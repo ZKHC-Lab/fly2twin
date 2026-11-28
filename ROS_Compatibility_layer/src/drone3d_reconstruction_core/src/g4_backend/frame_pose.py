@@ -1,8 +1,8 @@
-"""Per-frame external-pose placement: VGGT supplies depth and a window scale only.
+"""Per-frame external-pose placement with window or per-frame depth scales.
 
-Each frame is placed with the localization camera pose at its RGB time. The
-window's VGGT depth (local gauge units) is converted to metres by one scale per
-window, solved as a log-scale least-squares problem over two constraint types:
+Each frame is placed with its localization camera pose. The window's VGGT depth
+(local gauge units) is converted to metres using scales solved in the log domain.
+The window-scale solver uses:
 
 * trajectory prior: the window's VGGT camera centres are rotated by the mean
   localization/VGGT orientation difference, then fitted to the localization
@@ -14,7 +14,9 @@ window, solved as a log-scale least-squares problem over two constraint types:
   not needed for a scale; it also rejected several indoor seams that the depth
   ratio handled.
 
-The numerics live in ``recon_core.scale`` and are shared with the offline pipeline.
+Optional frame-pair rows link depths across views. With ``frame_scales``, the
+backend solves per-frame deviations as well as window scales.
+The numerics live in ``recon_core.scale``; the offline pipeline uses window scales.
 
 Windows in a component without any trajectory prior have no metric scale and
 stay pending. Experiment basis (testflight3 indoor, flight-out2 outdoor):
@@ -36,8 +38,7 @@ class FramePoseConfig:
     min_extent_m: float = 0.3
     extent_weight_cap: float = 2.0
     edge_weight: float = 3.0
-    # Localization pose is taken at RGB time + offset (camera timestamps lag the
-    # odometry clock on the D435i/FAST-LIO rig: +70 ms indoor, +80 ms outdoor).
+    # Localization pose is sampled at RGB time + offset in the selected stage.
     pose_time_offset_ms: float = 0.0
     pose_time_offset_stage: str = "backend"
     max_pose_gap_ms: float = 500.0

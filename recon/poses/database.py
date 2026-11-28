@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 import numpy as np
+
 MAX_IMAGE_ID = 2147483647
+
 
 def points(db):
     result = {}
@@ -17,8 +19,7 @@ def matches(db, table, keypoints):
     for pair_id, rows, cols, blob in db.execute(f'SELECT pair_id,rows,cols,data FROM {table}'):
         a, b = divmod(pair_id, MAX_IMAGE_ID)
         arr = np.frombuffer(blob or b'', np.uint32).reshape(rows, cols)
-        if cols != 2 or (rows and ((arr[:, 0] >= len(keypoints[a])).any()
-                                  or (arr[:, 1] >= len(keypoints[b])).any())):
+        if cols != 2 or (rows and ((arr[:, 0] >= len(keypoints[a])).any() or (arr[:, 1] >= len(keypoints[b])).any())):
             raise ValueError(f'Invalid indices in {table}, pair {pair_id}')
         result[pair_id] = arr
     return result

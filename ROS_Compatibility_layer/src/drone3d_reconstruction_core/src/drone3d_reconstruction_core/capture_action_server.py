@@ -33,6 +33,7 @@ import rospy
 from sensor_msgs.msg import CameraInfo, Image
 from tf2_msgs.msg import TFMessage
 
+from .action_terminal import TerminalCall, converge_terminal, query_goal_status
 from .capture_handoff import ImageHandoff, consecutive, stamp_ns
 
 from drone3d_reconstruction_msgs.msg import (
@@ -86,11 +87,12 @@ class _CaptureRecord:
     handle: Any
     # actionlib GoalHandle：接受/拒绝目标、发布反馈、执行终态过渡的
     # 唯一通道。注意取消回调拿到的 handle 可能是重新包装后的对象，
-    # 身份比对一律走 ``key`` 而非 ``is``（见 _cancel_callback）。
+    # 身份比对一律走 ``goal_id`` 而非 ``is``（见 _cancel_callback）。
 
-    key: tuple[str, int, int]
-    # 目标身份键 ``(goal_id.id, stamp.secs, stamp.nsecs)``（由 _goal_key
-    # 提取）：用于取消请求的按 id 比对以及终态日志定位。
+    goal_id: str | None
+    # actionlib 目标号（``get_goal_id().id``）：取消请求按它比对，终态日志用它定位。
+    # 在 goal 回调里、服务端锁外读出缓存：get_goal_id 要拿 actionlib 的锁，服务端锁内
+    # 不调用句柄方法。读不到时为 None。
 
     # -- 配置与校验结果 -------------------------------------------
 
@@ -560,7 +562,7 @@ class CaptureActionServer:
 
     def _goal_callback(self, goal_handle: Any) -> None:
         """新目标回调：单槽位仲裁（忙/关闭 → 预接受拒绝）。"""
-        record = _CaptureRecord(goal_handle, _goal_key(goal_handle))
+        record = _CaptureRecord(goal_handle, _goal_id(goal_handle))
         rejection = None
         try:
             initial_status = goal_handle.get_goal_status().status
@@ -617,22 +619,17 @@ class CaptureActionServer:
         永远停在 PREEMPTING。因此这里同时把 session.done 置位，让
         ``_run_goal`` 的等待循环无条件立刻退出并发布 PREEMPTED。
         """
+        # actionlib 传给 cancel 回调的 goal handle 可能不是 goal 回调里保存的
+        # 同一个对象（ActionServer 会重新包一层）；按目标号比对，避免 PAUSE+STOP
+        # 时取消请求被身份比较误拒。读不到目标号时不认领：别的目标的取消不能
+        # 打断当前采集。目标号在服务端锁外读（get_goal_id 要拿 actionlib 的锁）。
+        cancel_id = _goal_id(goal_handle)
         with self._lock:
             record = self._active
             if record is None:
                 return
-            # actionlib 传给 cancel 回调的 goal handle 可能不是 goal 回调
-            # 里保存的同一个对象（ActionServer 会重新包一层）；按 goal_id
-            # 字符串比对目标，避免 PAUSE+STOP 时取消请求被身份比较误拒。
-            def _goal_id_string(handle: Any):
-                goal_id = getattr(handle, "goal_id", None)
-                if callable(goal_id):
-                    goal_id = goal_id()
-                return getattr(goal_id, "id", None)
-
-            record_id = _goal_id_string(record.handle)
-            cancel_id = _goal_id_string(goal_handle)
-            if record_id != cancel_id:
+            record_id = record.goal_id
+            if record_id is None or record_id != cancel_id:
                 rospy.loginfo(
                     "capture cancel ignored: goal id mismatch record=%r cancel=%r",
                     record_id,
@@ -782,16 +779,24 @@ class CaptureActionServer:
         try:
             goal_handle.set_accepted("capture started")
         except BaseException as error:
+            # set_accepted can fail before or after actionlib moved the goal to ACTIVE;
+            # only the status says which, and only an accepted goal may be aborted.
+            status, _ = query_goal_status(goal_handle)
+            accepted = status in (GoalStatus.ACTIVE, GoalStatus.PREEMPTING)
             with self._lock:
-                if self._active is record and not record.terminal_claimed:
+                cancelled = record.cancel_requested
+                if accepted and self._active is record and not record.terminal_claimed:
                     record.accepted = True
                     self._accepted_count += 1
                     record.phase = "active"
+            method = _legal_failure_method(status, accepted, cancelled)
             self._terminalize(
                 record,
-                "aborted",
+                method,
                 _result(
-                    CaptureSegmentResult.INTERNAL_ERROR,
+                    CaptureSegmentResult.CANCELLED
+                    if method == "canceled"
+                    else CaptureSegmentResult.INTERNAL_ERROR,
                     f"failed to accept capture goal: {type(error).__name__}",
                     config=runtime_config,
                 ),
@@ -1091,7 +1096,7 @@ class CaptureActionServer:
         result: CaptureSegmentResult,
         text: str,
     ) -> None:
-        """执行终态过渡：清理未提交事务 → 观察者 → set_<method> → 收敛确认。"""
+        """执行终态过渡：清理未提交事务，再交给共用执行器（观察者 → set_<method> → 确认，至多回退一次）。"""
         with self._lock:
             committed = record.committed
             transaction = record.transaction
@@ -1100,63 +1105,47 @@ class CaptureActionServer:
             try:
                 transaction.cleanup()
             except BaseException as cleanup_error:
-                method = "aborted"
+                status, _ = query_goal_status(record.handle)
+                with self._lock:
+                    accepted = record.accepted
+                    cancelled = record.cancel_requested
+                method = _legal_failure_method(status, accepted, cancelled)
                 result = _result(
                     CaptureSegmentResult.IO_ERROR,
                     f"capture staging cleanup failed: {type(cleanup_error).__name__}",
                     config=self._config,
                 )
                 text = result.message
+
+        def fallback(primary, status, _error):
+            # 原方法在当前状态下仍合法（或状态读不到）就重试原方法；不合法就换成当前状态
+            # 允许的失败方法，否则 actionlib 会再次拒绝、槽位永远占着。
+            method = primary.method
+            if status is not None and status not in _LEGAL_FROM.get(method, ()):
+                with self._lock:
+                    accepted = record.accepted
+                    cancelled = record.cancel_requested
+                method = _legal_failure_method(status, accepted, cancelled)
+            return TerminalCall(method, primary.result, primary.result.message)
+
+        observer = None
         if self._terminal_observer is not None:
-            try:
-                self._terminal_observer(method, result, text)
-            except BaseException:
-                pass  # 观察者异常绝不阻断收敛
-        terminal_error = None
-        try:
-            self._set_goal_terminal(record.handle, method, result, text)
-        except BaseException as error:
-            terminal_error = error
-            rospy.logerr("capture terminal failed: %s", type(error).__name__)
+            def observer(call):
+                self._terminal_observer(call.method, call.result, call.text)
 
-        status, status_error = _query_capture_goal_status(record.handle)
-        if status is not None and _capture_status_is_terminal(status):
-            self._release_terminal(record, method, result)
-            return
-
-        # 第一次终态调用未收敛：用合法回退方法再试一次
-        fallback_method = method
-        fallback_result = result
-        fallback_error = None
-        try:
-            self._set_goal_terminal(
-                record.handle, fallback_method, fallback_result, fallback_result.message
-            )
-        except BaseException as error:
-            fallback_error = error
-
-        fallback_status, fallback_status_error = _query_capture_goal_status(
-            record.handle
+        outcome = converge_terminal(
+            record.handle,
+            TerminalCall(method, result, text),
+            invoke=lambda handle, call: self._set_goal_terminal(
+                handle, call.method, call.result, call.text
+            ),
+            fallback=fallback,
+            observer=observer,
+            log_context=f"capture goal {record.goal_id}",
         )
-        if fallback_status is not None and _capture_status_is_terminal(
-            fallback_status
-        ):
-            self._release_terminal(record, fallback_method, fallback_result)
-            return
-
-        # 除非 actionlib 证明已到终态，否则绝不释放容量。让槽位保持
-        # 占用比在已提交快照仍可能归属 ACTIVE 目标时接受新目标更安全。
-        final_error = (
-            fallback_error
-            or fallback_status_error
-            or status_error
-            or terminal_error
-        )
-        rospy.logerr(
-            "Capture action terminal did not converge for goal %s: %s",
-            record.key[0],
-            type(final_error).__name__ if final_error is not None else "unknown",
-        )
+        # 除非 actionlib 证明已到终态，否则绝不释放容量：已提交快照仍可能归属 ACTIVE 目标。
+        if outcome.converged:
+            self._release_terminal(record, outcome.final_call.method, outcome.final_call.result)
 
     def _release_terminal(self, record, method, result):
         """记录终态摘要并释放槽位、置位完成事件。"""
@@ -1231,41 +1220,61 @@ def _result(
     return result
 
 
-def _reject_goal(goal_handle: Any, result: CaptureSegmentResult) -> None:
-    """预接受拒绝：调用 set_rejected 并吞掉异常。"""
-    try:
-        goal_handle.set_rejected(result, result.message)
-    except BaseException:
-        pass
+def _reject_goal(goal_handle: Any, result: CaptureSegmentResult) -> bool:
+    """拒绝一个没有占到槽位的目标，并确认它到了终态。
 
+    这个目标没有记录，拒绝失败后不会再有别的路径处理它，所以与占槽目标一样交给共用
+    执行器：确认终态，没证实就再试一次（rejected 在当前状态下不合法时换成合法的失败方法）。
+    在服务端锁外调用。
+    """
 
-def _goal_key(goal_handle: Any) -> tuple[str, int, int]:
-    """从目标句柄提取 (goal_id.id, stamp.secs, stamp.nsecs) 身份键。"""
-    try:
-        goal_id = goal_handle.get_goal().goal_id
-        return (str(goal_id.id), int(goal_id.stamp.secs), int(goal_id.stamp.nsecs))
-    except BaseException:
-        return ("unknown", 0, 0)
+    def fallback(primary, status, _error):
+        method = primary.method
+        if status is not None and status not in _LEGAL_FROM[method]:
+            method = _legal_failure_method(status, False, False)
+        return TerminalCall(method, primary.result, primary.result.message)
 
-
-def _query_capture_goal_status(goal_handle):
-    """查询目标状态；异常时返回 (None, error)。"""
-    try:
-        return goal_handle.get_goal_status().status, None
-    except BaseException as error:
-        return None, error
-
-
-def _capture_status_is_terminal(status):
-    """判断状态是否为 actionlib 终态。"""
-    return status in (
-        GoalStatus.PREEMPTED,
-        GoalStatus.SUCCEEDED,
-        GoalStatus.ABORTED,
-        GoalStatus.REJECTED,
-        GoalStatus.RECALLED,
-        GoalStatus.LOST,
+    outcome = converge_terminal(
+        goal_handle,
+        TerminalCall("rejected", result, result.message),
+        invoke=lambda handle, call: getattr(handle, "set_" + call.method)(
+            call.result, call.text
+        ),
+        fallback=fallback,
+        log_context=f"capture contender {_goal_id(goal_handle)}",
     )
+    return outcome.converged
+
+
+def _goal_id(goal_handle: Any) -> str | None:
+    """actionlib 目标号 ``get_goal_id().id``（与重建服务端相同的来源）；读不到时返回 None。"""
+    try:
+        return str(goal_handle.get_goal_id().id)
+    except BaseException:
+        return None
+
+
+# actionlib ServerGoalHandle 各终态方法允许的起始状态（Noetic server_goal_handle.py）。
+_LEGAL_FROM = {
+    "rejected": (GoalStatus.PENDING, GoalStatus.RECALLING),
+    "canceled": (GoalStatus.PENDING, GoalStatus.RECALLING, GoalStatus.ACTIVE, GoalStatus.PREEMPTING),
+    "preempted": (GoalStatus.PENDING, GoalStatus.RECALLING, GoalStatus.ACTIVE, GoalStatus.PREEMPTING),
+    "aborted": (GoalStatus.ACTIVE, GoalStatus.PREEMPTING),
+    "succeeded": (GoalStatus.ACTIVE, GoalStatus.PREEMPTING),
+}
+
+
+def _legal_failure_method(status, accepted: bool, cancel_requested: bool) -> str:
+    """按 actionlib 当前状态选一个合法的失败终态方法（与重建服务端同一取法）。
+
+    ACTIVE/PREEMPTING 或已确认接受 → aborted；RECALLING → canceled；PENDING → 已请求取消
+    则 canceled，否则 rejected；状态读不到且未接受 → 同 PENDING。
+    """
+    if status in (GoalStatus.ACTIVE, GoalStatus.PREEMPTING) or (status is None and accepted):
+        return "aborted"
+    if status == GoalStatus.RECALLING or cancel_requested:
+        return "canceled"
+    return "rejected"
 
 
 def _make_daemon_thread(target, args) -> threading.Thread:

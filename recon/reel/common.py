@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Specification paths and external-program boundary."""
+
 import copy
 import json
 import shutil
@@ -25,4 +26,3 @@ def specification(value):
 
 def resolve(base, path):
     return str((base / Path(path).expanduser()).resolve())
-

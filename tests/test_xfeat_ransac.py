@@ -9,6 +9,7 @@ torch = pytest.importorskip('torch')
 
 class FakeXFeat:
     """Stands in for the user-installed modules.xfeat: fixed synthetic correspondences per pair."""
+
     dev = 'cpu'
 
     def __init__(self, weights, top_k):
@@ -25,7 +26,7 @@ class FakeXFeat:
         rng = np.random.default_rng(matches[b][0] * 1000 + matches[b][1])
         n = 40 + 20 * (matches[b][0] % 5)  # some pairs fall below 8 or 30 inliers
         x = rng.random((n, 2)) * 400
-        y = x + rng.normal(0, .3, (n, 2)) + [3, 1]
+        y = x + rng.normal(0, 0.3, (n, 2)) + [3, 1]
         y[: n // 3] = rng.random((n // 3, 2)) * 400  # outliers
         return torch.from_numpy(np.hstack([x, y]))
 
@@ -37,6 +38,7 @@ def test_parallel_ransac_matches_one_thread(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, 'modules', package)
     monkeypatch.setitem(sys.modules, 'modules.xfeat', package.xfeat)
     from recon.poses.xfeat import match
+
     names = []
     for i in range(12):
         names.append('%02d.png' % i)
@@ -60,14 +62,21 @@ def test_xfeat_source_is_imported(tmp_path, monkeypatch):
     (checkout / 'modules').mkdir(parents=True)
     (checkout / 'modules' / '__init__.py').touch()
     (checkout / 'modules' / 'xfeat.py').write_text(
-        'class XFeat:\n    def __init__(self, weights, top_k):\n        raise RuntimeError("loaded from checkout")\n')
+        'class XFeat:\n    def __init__(self, weights, top_k):\n        raise RuntimeError("loaded from checkout")\n'
+    )
     monkeypatch.delitem(sys.modules, 'modules', raising=False)
     monkeypatch.delitem(sys.modules, 'modules.xfeat', raising=False)
     monkeypatch.setattr(sys, 'path', list(sys.path))
     from recon.poses.xfeat import match
+
     with pytest.raises(RuntimeError, match='loaded from checkout'):
-        match(dict(image_names=[]), tmp_path, np.empty((0, 2), int), tmp_path / 'x.npz',
-              dict(xfeat_weights='unused', xfeat_source=str(checkout)))
+        match(
+            dict(image_names=[]),
+            tmp_path,
+            np.empty((0, 2), int),
+            tmp_path / 'x.npz',
+            dict(xfeat_weights='unused', xfeat_source=str(checkout)),
+        )
 
 
 def test_xfeat_source_conflicting_with_an_imported_checkout_fails(tmp_path, monkeypatch):
@@ -76,13 +85,16 @@ def test_xfeat_source_conflicting_with_an_imported_checkout_fails(tmp_path, monk
         (root / 'modules').mkdir(parents=True)
         (root / 'modules' / '__init__.py').touch()
         (root / 'modules' / 'xfeat.py').write_text(
-            'class XFeat:\n    def __init__(self, weights, top_k):\n        raise RuntimeError("%s")\n' % name)
+            'class XFeat:\n    def __init__(self, weights, top_k):\n        raise RuntimeError("%s")\n' % name
+        )
         return root
+
     first, second = checkout('first'), checkout('second')
     monkeypatch.delitem(sys.modules, 'modules', raising=False)
     monkeypatch.delitem(sys.modules, 'modules.xfeat', raising=False)
     monkeypatch.setattr(sys, 'path', list(sys.path))
     from recon.poses.xfeat import match
+
     arguments = dict(image_names=[]), tmp_path, np.empty((0, 2), int), tmp_path / 'x.npz'
     with pytest.raises(RuntimeError, match='first'):
         match(*arguments, dict(xfeat_weights='unused', xfeat_source=str(first)))
@@ -93,6 +105,12 @@ def test_xfeat_source_conflicting_with_an_imported_checkout_fails(tmp_path, monk
 
 def test_xfeat_source_without_module_fails(tmp_path):
     from recon.poses.xfeat import match
+
     with pytest.raises(FileNotFoundError, match='pose.xfeat_source has no modules/xfeat.py: ' + str(tmp_path)):
-        match(dict(image_names=[]), tmp_path, np.empty((0, 2), int), tmp_path / 'x.npz',
-              dict(xfeat_weights='unused', xfeat_source=str(tmp_path)))
+        match(
+            dict(image_names=[]),
+            tmp_path,
+            np.empty((0, 2), int),
+            tmp_path / 'x.npz',
+            dict(xfeat_weights='unused', xfeat_source=str(tmp_path)),
+        )

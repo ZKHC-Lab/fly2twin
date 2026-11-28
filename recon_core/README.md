@@ -1,7 +1,7 @@
 # recon_core
 
 机载端（ROS，Python 3.8）和离线端（Python 3.10）共用的数值核心，只依赖 NumPy / SciPy；读 RGB 时才导入 OpenCV。
-约定：位姿是相机到世界的 4×4 矩阵（OpenCV 光轴：右、下、前），世界系为米制、Z 轴向上，深度是沿光轴的米制 z。
+约定：位姿是相机到世界的 4×4 矩阵（OpenCV 光轴：右、下、前），世界系为米制、Z 轴向上，深度是沿光轴的米制 z。手机视频例外：“米”来自相机高度 1.4 m 的假设，上方是拟合的地面法向，不是 Z。
 
 | 模块 | 内容 |
 | --- | --- |
@@ -24,20 +24,11 @@
 | 一致性 | \|log 深度比\| < 0.03 计为支持；支持数 ≥ min(2, 可见视角数)；0.3 m < 深度 < 4 m；步长 2 |
 | 体素 | 2 cm 起；点数超过上限时按 max(1.1, (点数/上限)^(1/3)) 放大，从 2 cm 点云重新降采样 |
 
-## 来源与等价性
+## 实现
 
-由三份实现合并而来：离线包 `dronerecon` 的 fusion/scale、G4 逐帧位姿放置 `g4_backend/frame_pose.py`、`drone3d_onboard/fusion.py`。合并时统一了一处差异：G4 在线版计算共享帧深度比时取置信度 ≥ 中位数的像素，现与离线版一致取 > 中位数；真实 VGGT 置信度没有重复值，每帧最多相差一个像素。体素降采样用 NumPy 实现，网格原点与 Open3D 相同（min − 体素/2），输出按体素字典序排列；三维体素编号合成一个 int64 键后排序、用 bincount 累加（每轴编号 < 2^21，超出时退回逐行 unique），与逐行 unique + add.at 的旧实现逐位相同（`tests/test_fusion.py`）。
+体素降采样用 NumPy 实现，网格原点为 min − 体素/2，输出按体素字典序排列。
 
 融合按帧拆成 `frame_points`（单帧多视一致性检查后的点）、`frame_image` / `frame_colors`（颜色）和 `cloud_from_frames`（2 cm 体素与自适应放大）；`colored_cloud` 依次调用它们。机载在线点云用这些函数做按帧增量（`drone3d_onboard.session.SessionFusion`）。
-
-已验证（2026-10-29，无人机 V1.0 参考输入：670 帧、23 个窗口、512×288）：
-
-| 项目 | 结果 |
-| --- | --- |
-| 窗口尺度、逐帧尺度、轨迹拟合、相邻边 | 与 dronerecon 逐位相同 |
-| 深度缓存、单帧掩码 | 逐位相同 |
-| 融合点云 | 2 cm 点数 2,732,886、最终 848,586 点、体素 0.03383419681295737 m；按坐标排序后 XYZ / RGB（float32）逐位相同 |
-| CPU 融合耗时 | 136 s（4 线程）；2026-11-03 体素降采样改为整数键后 78 s，点数、体素与按坐标排序后的 XYZ / RGB 仍与上表逐位相同 |
 
 ## 回访约束
 
@@ -63,7 +54,8 @@
 - 各帧修正量的绝对值中位数 0.6–1.4%，最大 5–12%。
 - 用时是台式机（6 线程，空闲）测的。office_gs_03 的 57 s 里，取成员点约 14 s，匹配和求解约 44 s（每个窗口每轮要对其他窗口的点建一次最近邻树）。NX 上未测。
 - 产品路径复核：office_gs_04 的机载记录用 `drone3d_onboard.export` 重新导出，`cloud.ply` 为 864,610 点、体素 4.59 cm，用 `recon lidar-distance` 评测为 P50 3.02 / P90 7.32 cm、5 cm 内 81.1%（原交付 880,636 点、4.86 cm、3.32 / 11.17 cm、71.5%）。同一台机器同样状态下，整个导出不开这一步 581 s，开启 863 s；不开时的 `cloud.ply` 与原交付逐字节相同。离线一侧，office_gs_04 落地 BA 的运行目录用 `recon.pipeline.fuse` 加 `fusion.revisit: true` 重做融合阶段，`initial.npz` 为 839,215 点、体素 4.09 cm，评测为 P50 2.73 / P90 4.65 cm、5 cm 内 91.4%（原结果 850,318 点、2.92 / 6.77 cm、84.1%）；融合阶段共 702 s，其中这一步 347 s。
-- 结果表的来源（2026-11-20）：同一份机载记录先用现行代码按逐帧尺度重解地图，再导出。不开这一步 `cloud.ply` 为 870,700 点、P50 3.06 / P90 8.31 cm、5 cm 内 79.4%，与 [机载文档](../ROS_Compatibility_layer/src/drone3d_reconstruction_core/docs/ONBOARD_V1.md) 里逐帧尺度的数字相同；开启为 867,172 点、体素 4.38 cm、P50 2.92 / P90 6.14 cm、5 cm 内 85.7%，这是开源说明结果表里机载一行的 2.9 / 6.1 cm。落地 BA 一行的 2.7 / 4.7 cm 是上一条里离线融合的 2.73 / 4.65 cm。这份记录的窗口是 10 帧共享，现行采集配置是 5 帧共享，没有用新配置重新采过。
+- 结果表的来源（2026-11-20）：同一份机载记录先用现行代码按逐帧尺度重解地图，再导出。不开这一步 `cloud.ply` 为 870,700 点、P50 3.06 / P90 8.31 cm、5 cm 内 79.4%，与 [机载文档](../ROS_Compatibility_layer/src/drone3d_reconstruction_core/docs/ONBOARD_V1.md) 里逐帧尺度的数字相同；开启为 867,172 点、体素 4.38 cm、P50 2.92 / P90 6.14 cm、5 cm 内 85.7%，这是 11-20 到 11-23 之间开源说明结果表里机载一行的 2.9 / 6.1 cm。落地 BA 一行的 2.7 / 4.7 cm 是上一条里离线融合的 2.73 / 4.65 cm。这份记录的窗口是 10 帧共享，现行采集配置是 5 帧共享，没有用新配置重新采过。
+- 结果表机载一行的现行来源（2026-11-23）：用现行配置（40 帧窗、5 帧共享）把 office_gs_04 整段回放，100 个窗口全部成功，导出的 `cloud.ply` 为 865,875 点、体素 4.32 cm，P50 2.89 / P90 6.03 cm、5 cm 内 86.1%。
 
 **边界**（已知，未解决）：
 
@@ -85,6 +77,4 @@ ROS 构建通过 `ROS_Compatibility_layer/src/drone3d_reconstruction_core/src/re
 
 ## 证据索引
 
-- 无人机参考输入的对比脚本与结果：Data/experiments/restructure_20261029/m1_e1_equivalence.py、m1_e1_equivalence.json；2026-11-03 体素提速复验 Data/experiments/onboard_20261103/e1_fuse_equivalence.py 与 jobs/e1-fuse-eq/out.log
-- 无人机参考输出：open_release_repo/outputs/equivalence/e1/（原离线包仓库的验收输出）
 - 回访约束：Data/experiments/whitebox_20261112/ 的 REPORT.md（“不用学习，按窗口对齐”起的各节）、window_align_delivery.py（模式 core）、jobs/core-check/out.log、runs/wa_real/core_*.json、export_check/（产品路径导出与评测）；各采集的雷达图在 Data/experiments/capture_gap_20261112/map_0{1,2,3}.npz、whitebox_20261112/runs/wa_real/map_ctrl_wall_01.npz、promo_20261029/lidar_eval/lidar_reference_clean.npz

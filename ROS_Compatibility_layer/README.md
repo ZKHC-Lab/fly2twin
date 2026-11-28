@@ -1,10 +1,10 @@
 # ROS 兼容层
 
-ROS1 Noetic / catkin 工作空间，无人机机载端的连续重建：相机采集与运动关键帧 → 快照封存 → 分窗 VGGT-Omega 推理 → 后台放置与尺度求解 → 增量多视融合点云 → Web 查看；落地后导出交付包并做全局 BA。
+ROS1 Noetic / catkin 工作空间，无人机机载端的连续重建：相机采集（按时间均匀取样，可选运动关键帧） → 快照封存 → 分窗 VGGT-Omega 推理 → 后台放置与尺度求解 → 增量多视融合点云 → Web 查看。落地后可手动导出交付包；全局 BA 只有手动入口，没有启动文件调用。
 
-当前主线用逐帧位姿放置（`g4_placement: frame_pose`）：每帧按位姿来源给出的相机位姿放置，VGGT 提供深度，后台求窗口尺度和逐帧尺度。每窗 40 个关键帧，其中 5 个与上一窗共享，推理长边 384。配置见[机载融合、交付包与落地全局 BA](src/drone3d_reconstruction_core/docs/ONBOARD_V1.md)。
+当前主线用逐帧位姿放置（`g4_placement: frame_pose`）：每帧按里程计给出的相机位姿放置，VGGT 提供深度，后台求尺度。尺度默认每窗一个（模板 `g4_frame_scales: false`）；NX 台架和 bag 回放配置开了逐帧尺度（`g4_frame_scales: true`）。每窗帧数：NX 台架 16，bag 回放 40，都与上一窗共享 5 帧；推理长边 384。配置见[机载融合、交付包与落地全局 BA](src/drone3d_reconstruction_core/docs/ONBOARD_V1.md)。
 
-逐帧位姿放置是唯一的放置方式；早期的图配准（每窗一个 Sim(3)）和长窗分组已删除，见 [G4 接入](src/drone3d_reconstruction_core/docs/G4_INTEGRATION.md)。后台完成求解后原子更新历史窗口。
+逐帧位姿放置是唯一的放置方式；早期的图配准（每窗一个 Sim(3)）和长窗分组已删除，代码可从提交 `f0c0aa3` 恢复。后台完成求解后原子更新历史窗口。
 
 ## 目录
 
@@ -17,9 +17,6 @@ ROS1 Noetic / catkin 工作空间，无人机机载端的连续重建：相机�
 
 - [模块边界与安装](docs/ARCHITECTURE.md)
 - [环境与部署边界](docs/ENVIRONMENT.md)
-- [G4 算法基线与移植规范](docs/G4_BASELINE_SPEC.md)
-- [长窗分组(100/120 与尾窗规则)](docs/LONG_WINDOW_GROUPING.md)
-- [3DGS 离线重建(位姿精化、初始点云、评测)](docs/GS_OFFLINE_RECONSTRUCTION.md)
 - [机体→相机外参(2026-10-23 重标与验证)](docs/CAMERA_EXTRINSIC.md)
 - 核心包文档:[机载融合与交付包](src/drone3d_reconstruction_core/docs/ONBOARD_V1.md)、[G4 接入](src/drone3d_reconstruction_core/docs/G4_INTEGRATION.md)、[NX 台架启动](src/drone3d_reconstruction_core/docs/NX_BRINGUP.md)
 - 其他模块:[drone3d_runtime](src/drone3d_runtime/README.md)
@@ -49,7 +46,7 @@ bash src/drone3d_reconstruction_core/scripts/nx_step2_bringup.sh
 ```
 
 顺序：roscore → Livox → FAST-LIO → RealSense → TF → 生产栈；不启动飞控或桨叶。
-一键脚本的生产栈按台架配置运行：640×480、16 帧窗、逐帧位姿放置，NX 实机未验证。机载主线的完整配置见 [机载融合与交付包](src/drone3d_reconstruction_core/docs/ONBOARD_V1.md) 第 1 节，只在 bag 回放中验证过。
+一键脚本的生产栈按台架配置运行：RealSense 640×480@15；取帧、分窗、尺度和放置与 bag 回放配置相同（运动关键帧 0.15 m / 8° / 2 s、40 帧窗共享 5 帧、逐帧尺度、逐帧位姿放置，2026-11-25 对齐）；这套配置在 NX 实机上未运行过（`nx_step2_bringup.sh:7-8`）。各项取值见 [机载融合与交付包](src/drone3d_reconstruction_core/docs/ONBOARD_V1.md) 第 1 节。
 外部里程计用 `--external-odom /Odometry`，同时禁用 Livox 加 `--no-livox`；关闭 Web 加 `--no-web`。
 
 仅启动生产栈（要求已有可达的 roscore）：
@@ -80,7 +77,7 @@ bash src/drone3d_reconstruction_core/scripts/continuous_production.sh \
 
 ## 模式与限制
 
-- 重建模式只有 `per_window`，窗口放置只有 G4 全局配准（`alignment_backend: global_g4`）。G4会话内固定输入配置。
+- 重建模式只有 `per_window`；`alignment_backend` 只接受 `global_g4`（名称沿用，实际做的是逐帧位姿放置，没有窗口间配准）。会话内配置固定。
 - `g4_placement: frame_pose`（唯一取值）：逐帧外部定位位姿加 VGGT 深度尺度，见本页开头和[机载融合与交付包](src/drone3d_reconstruction_core/docs/ONBOARD_V1.md)。早期以 D435i 参考面做的验证见 [G4 接入](src/drone3d_reconstruction_core/docs/G4_INTEGRATION.md) 的“逐帧位姿放置”。
 - CUDA OOM 进入 `FATAL_OOM` 并停止采集与消费；降低帧数或分辨率后人工重启。
 - 快照根、结果根及其父目录必须可信、稳定；NX 候选配置不代表已通过生产验收。

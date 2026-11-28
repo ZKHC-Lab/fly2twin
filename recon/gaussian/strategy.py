@@ -9,6 +9,7 @@ never resets. The reference uses positive multiples of reset_every, before
 refine_stop_iter. Keep the entire callback order explicit rather than delegate
 to either version's conditional.
 """
+
 from dataclasses import dataclass
 import torch
 from gsplat.strategy import DefaultStrategy
@@ -23,8 +24,11 @@ class BaselineStrategy(DefaultStrategy):
         if step >= self.refine_stop_iter:
             return
         self._update_state(params, state, info, packed=packed)
-        refine = (step > self.refine_start_iter and step % self.refine_every == 0
-                  and step % self.reset_every >= self.pause_refine_after_reset)
+        refine = (
+            step > self.refine_start_iter
+            and step % self.refine_every == 0
+            and step % self.reset_every >= self.pause_refine_after_reset
+        )
         if refine:
             duplicated, split = self._grow_gs(params, optimizers, state, step)
             pruned = self._prune_gs(params, optimizers, state, step)
@@ -36,4 +40,4 @@ class BaselineStrategy(DefaultStrategy):
             if self.verbose:
                 print(f'Step {step}: duplicate={duplicated}, split={split}, prune={pruned}', flush=True)
         if (step > 0 or self.reset_at_zero) and step % self.reset_every == 0:
-            reset_opa(params=params, optimizers=optimizers, state=state, value=2*self.prune_opa)
+            reset_opa(params=params, optimizers=optimizers, state=state, value=2 * self.prune_opa)

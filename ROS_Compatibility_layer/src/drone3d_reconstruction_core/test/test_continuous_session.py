@@ -826,9 +826,13 @@ class ContinuousSessionTest(unittest.TestCase):
 
     def assert_only_succeeded_snapshots_remain(self, service):
         """Succeeded windows keep their snapshot (G4 reads it); nothing else remains."""
+        session_id = service.get_status().session_id
+        events = [event for event in self.journal_events() if event.get("session_id") == session_id]
+        succeeded = {event["window_index"] for event in events if event["event"] == "window_succeeded"}
         kept = {
-            Path(unquote(urlsplit(record.snapshot_uri).path))
-            for record in service._windows if record.state == WINDOW_SUCCEEDED
+            self.snapshot_path(event["snapshot_uri"])
+            for event in events
+            if event["event"] == "window_pending" and event["window_index"] in succeeded
         }
         self.assertTrue(kept)
         self.assertEqual(set(self.front_root.iterdir()), kept)
@@ -847,6 +851,19 @@ class ContinuousSessionTest(unittest.TestCase):
                 last_error = error
                 time.sleep(0.05)
         raise AssertionError(f"journal never became readable: {last_error}")
+
+    @staticmethod
+    def snapshot_path(uri):
+        return Path(unquote(urlsplit(uri).path))
+
+    def pending_snapshot(self, service, window_index):
+        """The snapshot a window was queued with, as the session journaled it."""
+        session_id = service.get_status().session_id
+        uris = [event["snapshot_uri"] for event in self.journal_events()
+                if event.get("event") == "window_pending" and event.get("session_id") == session_id
+                and event["window_index"] == window_index]
+        self.assertEqual(len(uris), 1)
+        return self.snapshot_path(uris[0])
 
     def test_three_windows_are_captured_while_first_is_reconstructing(self):
         backend = FakeBackend(block_first=True)
@@ -971,16 +988,24 @@ class ContinuousSessionTest(unittest.TestCase):
                          initial_window_frames=16, initial_overlap_frames=5,
                          reconstruct_frame_group_size=16,
                          initial_keep_snapshot_on_success=True)
-        service = self.make_session(config=config)
-        for index, shared in ((0, 0), (1, 5)):
-            record = WindowRecord(index, "diagnostic-%d" % index, config.roles[0],
-                                  service._runtime, overlap_frame_count=shared)
-            record.state = WINDOW_CAPTURING
-            service._windows = [record]
+        role = config.roles[0]
+        first = BlockingCaptureClient(role, self.front_root)
+        second = BlockingCaptureClient(role, self.front_root)
+        clients = [first, second]
+        service = self.make_session(config=config, capture_factory=lambda _role: (
+            clients.pop(0) if clients else BlockingCaptureClient(role, self.front_root)))
+        service.select_source("front")
+        service.start_session("")
+        # Window 0 captures all 16 frames; window 1 shares the last 5 and captures 11.
+        for client, shared in ((first, 0), (second, 5)):
+            self.assertTrue(client.goal_sent.wait(5.0))
+            self.assertEqual(client.max_frames, 16 - shared)
             diagnostic = service.diagnostics_snapshot()
             self.assertEqual(diagnostic["new_input_frames"], 16-shared)
             self.assertEqual(diagnostic["shared_input_frames"], shared)
             self.assertEqual(diagnostic["model_input_frames"], 16)
+            client.release()
+        service.stop_all(discard_queue=True)
 
     def test_three_consecutive_capture_failures_pause_until_resume(self):
         config = replace(self.large_window_config(), alignment_backend="global_g4",
@@ -999,7 +1024,10 @@ class ContinuousSessionTest(unittest.TestCase):
         service.start_session("")
         self.wait_until(lambda: service.get_status().state == SESSION_PAUSED)
         self.assertEqual(service.get_status().failed_windows, 3)
-        self.assertEqual(len(service._windows), 3)
+        # Exactly three windows were planned, each a capture failure.
+        self.assertEqual(service.get_status().window_index, 3)
+        self.assertEqual([event["window_index"] for event in self.journal_events()
+                          if event.get("event") == "window_capture_failed"], [0, 1, 2])
         self.assertEqual(len(clients), 3)
         self.assertEqual(service.resume()[0], 0)
         self.assertTrue(recovered.goal_sent.wait(3.0))
@@ -1262,19 +1290,24 @@ class ContinuousSessionTest(unittest.TestCase):
         service.select_source("front")
         service.start_session("")
         self.assertTrue(blocked.goal_sent.wait(5.0))
-        self.wait_until(lambda: all(w.done.is_set() for w in service._windows[:len(missing_per_capture)]))
+        # A window's terminal outcome is journaled in the same lock section that ends it.
+        self.wait_until(lambda: set(range(len(missing_per_capture))) <= {
+            e["window_index"] for e in self.journal_events()
+            if e["event"] in ("window_succeeded", "window_failed")})
         return service, backend
+
+    def window_events(self, name, window_index):
+        return [e for e in self.journal_events()
+                if e["event"] == name and e.get("window_index") == window_index]
 
     def test_window_missing_exactly_20_percent_of_poses_is_reconstructed(self):
         service, backend = self.run_missing_pose_windows([(0, 1)])
-        record = service._windows[0]
-        self.assertEqual(record.state, WINDOW_SUCCEEDED)
-        self.assertEqual(record.missing_pose_frames, 2)
-        self.assertEqual(backend.submitted, [record.scene_id])
+        pending = self.window_events("window_pending", 0)
+        succeeded = self.window_events("window_succeeded", 0)
+        self.assertEqual(len(succeeded), 1)
+        self.assertEqual(self.window_events("window_failed", 0), [])
+        self.assertEqual(backend.submitted, [succeeded[0]["scene_id"]])
         self.assertEqual(service.get_status().failed_windows, 0)
-        events = self.journal_events()
-        pending = [e for e in events if e["event"] == "window_pending" and e["window_index"] == 0]
-        succeeded = [e for e in events if e["event"] == "window_succeeded" and e["window_index"] == 0]
         self.assertEqual([e["missing_pose_frames"] for e in pending], [2])
         self.assertEqual([e["missing_pose_frames"] for e in succeeded], [2])
         self.assertEqual(service.diagnostics_snapshot()["missing_pose_frames"], 2)
@@ -1284,20 +1317,20 @@ class ContinuousSessionTest(unittest.TestCase):
         # Window 0 misses 3 of 10. Window 1 reuses frames 5–9 of window 0 (all posed)
         # and is reconstructed normally; the session keeps running.
         service, backend = self.run_missing_pose_windows([(0, 1, 2), ()])
-        failed, following = service._windows[:2]
-        self.assertEqual(failed.state, WINDOW_FAILED)
-        self.assertIn("missing poses: 3 of 10 window frames have no pose (limit 20%)", failed.error)
-        self.assertEqual(failed.reconstruct_attempts, 0)
-        self.assertEqual(following.state, WINDOW_SUCCEEDED)
-        self.assertEqual(following.overlap_frame_count, 5)
-        self.assertEqual(backend.submitted, [following.scene_id])
+        failed_events = self.window_events("window_failed", 0)
+        self.assertEqual(len(failed_events), 1)
+        self.assertIn("missing poses: 3 of 10 window frames have no pose (limit 20%)",
+                      failed_events[0]["reason"])
+        self.assertEqual(failed_events[0]["attempts"], 0)
+        following = self.window_events("window_succeeded", 1)
+        self.assertEqual(len(following), 1)
+        self.assertEqual([e["overlap_frame_count"] for e in self.window_events("window_pending", 1)], [5])
+        self.assertEqual(backend.submitted, [following[0]["scene_id"]])
         status = service.get_status()
         self.assertEqual(status.state, SESSION_RUNNING)
         self.assertEqual(status.failed_windows, 1)
         self.assertEqual(service.diagnostics_snapshot()["missing_pose_frames"], 3)
         events = [e for e in self.journal_events() if e.get("window_index") == 0]
-        failed_events = [e for e in events if e["event"] == "window_failed"]
-        self.assertEqual(len(failed_events), 1)
         self.assertEqual((failed_events[0]["missing_pose_frames"], failed_events[0]["window_frames"]), (3, 10))
         self.assertFalse([e for e in events if e["event"] in ("window_pending", "window_retry")])
         service.stop_all()
@@ -1306,11 +1339,12 @@ class ContinuousSessionTest(unittest.TestCase):
         # Window 0 misses its last two frames (2 of 10: reconstructed); window 1 shares
         # them and misses one new frame: 3 of 10, so window 1 fails.
         service, backend = self.run_missing_pose_windows([(8, 9), (0,)])
-        first, second = service._windows[:2]
-        self.assertEqual(first.state, WINDOW_SUCCEEDED)
-        self.assertEqual(second.state, WINDOW_FAILED)
-        self.assertEqual(second.missing_pose_frames, 3)
-        self.assertEqual(backend.submitted, [first.scene_id])
+        first = self.window_events("window_succeeded", 0)
+        second = self.window_events("window_failed", 1)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 1)
+        self.assertEqual(second[0]["missing_pose_frames"], 3)
+        self.assertEqual(backend.submitted, [first[0]["scene_id"]])
         # 会话累计每帧只算一次：窗口 0 的两帧加窗口 1 新采的一帧，共享的两帧不重复计数。
         self.assertEqual(service.diagnostics_snapshot()["missing_pose_frames"], 3)
         service.stop_all()
@@ -1474,8 +1508,7 @@ class ContinuousSessionTest(unittest.TestCase):
                     time.sleep(.4)
                     self.assertEqual((len(self.capture_clients), len(backend.submitted)), before)
                     self.assertEqual(service.get_status().failed_windows, 1)
-                    record = service._windows[0]
-                    snapshot = Path(unquote(urlsplit(record.snapshot_uri).path))
+                    snapshot = self.pending_snapshot(service, 0)
                     self.assertTrue(snapshot.is_dir())
                     self.assertEqual(service.stop_all()[0], 0)
                     self.assertTrue(snapshot.is_dir())
@@ -1602,18 +1635,21 @@ class ContinuousSessionTest(unittest.TestCase):
         )
         self.assertTrue(blocked.goal_sent.wait(3.0))
         status = service.get_status()
-        with service._lock:
-            fifo_records = list(service._fifo)
-        self.assertEqual(status.pending_windows, len(fifo_records))
+        snapshot = service.diagnostics_snapshot()
+        queued = [item["window_index"] for item in snapshot["fifo"]]
+        self.assertEqual(status.pending_windows, len(queued))
+        # Independent of the session's own accounting: the regular files under each
+        # queued window's journaled snapshot directory.
         expected_fifo_bytes = sum(
-            service._snapshot_bytes_from_uri(record.snapshot_uri)
-            for record in fifo_records
+            path.stat().st_size
+            for index in queued
+            for path in self.pending_snapshot(service, index).rglob("*")
+            if path.is_file() and not path.is_symlink()
         )
         self.assertEqual(status.fifo_bytes, expected_fifo_bytes)
         self.assertGreaterEqual(status.fifo_bytes, status.pending_windows * len(payload))
         self.assertIsNotNone(status.fifo_oldest_wait_sec)
         self.assertGreaterEqual(status.fifo_oldest_wait_sec, 0.0)
-        snapshot = service.diagnostics_snapshot()
         self.assertEqual(snapshot["fifo_bytes"], status.fifo_bytes)
         self.assertAlmostEqual(
             snapshot["fifo_oldest_wait_sec"], status.fifo_oldest_wait_sec, delta=0.5
@@ -1887,33 +1923,45 @@ class ContinuousSessionTest(unittest.TestCase):
 
     def test_stop_all_detected_during_gate_marks_window_cancelled(self):
         backend = FakeBackend(block_first=True)
-        service = self.make_session(
-            backend=backend, formal_gate=None, formal_publisher=None
-        )
+        sessions = []
+        stops = []
 
         def stop_during_gate(
             uri, expected_sha256, *, expected_identity, expected_authenticity
         ):
-            # 模拟门禁执行期间 stop_all 置位：窗口必须按 CANCELLED 收敛，
-            # 而不是被计为正式门禁失败。
-            with service._lock:
-                service._stopping = True
+            # 门禁执行期间收到 STOP：窗口必须按 CANCELLED 收敛，
+            # 而不是被计为正式门禁失败。STOP 由另一个线程经公开接口发出，
+            # 门禁等它把会话置为 STOPPING 后才返回。
+            session = sessions[0]
+            stopper = threading.Thread(
+                target=lambda: stops.append(session.stop_all(discard_queue=True)))
+            stopper.start()
+            stops.append(stopper)
+            self.wait_until(lambda: session.get_status().state == SESSION_STOPPING)
             return SimpleNamespace(ok=True, reason="", payload={}, manifest_bytes=b"{}")
 
-        service._result_gate = stop_during_gate
+        service = self.make_session(
+            backend=backend, formal_gate=stop_during_gate, formal_publisher=None
+        )
+        sessions.append(service)
         service.select_source("front")
         self.assertEqual(service.start_session("")[0], 0)
         self.wait_until(lambda: len(backend.submitted) == 1)
         job_id = backend.submitted[0]
         backend.jobs[job_id]["state"] = JOB_SUCCEEDED
         backend.release_first.set()
-        self.wait_until(
-            lambda: service._windows
-            and service._windows[0].state == WINDOW_CANCELLED
-        )
+        self.wait_until(lambda: stops)
+        stops[0].join(5.0)
+        self.assertFalse(stops[0].is_alive())
+        self.assertEqual(stops[1][0], 0, stops[1][1])
+        self.assertEqual(service.get_status().state, SESSION_STOPPED)
+        # 窗口的 CANCELLED 状态不进 journal 也不进诊断，只能读记录本身。
+        self.assertEqual(service._windows[0].state, WINDOW_CANCELLED)
         self.assertEqual(service.get_status().failed_windows, 0)
         self.assertEqual(service.get_status().formal_windows, 0)
-        service.stop_all()
+        events = [e for e in self.journal_events() if e.get("window_index") == 0]
+        self.assertFalse([e for e in events if e["event"] in (
+            "window_failed", "window_result_gate_failed", "window_succeeded")])
 
     def test_formal_gate_failure_keeps_window_failed_and_no_record(self):
         config = replace(
@@ -1951,8 +1999,7 @@ class ContinuousSessionTest(unittest.TestCase):
         backend.jobs[job_id]["state"] = JOB_SUCCEEDED
         backend.release_first.set()
         self.wait_until(lambda: service.get_status().failed_windows >= 1)
-        failed_record = service._windows[0]
-        failed_snapshot = Path(unquote(urlsplit(failed_record.snapshot_uri).path))
+        failed_snapshot = self.pending_snapshot(service, 0)
         self.wait_until(lambda: not failed_snapshot.exists())
         session_id = service.get_status().session_id
         self.assertEqual(service.get_status().formal_windows, 0)
@@ -2091,9 +2138,12 @@ class ContinuousSessionTest(unittest.TestCase):
         self.assertEqual(backend.status_calls_by_job[first_window_id], 3)
         self.assertEqual(backend.cancel_calls_by_job.get(first_window_id, 0), 1)
         self.assertEqual(backend.collect_calls_by_job.get(first_window_id, 0), 2)
-        with service._lock:
-            self.assertIsNone(service._active_job_id)
-        service.stop_all()
+        # No job is owned any more: the STOP that follows finds none to cancel. Stop at
+        # once: a plain STOP may drain first and journal session_stop only later.
+        self.assertEqual(service.stop_all(discard_queue=True)[0], 0)
+        stop_event = [event for event in self.journal_events() if event.get("event") == "session_stop"][-1]
+        self.assertIsNone(stop_event["backend_job_id_before"])
+        self.assertEqual(stop_event["worker_active_after"], 0)
 
     def test_backend_status_exception_waits_for_async_cancel_terminal(self):
         backend = AsyncCancelAfterStatusErrorBackend()
@@ -2117,12 +2167,15 @@ class ContinuousSessionTest(unittest.TestCase):
         time.sleep(0.3)
         self.assertEqual(backend.collect_calls_by_job.get(first_job_id, 0), 0)
         self.assertEqual(len(backend.submitted), 1)
-        with service._lock:
-            self.assertEqual(service._active_job_id, first_job_id)
 
         code, message = service.stop_all(discard_queue=True)
         self.assertEqual(code, 3, message)
         self.assertEqual(service.get_status().state, SESSION_STOPPING)
+        # The cancel-pending job was still owned when STOP arrived, and stays owned.
+        pending = [event for event in self.journal_events() if event.get("event") == "session_stop_pending"][-1]
+        self.assertEqual(pending["backend_job_id_before"], first_job_id)
+        self.assertEqual(pending["worker_active_after"], 1)
+        self.assertFalse(pending["backend_terminal_collected"])
 
         backend.cancel_terminal.set()
         self.wait_until(lambda: service._consume_done.is_set(), timeout=5.0)
@@ -2198,7 +2251,9 @@ class ContinuousSessionTest(unittest.TestCase):
 
         code, message = service.stop_all(discard_queue=True)
         self.assertEqual(code, 3, message)
-        self.assertIsNone(service._stop_audit["backend_job_id_before"])
+        # The submit had not returned yet: STOP found no job to bind.
+        pending = [event for event in self.journal_events() if event.get("event") == "session_stop_pending"][-1]
+        self.assertIsNone(pending["backend_job_id_before"])
 
         backend.submit_release.set()
         self.wait_until(lambda: service._consume_done.is_set(), timeout=5.0)
@@ -2418,7 +2473,14 @@ class ContinuousSessionTest(unittest.TestCase):
         service.stop_all()
 
     def test_captured_frames_tracks_active_capturing_window(self):
-        client = BlockingCaptureClient(self.config.roles[0], self.front_root)
+        class FeedbackCaptureClient(BlockingCaptureClient):
+            def send_goal(self, scene_id, sample_fps, max_frames, max_duration_sec,
+                          feedback_cb, **kwargs):
+                self.feedback_cb = feedback_cb
+                super().send_goal(scene_id, sample_fps, max_frames, max_duration_sec,
+                                  feedback_cb, **kwargs)
+
+        client = FeedbackCaptureClient(self.config.roles[0], self.front_root)
         def capture_factory(_role):
             if not client.goal_sent.is_set():
                 return client
@@ -2428,25 +2490,17 @@ class ContinuousSessionTest(unittest.TestCase):
         service.select_source("front")
         service.start_session("")
         self.assertTrue(client.goal_sent.wait(3.0))
-        with service._lock:
-            active = next(
-                record
-                for record in service._windows
-                if record.state == WINDOW_CAPTURING
-            )
-            active.captured_frames = 7
-            active.capture_goal_frames = 80
-        self.assertEqual(service.get_status().captured_frames, 7)
-        self.assertEqual(service.get_status().capture_target_frames, 80)
+        # The capture action reports progress through its feedback callback.
+        self.assertEqual(client.max_frames, self.config.initial_window_frames)
+        client.feedback_cb(SimpleNamespace(frame_count=4))
+        self.assertEqual(service.get_status().captured_frames, 4)
+        self.assertEqual(service.get_status().capture_target_frames, client.max_frames)
         self.assertEqual(
-            service.diagnostics_snapshot()["captured_frames"], 7
+            service.diagnostics_snapshot()["captured_frames"], 4
         )
         self.assertEqual(
-            service.diagnostics_snapshot()["capture_target_frames"], 80
+            service.diagnostics_snapshot()["capture_target_frames"], client.max_frames
         )
-        # Restore the real goal before completion identity checks run.
-        with service._lock:
-            active.capture_goal_frames = client.max_frames
         client.release()
         self.wait_until(lambda: service.get_status().succeeded_windows >= 1)
         self.assertEqual(service.get_status().captured_frames, 0)
@@ -2462,19 +2516,20 @@ class ContinuousSessionTest(unittest.TestCase):
         job_id = backend.submitted[0]
         self.wait_until(lambda: backend.collect_calls >= 1)
         self.assertFalse(backend.release_collect.is_set())
-        with service._lock:
-            self.assertEqual(service._active_job_id, job_id)
         code, message = service.stop_all(discard_queue=True)
         self.assertNotEqual(code, 0)
         self.assertEqual(service.get_status().state, SESSION_STOPPING)
-        with service._lock:
-            self.assertEqual(service._active_job_id, job_id)
+        # Owned when STOP arrived and still owned after it: collect has not succeeded.
+        pending = [event for event in self.journal_events() if event.get("event") == "session_stop_pending"][-1]
+        self.assertEqual(pending["backend_job_id_before"], job_id)
+        self.assertEqual(pending["worker_active_after"], 1)
         self.assertEqual(service.start_session("")[0], 3)
         backend.release_collect.set()
         self.assertEqual(service.stop_all(discard_queue=True)[0], 0)
         self.assertEqual(service.get_status().state, SESSION_STOPPED)
-        with service._lock:
-            self.assertIsNone(service._active_job_id)
+        stop_event = [event for event in self.journal_events() if event.get("event") == "session_stop"][-1]
+        self.assertEqual(stop_event["worker_active_after"], 0)
+        self.assertTrue(stop_event["backend_terminal_collected"])
 
 
 
@@ -2627,16 +2682,6 @@ class DiagnosticInputFrameDisplayTests(G4SessionFixture):
         session = self.make_session()
         self.assertEqual(self.display_numbers(session), (100, 0, 100))
 
-    def test_g4_total_frames_semantics_is_unchanged(self):
-        session = self.make_session(reconstruct_frame_group_size=16,
-                                    initial_window_frames=16,
-                                    initial_overlap_frames=5)
-        record = WindowRecord(1, "legacy", session._config.roles[0], session._runtime,
-                              overlap_frame_count=5)
-        record.state = WINDOW_CAPTURING
-        session._windows = [record]
-        self.assertEqual(self.display_numbers(session), (11, 5, 16))
-
 
 class ResourceGuardBackend(FakeBackend):
     """按 0 基提交序号拒绝启动的 backend（模拟启动资源门）。
@@ -2691,32 +2736,29 @@ class ResourceGuardBackend(FakeBackend):
 
 
 class GuardDeniedAfterDelayBackend(ResourceGuardBackend):
-    """第一个被拒 job 先报告 RUNNING 一小段时间，再以启动资源门拒绝结束。
+    """第一个被拒 job 先报告 RUNNING，直到 ``release_when()`` 为真，再以启动资源门拒绝结束。
 
-    这段延迟让采集线程有机会把后续窗口排进 FIFO（容量内），用来验证人工
-    恢复后的消费顺序：重试窗必须排在所有更晚的窗口之前。
+    测试用它等采集线程把后续窗口排进 FIFO（容量内），再让拒绝落地，用来验证人工
+    恢复后的消费顺序：重试窗必须排在所有更晚的窗口之前。放行条件是可观察的状态，
+    不是固定时长，所以采集慢的机器上也不会在队列还空时就拒绝。
     """
 
-    def __init__(self, deny_indices=(0,), code="HIGH_SWAP_USED", hold_sec=0.6):
+    def __init__(self, deny_indices=(0,), code="HIGH_SWAP_USED", release_when=None):
         super().__init__(deny_indices=deny_indices, code=code)
-        self.hold_sec = hold_sec
-        self.hold_until = {}
+        self.release_when = release_when or (lambda: True)
+        self.held = set()
 
     def submit(self, *args, **kwargs):
         index = len(self.submitted)
         job_id = super().submit(*args, **kwargs)
         if index in self.deny_indices:
             self.jobs[job_id]["state"] = JOB_RUNNING
-            self.hold_until[job_id] = time.monotonic() + self.hold_sec
+            self.held.add(job_id)
         return job_id
 
     def status(self, job_id):
         job = self.jobs[job_id]
-        if (
-            job_id in self.hold_until
-            and job["state"] == JOB_RUNNING
-            and time.monotonic() >= self.hold_until[job_id]
-        ):
+        if job_id in self.held and job["state"] == JOB_RUNNING and self.release_when():
             job["state"] = JOB_FAILED
         return JobStatus(job_id, job["state"], "")
 
@@ -2865,7 +2907,7 @@ class MemoryPausedManualRecoveryTests(unittest.TestCase):
         回答“稍后重试”（代码 3）。测试要发命令，就得先等消费线程放手。
         """
         self.wait_until(lambda: service.get_status().state == SESSION_MEMORY_PAUSED)
-        self.wait_until(lambda: service._running_window is None)
+        self.wait_until(lambda: service.diagnostics_snapshot()["running_window"] is None)
 
     def snapshot_path(self, record):
         return Path(unquote(urlsplit(record.snapshot_uri).path))
@@ -2882,11 +2924,9 @@ class MemoryPausedManualRecoveryTests(unittest.TestCase):
         self.assertIn("HIGH_SWAP_USED", record.error)
         self.assertTrue(self.snapshot_path(record).is_dir())
         self.assertTrue(service._fatal_oom)
-        self.assertFalse(service._oom_latched)
-        self.assertTrue(service._memory_guard_paused)
         # 资源门失败不是可自动重试的失败：max_retries=0 也仍然只提交一次。
         self.assertEqual(len(backend.submitted), 1)
-        self.assertEqual(service._fifo, [])
+        self.assertEqual(service.diagnostics_snapshot()["fifo"], [])
         # 采集/消费线程都因硬停退出，单改 state 无法恢复。
         self.assertTrue(service._capture_done.wait(5.0))
         self.assertTrue(service._consume_done.wait(5.0))
@@ -2915,8 +2955,7 @@ class MemoryPausedManualRecoveryTests(unittest.TestCase):
         self.assertEqual(record.manual_retries, 1)
         self.assertTrue(any("HIGH_SWAP_USED" in item for item in record.guard_failures))
         self.assertEqual(status.failed_windows, 0)
-        self.assertEqual(service._failed, 0)
-        self.assertEqual(service._attempt_failures, 1)
+        self.assertEqual(service.diagnostics_snapshot()["attempt_failures"], 1)
         formal_windows = [index for _, index in self.formal]
         self.assertEqual(formal_windows[0], record.window_index)
         self.assertEqual(formal_windows.count(record.window_index), 1)
@@ -2934,16 +2973,19 @@ class MemoryPausedManualRecoveryTests(unittest.TestCase):
     def test_manual_retry_keeps_fifo_order_with_later_windows_pending(self):
         backend = GuardDeniedAfterDelayBackend()
         service = self.make_session(backend)
+        # The rejection lands only once capture has queued two later windows.
+        backend.release_when = lambda: len(service.diagnostics_snapshot()["fifo"]) >= 2
         service.select_source("front")
         self.assertEqual(service.start_session("")[0], 0)
         self.wait_paused_on_guard(service)
-        record = service._memory_failed_window
-        pending = [item.window_index for item in service._fifo]
+        diagnostics = service.diagnostics_snapshot()
+        record_index = diagnostics["retry_window"]
+        pending = [item["window_index"] for item in diagnostics["fifo"]]
         # 采集已经跑在消费前面：暂停时队列里已有更晚的窗口。
         self.assertGreaterEqual(len(pending), 2)
         self.assertEqual(pending, sorted(pending))
-        self.assertTrue(all(index > record.window_index for index in pending))
-        expected = [record.window_index] + pending
+        self.assertTrue(all(index > record_index for index in pending))
+        expected = [record_index] + pending
         code, message = service.resume()
         self.assertEqual(code, 0, message)
         self.wait_until(lambda: len(self.formal) >= len(expected))
@@ -2951,20 +2993,24 @@ class MemoryPausedManualRecoveryTests(unittest.TestCase):
         # 的窗口序列（采集线程随后还会继续后面的窗口）。
         self.assertEqual([index for _, index in self.formal][:len(expected)],
                          expected)
-        self.assertEqual(service._failed, 0)
+        self.assertEqual(service.get_status().failed_windows, 0)
         self.assertEqual(service.get_status().dropped_windows, 0)
-        self.assertEqual(service._attempt_failures, 1)
+        self.assertEqual(service.diagnostics_snapshot()["attempt_failures"], 1)
+        session_id = service.get_status().session_id
         service.stop_all()
-        self.assertEqual(service._windows[0].manual_retries, 1)
+        retries = [event["window_index"] for event in self.journal_events(session_id)
+                   if event.get("event") == "window_manual_retry"]
+        self.assertEqual(retries, [record_index])
 
     def test_cuda_oom_is_never_recoverable(self):
         service = self.make_session(OomBackend())
         service.select_source("front")
         self.assertEqual(service.start_session("")[0], 0)
         self.wait_until(lambda: service.get_status().state == SESSION_FATAL_OOM)
-        self.assertTrue(service._oom_latched)
-        self.assertFalse(service._memory_guard_paused)
-        self.assertIsNone(service._memory_failed_window)
+        diagnostics = service.diagnostics_snapshot()
+        self.assertTrue(diagnostics["oom_latched"])
+        self.assertFalse(diagnostics["memory_paused"])
+        self.assertIsNone(diagnostics["retry_window"])
         code, message = service.resume()
         self.assertEqual(code, 4)
         self.assertIn(SESSION_FATAL_OOM, message)
@@ -2981,8 +3027,9 @@ class MemoryPausedManualRecoveryTests(unittest.TestCase):
         service.select_source("front")
         self.assertEqual(service.start_session("")[0], 0)
         self.wait_until(lambda: service.get_status().state == SESSION_FATAL_OOM)
-        self.assertTrue(service._oom_latched)
-        self.assertFalse(service._memory_guard_paused)
+        diagnostics = service.diagnostics_snapshot()
+        self.assertTrue(diagnostics["oom_latched"])
+        self.assertFalse(diagnostics["memory_paused"])
         self.assertEqual(service.resume()[0], 4)
 
     def test_resume_refuses_when_the_preserved_snapshot_is_gone(self):
@@ -2994,7 +3041,7 @@ class MemoryPausedManualRecoveryTests(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertIn("snapshot", message)
         self.assertEqual(service.get_status().state, SESSION_MEMORY_PAUSED)
-        self.assertIs(service._memory_failed_window, record)
+        self.assertEqual(service.diagnostics_snapshot()["retry_window"], record.window_index)
         self.assertEqual(len(backend.submitted), 1)
         self.assertEqual(self.formal, [])
 
@@ -3020,13 +3067,12 @@ class MemoryPausedManualRecoveryTests(unittest.TestCase):
         self.wait_until(lambda: service.get_status().state == SESSION_MEMORY_PAUSED)
         self.assertEqual(record.manual_retries, 1)
         self.assertEqual(len(record.guard_failures), 2)
-        self.assertEqual(service._failed, 1)
-        self.assertEqual(service._attempt_failures, 2)
+        self.assertEqual(service.diagnostics_snapshot()["attempt_failures"], 2)
         self.assertEqual(service.get_status().failed_windows, 1)
         self.assertEqual(service.resume()[0], 0)
         self.wait_until(lambda: record.state == WINDOW_SUCCEEDED)
-        self.assertEqual(service._failed, 0)
-        self.assertEqual(service._attempt_failures, 2)
+        self.assertEqual(service.get_status().failed_windows, 0)
+        self.assertEqual(service.diagnostics_snapshot()["attempt_failures"], 2)
 
     def test_resume_refuses_when_the_preserved_snapshot_hash_is_wrong(self):
         """目录还在但内容被改过：必须由现有验证器拒绝，而不是只看目录存在。"""
@@ -3139,8 +3185,8 @@ class MemoryPausedManualRecoveryTests(unittest.TestCase):
         self.assertEqual(service.start_session("")[0], 0)
         # 先确认在飞采集已 ACTIVE（记录处于 CAPTURING），再放行资源拒绝。
         self.assertTrue(blocked.goal_sent.wait(5.0))
-        self.wait_until(lambda: len(service._windows) == 2
-                        and service._windows[1].state == WINDOW_CAPTURING)
+        self.wait_until(lambda: service.get_status().window_index == 1
+                        and service.get_status().capture_target_frames == blocked.max_frames)
         backend.denial_release.set()
         self.wait_until(lambda: service.get_status().state == SESSION_MEMORY_PAUSED)
         record = service._memory_failed_window
@@ -3155,7 +3201,7 @@ class MemoryPausedManualRecoveryTests(unittest.TestCase):
         self.assertEqual([item.window_index for item in cancelled], [1])
         self.assertIn("fatal oom", cancelled[0].error)
         # 取消不会推进采集前沿：该索引恢复后还会被重新采集。
-        self.assertEqual(service._next_window, 1)
+        self.assertEqual(service.get_status().window_index, 1)
         return service, record, cancelled[0], backend
 
     def test_cancelled_inflight_capture_is_recaptured_after_manual_retry(self):
@@ -3169,8 +3215,8 @@ class MemoryPausedManualRecoveryTests(unittest.TestCase):
         # 被取消的计划窗被重新采集并产出正式结果：0 与 1 都不缺、都不重复。
         # 采集线程随后还会继续后面的窗口，所以只要求前沿已越过被取消的索引。
         self.assertEqual([index for _, index in self.formal][:2], [0, 1])
-        self.assertGreaterEqual(service._next_window, 2)
-        self.assertEqual(service._failed, 0)
+        self.assertGreaterEqual(service.get_status().window_index, 2)
+        self.assertEqual(service.get_status().failed_windows, 0)
         self.assertTrue(all(item is record or item.window_index != 0
                             for item in service._windows))
         self.assertEqual(sum(item.window_index <= 1 for item in service._windows), 3)
@@ -3224,8 +3270,8 @@ class MemoryPausedManualRecoveryTests(unittest.TestCase):
         service.select_source("front")
         self.assertEqual(service.start_session("")[0], 0)
         self.assertTrue(stuck.goal_sent.wait(5.0))
-        self.wait_until(lambda: len(service._windows) == 2
-                        and service._windows[1].state == WINDOW_CAPTURING)
+        self.wait_until(lambda: service.get_status().window_index == 1
+                        and service.get_status().capture_target_frames == stuck.max_frames)
         backend.denial_release.set()
         self.wait_until(lambda: service.get_status().state == SESSION_MEMORY_PAUSED)
         # 取消不收敛：采集线程仍卡在在飞动作里。
@@ -3236,7 +3282,12 @@ class MemoryPausedManualRecoveryTests(unittest.TestCase):
         self.assertEqual(service.get_status().state, SESSION_MEMORY_PAUSED)
         self.assertEqual(self.formal, [])
         # 现场保留：被拒窗口的输入仍在，且没有第二个消费线程被启动。
-        self.assertTrue(self.snapshot_path(service._memory_failed_window).is_dir())
+        session_id = service.get_status().session_id
+        self.assertEqual(service.diagnostics_snapshot()["retry_window"], 0)
+        pending = [row["snapshot_uri"] for row in self.journal_events(session_id)
+                   if row["event"] == "window_pending" and row["window_index"] == 0]
+        self.assertEqual(len(pending), 1)
+        self.assertTrue(Path(unquote(urlsplit(pending[0]).path)).is_dir())
         self.assertEqual(len(backend.submitted), 1)
         stuck.release_terminal()
         self.wait_until(lambda: not service._capture_thread.is_alive())
@@ -3278,7 +3329,8 @@ class MemoryPausedManualRecoveryTests(unittest.TestCase):
                         and not service._consume_thread.is_alive())
         new_record = service._memory_failed_window
         self.assertIsNotNone(new_record)
-        fifo_before = list(service._fifo)
+        fifo_before = [(item["window_index"], item["attempts"])
+                       for item in service.diagnostics_snapshot()["fifo"]]
         submits_before = len(backend.submitted)
         release.set()
         worker.join(5.0)
@@ -3286,9 +3338,10 @@ class MemoryPausedManualRecoveryTests(unittest.TestCase):
         self.assertEqual(results[0][0], 4)
         self.assertEqual(service.get_status().state, SESSION_MEMORY_PAUSED)
         self.assertIs(service._memory_failed_window, new_record)
-        self.assertEqual(service._manual_retries, 0)
+        self.assertEqual(service.diagnostics_snapshot()["manual_retries"], 0)
         self.assertEqual(new_record.manual_retries, 0)
-        self.assertEqual(service._fifo, fifo_before)
+        self.assertEqual([(item["window_index"], item["attempts"])
+                          for item in service.diagnostics_snapshot()["fifo"]], fifo_before)
         self.assertEqual(len(backend.submitted), submits_before)
         self.assertFalse(service._capture_thread.is_alive())
         self.assertFalse(service._consume_thread.is_alive())

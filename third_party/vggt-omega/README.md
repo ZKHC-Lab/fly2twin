@@ -82,26 +82,6 @@ registers = camera_and_register_tokens[:, :, 1:]
 For the text-aligned checkpoint, use `VGGTOmega(enable_alignment=True)` with `image_resolution=256` and read `predictions["text_alignment_embedding"]`.
 
 
-## Interactive Demo
-
-Install the demo dependencies:
-
-```bash
-pip install -r requirements_demo.txt
-```
-
-Launch the Gradio demo with a local checkpoint path:
-
-```bash
-python demo_gradio.py \
-  --checkpoint checkpoints/VGGT-Omega-1B-512/model.pt \
-  --image-resolution 512
-```
-
-The demo accepts uploaded images or a video, runs camera and depth inference,
-and visualizes the depth-unprojected point cloud and predicted cameras as a GLB
-scene.
-
 ## Runtime and GPU Memory
 
 We benchmark the end-to-end peak GPU memory usage of `VGGT-Omega-1B-512` on a

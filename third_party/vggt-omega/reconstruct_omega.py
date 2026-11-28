@@ -309,7 +309,7 @@ def load_model(
 
 
 def unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic):
-    """Depth -> world point map (mirrors demo_gradio.run_model)."""
+    """Depth -> world point map."""
     depth = depth_map[..., 0]
     num_frames, height, width = depth.shape
 

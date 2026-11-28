@@ -43,6 +43,11 @@ install(DIRECTORY launch
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
 
+# The Web dashboard page, next to the installed Python package (also in setup.py package_data).
+install(FILES src/drone3d_reconstruction_core/static/dashboard.html
+  DESTINATION ${CATKIN_PACKAGE_PYTHON_DESTINATION}/static
+)
+
 install(DIRECTORY config
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
@@ -55,9 +60,14 @@ if(CATKIN_ENABLE_TESTING)
   catkin_add_nosetests(test/test_g4_map_backend.py)
   catkin_add_nosetests(test/test_g4_input_adapter.py)
   catkin_add_nosetests(test/test_capture.py)
+  catkin_add_nosetests(test/test_action_terminal.py)
+  catkin_add_nosetests(test/test_action_terminal_pins.py)
   catkin_add_nosetests(test/test_capture_action_server.py)
   catkin_add_nosetests(test/test_capture_node.py)
+  catkin_add_nosetests(test/test_continuous_align.py)
   catkin_add_nosetests(test/test_continuous_fault_matrix.py)
+  catkin_add_nosetests(test/test_continuous_job.py)
+  catkin_add_nosetests(test/test_continuous_job_pins.py)
   catkin_add_nosetests(test/test_continuous_session.py)
   catkin_add_nosetests(test/test_continuous_session_node.py)
   catkin_add_nosetests(test/test_continuous_web.py)

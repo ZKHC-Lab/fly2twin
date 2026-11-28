@@ -1,4 +1,5 @@
 """Build a symlink-only multi-scene demo and launch a discrete-GPU browser."""
+
 import argparse
 from array import array
 import fcntl
@@ -17,11 +18,29 @@ from urllib.parse import urlencode
 from urllib.request import urlopen
 
 TOOLS = Path(__file__).resolve().parent
-GPU_ENV = {'__NV_PRIME_RENDER_OFFLOAD': '1', '__GLX_VENDOR_LIBRARY_NAME': 'nvidia',
-           '__EGL_VENDOR_LIBRARY_FILENAMES': '/usr/share/glvnd/egl_vendor.d/10_nvidia.json'}
-PLY_TYPES = {'char': 'b', 'int8': 'b', 'uchar': 'B', 'uint8': 'B', 'short': 'h',
-             'int16': 'h', 'ushort': 'H', 'uint16': 'H', 'int': 'i', 'int32': 'i',
-             'uint': 'I', 'uint32': 'I', 'float': 'f', 'float32': 'f', 'double': 'd', 'float64': 'd'}
+GPU_ENV = {
+    '__NV_PRIME_RENDER_OFFLOAD': '1',
+    '__GLX_VENDOR_LIBRARY_NAME': 'nvidia',
+    '__EGL_VENDOR_LIBRARY_FILENAMES': '/usr/share/glvnd/egl_vendor.d/10_nvidia.json',
+}
+PLY_TYPES = {
+    'char': 'b',
+    'int8': 'b',
+    'uchar': 'B',
+    'uint8': 'B',
+    'short': 'h',
+    'int16': 'h',
+    'ushort': 'H',
+    'uint16': 'H',
+    'int': 'i',
+    'int32': 'i',
+    'uint': 'I',
+    'uint32': 'I',
+    'float': 'f',
+    'float32': 'f',
+    'double': 'd',
+    'float64': 'd',
+}
 
 
 def cloud_bounds(path):
@@ -70,15 +89,17 @@ def cloud_bounds(path):
                     axis.append(value)
     if not axes[0]:
         raise ValueError('PLY has no finite XYZ vertices')
+
     def percentile(values, q):
         at = (len(values) - 1) * q
         lo = int(at)
         return values[lo] + (values[min(lo + 1, len(values) - 1)] - values[lo]) * (at - lo)
+
     bounds = {'min': [], 'max': []}
     for axis in axes:
         ordered = sorted(axis)
-        bounds['min'].append(percentile(ordered, .005))
-        bounds['max'].append(percentile(ordered, .995))
+        bounds['min'].append(percentile(ordered, 0.005))
+        bounds['max'].append(percentile(ordered, 0.995))
     return bounds
 
 
@@ -130,6 +151,7 @@ def build_site(exports, names=(), cache=None):
 def ensure_server(cache, port):
     """Reuse only this tool's server serving the same cache; never kill listeners."""
     endpoint = f'http://127.0.0.1:{port}/__drone3d_demo__'
+
     def ours():
         try:
             with urlopen(endpoint, timeout=1) as r:
@@ -137,6 +159,7 @@ def ensure_server(cache, port):
             return info == {'tool': 'drone3d-demo-v1', 'root': str(cache.resolve())}
         except (OSError, ValueError):
             return False
+
     if ours():
         return
     with socket.socket() as sock:
@@ -145,14 +168,19 @@ def ensure_server(cache, port):
         except OSError as exc:
             raise RuntimeError(f'Port {port} is occupied by another service; choose --port') from exc
     with (cache / 'server.log').open('ab') as log:
-        process = subprocess.Popen([sys.executable, str(TOOLS / 'serve.py'), str(cache), '--port', str(port)],
-                                   stdout=log, stderr=log, stdin=subprocess.DEVNULL, start_new_session=True)
+        process = subprocess.Popen(
+            [sys.executable, str(TOOLS / 'serve.py'), str(cache), '--port', str(port)],
+            stdout=log,
+            stderr=log,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
     for _ in range(50):
         if ours():
             return
         if process.poll() is not None:
             break
-        time.sleep(.1)
+        time.sleep(0.1)
     raise RuntimeError(f'Server failed; see {cache / "server.log"}')
 
 
@@ -177,10 +205,21 @@ def launch_browser(browser, url, site):
         if target.exists():
             shutil.rmtree(target)
     with (profile / 'browser.log').open('ab') as log:
-        subprocess.Popen([browser, f'--user-data-dir={profile}', '--use-angle=gl-egl',
-                          '--no-first-run', '--no-default-browser-check', url],
-                         env={**os.environ, **GPU_ENV}, stdout=log, stderr=log,
-                         stdin=subprocess.DEVNULL, start_new_session=True)
+        subprocess.Popen(
+            [
+                browser,
+                f'--user-data-dir={profile}',
+                '--use-angle=gl-egl',
+                '--no-first-run',
+                '--no-default-browser-check',
+                url,
+            ],
+            env={**os.environ, **GPU_ENV},
+            stdout=log,
+            stderr=log,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
 
 
 def main(argv=None):
@@ -204,18 +243,30 @@ def main(argv=None):
     try:
         site, manifests, ids = build_site(args.exports, args.name)
         ensure_server(site.parent, args.port)
-        query = urlencode({'manifest': ','.join(manifests), 'scene': ids[args.start - 1],
-                           'margin': args.margin, 'guided': int(args.guided), 'quality': 'high'})
+        query = urlencode(
+            {
+                'manifest': ','.join(manifests),
+                'scene': ids[args.start - 1],
+                'margin': args.margin,
+                'guided': int(args.guided),
+                'quality': 'high',
+            }
+        )
         url = f'http://127.0.0.1:{args.port}/{site.name}/viewer/index.html?{query}'
         print(url, flush=True)
-        print('WASD 移动 · Q/E 转向 · R/F 升降 · Shift 加速 · 鼠标拖动转向 · Tab 飞行 · [ ] 切换场景 · P 巡航 · G 引导 · H 隐藏界面', flush=True)
+        print(
+            'WASD 移动 · Q/E 转向 · R/F 升降 · Shift 加速 · 鼠标拖动转向 · Tab 飞行 · [ ] 切换场景 · P 巡航 · G 引导 · H 隐藏界面',
+            flush=True,
+        )
         browser = find_browser(args.browser)
         if args.check:
             args.check.mkdir(parents=True, exist_ok=True)
             if not browser:
                 raise RuntimeError('--check requires Edge or --browser PATH')
-            result = subprocess.run(['node', str(TOOLS / 'check_demo.cjs'), url, str(args.check.resolve()), browser, json.dumps(ids)],
-                                    env={**os.environ, **GPU_ENV})
+            result = subprocess.run(
+                ['node', str(TOOLS / 'check_demo.cjs'), url, str(args.check.resolve()), browser, json.dumps(ids)],
+                env={**os.environ, **GPU_ENV},
+            )
             if result.returncode:
                 return result.returncode
         if not args.no_launch:

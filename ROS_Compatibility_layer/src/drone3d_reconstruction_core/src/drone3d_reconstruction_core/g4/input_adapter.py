@@ -1,12 +1,12 @@
 """Read immutable, verified Omega outputs; never consume an old map placement."""
 from dataclasses import dataclass
-import hashlib
 import json
 from pathlib import Path
 from urllib.parse import urlsplit, unquote
 
 import numpy as np
 from g4_backend import Sim3, from_prediction
+from .._common import sha256_file as sha256
 
 
 def local_path(uri):
@@ -17,14 +17,6 @@ def local_path(uri):
     if not path.is_absolute():
         raise ValueError("expected an absolute path")
     return path
-
-
-def sha256(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 @dataclass

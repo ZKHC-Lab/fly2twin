@@ -1,7 +1,7 @@
 # NX Step 2 一键启动说明（single-NX 连续重建）
 
 本文档针对 Orin NX 16GB 台架机，下文用 `<nx-user>@<nx-host>` 表示它的登录账号和地址。
-这是经过实机验证的正确启动顺序；**bench-only，绝不启动 mavros/PX4，绝不启动桨叶。**
+传感器部分（第 1–5 步）的启动顺序经过实机验证；第 6 步用的台架配置在 NX 上未运行过（`nx_step2_bringup.sh:7-8`）。**bench-only，绝不启动 mavros/PX4，绝不启动桨叶。**
 
 ## 一键启动
 
@@ -11,9 +11,8 @@ source devel/setup.bash
 bash src/drone3d_reconstruction_core/scripts/nx_step2_bringup.sh
 ```
 
-部署目录（2026-10-19 起）为 `~/Drone_3D-01-claude`：脚本默认的工作空间是它所在的部署目录，配置与 FAST-LIO 启动文件在
-`<部署目录>/ROS_Compatibility_layer/run/nx_step2/`，VGGT-Omega 权重在 `<部署目录>/DataSet/Model/vggt_omega_1b_512.pt`。旧目录
-`~/Drone_3D-01`、`~/Drone_3D-01-g4-validation`、`~/Drone_3D-01-remote` 已删除。
+脚本默认的工作空间是它所在的部署目录。`tools/nx_bench/deploy_to_nx.py` 和台架配置里的路径写死为 NX 上的 `~/Drone_3D-01`：配置与 FAST-LIO 启动文件在
+`~/Drone_3D-01/ROS_Compatibility_layer/run/nx_step2/`，VGGT-Omega 权重在 `~/Drone_3D-01/Data/Model/vggt_omega_1b_512.pt`。部署到别的目录时要改这些路径。
 
 脚本按已验证顺序启动，并自带幂等检查（已在运行/已在发 topic 就跳过）：
 
@@ -29,7 +28,7 @@ bash src/drone3d_reconstruction_core/scripts/nx_step2_bringup.sh
 第 6 步前会自动执行 `continuous_production_preflight.py`（ROS master + CUDA + checkpoint digest）。
 加 `--no-web` 可以不开 Web；路径可用 `--step2-root` / `--workspace` 覆盖。
 
-一键脚本的生产栈按台架配置运行：640×480、16 帧窗，窗口放置用主线的逐帧位姿放置（`g4_placement: frame_pose`，位姿时间偏移 40 ms 在采集端施加，逐帧深度尺度）。这份台架配置在 NX 实机上未验证（2026-11-23 切换时 NX 不在手边），分辨率和窗口帧数也还是台架值。机载主线的完整配置（1280×720、40 帧窗）见 [机载融合与交付包](ONBOARD_V1.md) 第 1 节，只在 bag 回放中验证过。
+一键脚本的生产栈按台架配置（`tools/nx_bench/profiles/`）运行：RealSense 默认 640×480@15。取帧、分窗、尺度和放置的取值与 bag 回放配置（`tools/bag/profiles/`）相同，2026-11-25 对齐：按 5 Hz 取样后按运动筛关键帧（0.15 m / 8° / 2 s），开交接缓冲（150 帧），40 帧窗、5 帧共享，推理长边 384；逐帧位姿放置（`g4_placement: frame_pose`，位姿时间偏移 +40 ms 在采集端施加，逐帧深度尺度 `g4_frame_scales: true`）。两套配置只在机器相关的项上不同（路径、解释器、端口、内存门槛、超时、深度话题）；`test_continuous_session_node.py` 逐键比对两套配置，改歪会失败。这份台架配置在 NX 实机上未运行过；NX 上跑过的 40 帧窗是下面 11-03 的那次，当时每窗约 42 s，跟不上采集。各项取值见 [机载融合与交付包](ONBOARD_V1.md) 第 1 节。
 
 ## 滑窗运行与验收
 
@@ -37,7 +36,7 @@ bash src/drone3d_reconstruction_core/scripts/nx_step2_bringup.sh
 
 运行中 `lossless_fifo` 达到 `queue_capacity` 水位后暂停新采集，消费释放容量后恢复；已启动采集和重试保留。暂停期间到达的图像全部丢失，交付包和落地 BA 也就缺了这一段，因此模板默认容量为 1000，实际只受 `min_free_disk_gb` 磁盘红线限制：重建慢于采集时，积压的窗口留在磁盘上排队。2026-11-03 NX 实测（15W，384 / 40 帧窗）：每窗处理中位 52.5 s（GPU 推理 38 s），新窗口每 15.8 s 一个，10 分钟积压 27 窗；去掉每窗重复的权重哈希后每窗约 42 s。落地后按 STOP：采集立即停止，会话进入 `DRAINING`，把排队窗口重建完、等 G4 发布完整地图后自动停下（2026-11-03 起；之前的版本 STOP 会删除所有还没重建的窗口）。处理积压期间 Web 按钮变为“立即停止”，再按一次会丢弃剩余窗口。2026-11-03 本机回放加写盘压力时，重建降到约 40–50 s/窗，容量 8 的队列填满，窗口之间出现 15–48 s 的采集空档。队列只有 `lossless_fifo` 一种，共享帧数和其它会话参数在运行中不能修改。v4 合成输入保留相机参数、odom、TF 和可选传感器深度。
 
-例如按 5 FPS 时间采样、40 帧窗、5 帧共享时，名义产窗间隔约 7 s；开启运动关键帧后按实际选帧间隔计。日志 `window_service_timing` 的 `service_wall_time_sec` 覆盖每次消费的推理、校验、发布与正常清理；`service_budget_sec` 是该窗口冻结参数对应的名义产窗间隔。还需检查 FIFO 最老等待时间；满载暂停不代表硬件已达到 5 FPS 连续建图吞吐。每个窗口各自产出正式的局部结果，跨窗口的放置由 G4 在后台完成，不计入这个时间。
+按 5 FPS 时间采样时，每窗新帧数 = 窗口帧数 − 共享帧数：16 帧窗、5 帧共享时名义产窗间隔约 2.2 s，40 帧窗时约 7 s；开启运动关键帧后（台架和 bag 回放配置都开）按实际选帧间隔计。日志 `window_service_timing` 的 `service_wall_time_sec` 覆盖每次消费的推理、校验、发布与正常清理；`service_budget_sec` 是该窗口冻结参数对应的名义产窗间隔。还需检查 FIFO 最老等待时间；满载暂停不代表硬件已达到 5 FPS 连续建图吞吐。每个窗口各自产出正式的局部结果，跨窗口的放置由 G4 在后台完成，不计入这个时间。
 
 ## 外部里程计模式（不自起 FAST-LIO）
 
@@ -70,8 +69,8 @@ bash src/drone3d_reconstruction_core/scripts/nx_step2_bringup.sh \
 
 ## 录制离线重建数据（3DGS 用）
 
-只起传感器和 TF，不起生产栈，录原始 bag 回本机处理。一键脚本的生产栈配置按 640×480 写（台架配置；主线的 1280×720 配置见 [机载融合与交付包](ONBOARD_V1.md)），换彩色分辨率时脚本要求同时加
-`--no-production`。
+只起传感器和 TF，不起生产栈，录原始 bag 回本机处理。脚本默认彩色 640×480@15；换彩色分辨率时脚本要求同时加
+`--no-production`（`nx_step2_bringup.sh:85-86`）。
 
 ```bash
 cd <NX 上的仓库>/ROS_Compatibility_layer && source devel/setup.bash
@@ -98,7 +97,7 @@ bash $S/nx_record.sh --name office_gs_02    # Ctrl-C 停止，默认存到 ~/bag
 - 读取压缩 bag：`cv2.imdecode(np.frombuffer(msg.data, np.uint8), cv2.IMREAD_COLOR)` 得到 BGR 图像，可直接 `cv2.imwrite`。
   原有按 `sensor_msgs/Image` 解码的抽帧脚本要相应修改。
 
-参数依据（离线 3DGS 结论见 [3DGS 离线重建](../../../docs/GS_OFFLINE_RECONSTRUCTION.md)）：
+参数依据（离线 3DGS 实验结论）：
 
 | 参数 | 取值 | 依据 |
 |---|---|---|

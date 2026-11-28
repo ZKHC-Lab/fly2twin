@@ -1,8 +1,10 @@
-# Phone video: drone depth/fusion method, GLOMAP poses, assumed camera height 1.4 m.
+# Phone video: drone depth/fusion method, poses from the VGGT windows (pose.provider: vggt), assumed walking speed.
 protocol: phone
 video: scene/video.MOV
 output: ../../outputs/phone_b0
 extract:
+  # 400 x 3 = 1200 equal timeline bins, sharpest frame per bin (no motion criterion);
+  # poses and training use the same frames. Frames are always scaled to long_edge.
   target_frames: 400
   min_frames: 200
   sfm_multiple: 3
@@ -17,13 +19,15 @@ sfm:
   overlap: 20
   loop_keyframes: 60
   loop_max_pairs: 600
-  max_features: 8192
+  # 2048 features per frame: same quality as 8192 on the three videos tried, BA three to five times faster.
+  max_features: 2048
   threads: 8
 pose:
-  provider: glomap
+  provider: vggt
   refine: none
   metric:
-    camera_height_m: 1.4
+    # Assumed, not measured: metres in all later stages come from this walking speed.
+    speed_mps: 1.0
 split:
   mode: holdout
   exclude_blur: false
@@ -41,7 +45,7 @@ train:
   discard_initial_permutation: true
   exact_steps: true
   image_cache_frames: 1200
-  max_width: 1600
+  max_width: 1600  # 1920x1080 frames train at 1600x900
   reset_at_zero: true
   scale_densification: true
   schedule_rounding: round

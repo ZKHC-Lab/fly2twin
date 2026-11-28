@@ -1,4 +1,5 @@
 """CPU-only demo construction, PLY quantiles and HTTP cache regression tests."""
+
 import functools
 import http.server
 import json
@@ -16,11 +17,16 @@ from viewer.tools.serve import NoCache
 
 
 def ply(path, fmt='ascii'):
-    header = ('ply\nformat ' + fmt + ' 1.0\nelement vertex 3\n'
-              'property uchar red\nproperty float z\nproperty double x\nproperty float y\nend_header\n')
+    header = (
+        'ply\nformat ' + fmt + ' 1.0\nelement vertex 3\n'
+        'property uchar red\nproperty float z\nproperty double x\nproperty float y\nend_header\n'
+    )
     rows = [(255, 20, 0, 10), (128, 30, 10, 20), (0, 40, 20, 30)]
-    data = '\n'.join(' '.join(map(str, row)) for row in rows).encode() if fmt == 'ascii' else b''.join(
-        struct.pack(('<' if fmt == 'binary_little_endian' else '>') + 'Bfdf', *row) for row in rows)
+    data = (
+        '\n'.join(' '.join(map(str, row)) for row in rows).encode()
+        if fmt == 'ascii'
+        else b''.join(struct.pack(('<' if fmt == 'binary_little_endian' else '>') + 'Bfdf', *row) for row in rows)
+    )
     path.write_bytes(header.encode() + data)
 
 
@@ -29,7 +35,7 @@ def test_quantiles(tmp_path, fmt):
     path = tmp_path / 'cloud.ply'
     ply(path, fmt)
     bounds = cloud_bounds(path)
-    assert bounds['min'] == pytest.approx([.1, 10.1, 20.1])
+    assert bounds['min'] == pytest.approx([0.1, 10.1, 20.1])
     assert bounds['max'] == pytest.approx([19.9, 29.9, 39.9])
 
 
@@ -45,8 +51,13 @@ def export(tmp_path, name, scene):
 def test_build_overlay_preserves_sources(tmp_path):
     old = {'preferred_model': {'path': 'gaussians.ply', 'full_sh': True}}
     first = export(tmp_path, 'old export', old)
-    second_scene = {**old, 'bounds': {'min': [0, 1, 2], 'max': [3, 4, 5]},
-                    'name': 'Original', 'world_up': [0, 1, 0], 'subtitle': 'Preserve me'}
+    second_scene = {
+        **old,
+        'bounds': {'min': [0, 1, 2], 'max': [3, 4, 5]},
+        'name': 'Original',
+        'world_up': [0, 1, 0],
+        'subtitle': 'Preserve me',
+    }
     second = export(tmp_path, 'new', second_scene)
     cache = tmp_path / 'cache'
     site, manifests, ids = build_site([first, second], ['Custom', 'Ignored'], cache)
@@ -58,7 +69,7 @@ def test_build_overlay_preserves_sources(tmp_path):
     assert (site / 'scene-0' / 'gaussians.ply').resolve() == first / 'gaussians.ply'
     overlay = json.loads((site / 'scene-0' / 'scene.json').read_text())
     assert overlay['name'] == 'Custom'
-    assert overlay['bounds']['min'] == pytest.approx([.1, 10.1, 20.1])
+    assert overlay['bounds']['min'] == pytest.approx([0.1, 10.1, 20.1])
     new = json.loads((site / 'scene-1' / 'scene.json').read_text())
     assert all(new[key] == second_scene[key] for key in second_scene)
     assert json.loads((first / 'scene.json').read_text()) == old
@@ -120,8 +131,9 @@ def test_no_cache_and_occupied_port(tmp_path):
     try:
         port = server.server_port
         ensure_server(tmp_path, port)  # Reuse the matching tool server.
-        with urlopen(Request(f'http://127.0.0.1:{port}/hello.js', headers={
-                'If-Modified-Since': 'Wed, 21 Oct 2099 07:28:00 GMT'})) as response:
+        with urlopen(
+            Request(f'http://127.0.0.1:{port}/hello.js', headers={'If-Modified-Since': 'Wed, 21 Oct 2099 07:28:00 GMT'})
+        ) as response:
             assert response.status == 200
             assert 'no-store' in response.headers['Cache-Control']
             assert response.read() == b'current'

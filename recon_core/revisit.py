@@ -25,23 +25,24 @@ scale. A gap between two frames is closed mostly by the one farther from the sur
 the same prior on every frame, that needs the smaller scale change. Frames that share no
 surface with another window keep their scale.
 """
+
 import numpy as np
 
 from .fusion import partners, supported_points
 
-GATES_M = (0.20, 0.12, 0.08)   # match distance per round
-NORMAL_DOT = 0.6               # cos between the two normals of a match (both face their cameras)
-HUBER_M = 0.03                 # residuals beyond this get weight HUBER_M / |r|
-SIGMA_RESIDUAL_M = 0.03        # point-to-plane noise of one match
-CORRELATION = 30.0             # matches of one frame pair are not independent: variance factor
-SIGMA_PRIOR = 0.03             # log-scale correction of a frame
-SIGMA_TEMPORAL = 0.01          # difference between consecutive frames of one window
-MAX_STEP = 0.05                # largest change of a correction in one round
-MEMBER_STEP = 2                # the pool takes every MEMBER_STEP-th column of the fusion's every-second-pixel grid
-SOURCE_POINTS = 30000          # points of a window that look for matches
-TARGET_POINTS = 500000         # points of the other windows they are matched against
-MIN_POINTS = 2000              # a window (or its surroundings) with fewer points is skipped
-MARGIN_M = 0.3                 # the other windows' points are taken from the window's box plus this
+GATES_M = (0.20, 0.12, 0.08)  # match distance per round
+NORMAL_DOT = 0.6  # cos between the two normals of a match (both face their cameras)
+HUBER_M = 0.03  # residuals beyond this get weight HUBER_M / |r|
+SIGMA_RESIDUAL_M = 0.03  # point-to-plane noise of one match
+CORRELATION = 30.0  # matches of one frame pair are not independent: variance factor
+SIGMA_PRIOR = 0.03  # log-scale correction of a frame
+SIGMA_TEMPORAL = 0.01  # difference between consecutive frames of one window
+MAX_STEP = 0.05  # largest change of a correction in one round
+MEMBER_STEP = 2  # the pool takes every MEMBER_STEP-th column of the fusion's every-second-pixel grid
+SOURCE_POINTS = 30000  # points of a window that look for matches
+TARGET_POINTS = 500000  # points of the other windows they are matched against
+MIN_POINTS = 2000  # a window (or its surroundings) with fewer points is skipped
+MARGIN_M = 0.3  # the other windows' points are taken from the window's box plus this
 
 
 def member_points(poses, K, depth, good, step=MEMBER_STEP):
@@ -54,14 +55,17 @@ def member_points(poses, K, depth, good, step=MEMBER_STEP):
     neighbors = partners(poses)
     H, W = depth.shape[1:]
     v, u = np.mgrid[0:H, 0:W]
-    rows, cols = (a.reshape(-1) for a in np.mgrid[0:H:2, 0:W:2 * step])
+    rows, cols = (a.reshape(-1) for a in np.mgrid[0:H:2, 0 : W : 2 * step])
     rel, normal, count = [], [], np.zeros(len(poses), np.int64)
     for i in range(len(poses)):
         xyz, keep = supported_points(i, poses, K, depth, good, neighbors, rows, cols)
         if not len(xyz):
             continue
         Ki, R = K[i], poses[i, :3, :3]
-        cam = np.stack([(u - Ki[0, 2]) / Ki[0, 0], (v - Ki[1, 2]) / Ki[1, 1], np.ones((H, W))], -1) * np.asarray(depth[i])[..., None]
+        cam = (
+            np.stack([(u - Ki[0, 2]) / Ki[0, 0], (v - Ki[1, 2]) / Ki[1, 1], np.ones((H, W))], -1)
+            * np.asarray(depth[i])[..., None]
+        )
         at = cam[rows[keep], cols[keep]]
         n = np.cross(np.gradient(cam, axis=1)[rows[keep], cols[keep]], np.gradient(cam, axis=0)[rows[keep], cols[keep]])
         n /= np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-12)
@@ -77,7 +81,7 @@ def member_points(poses, K, depth, good, step=MEMBER_STEP):
 
 def _thin(index, limit):
     """At most ``limit`` entries of ``index``, evenly spaced (no random numbers)."""
-    return index if len(index) <= limit else index[::-(-len(index) // limit)]
+    return index if len(index) <= limit else index[:: -(-len(index) // limit)]
 
 
 def _rows(first, frames):
@@ -85,8 +89,9 @@ def _rows(first, frames):
     return np.concatenate([np.arange(first[f], first[f + 1]) for f in frames]) if len(frames) else np.zeros(0, np.int64)
 
 
-def frame_log_scale_corrections(poses, K, depth, good, frame_window, gates=GATES_M,
-                                sigma_prior=SIGMA_PRIOR, sigma_temporal=SIGMA_TEMPORAL):
+def frame_log_scale_corrections(
+    poses, K, depth, good, frame_window, gates=GATES_M, sigma_prior=SIGMA_PRIOR, sigma_temporal=SIGMA_TEMPORAL
+):
     """Log-scale correction per frame; multiply frame f's metric depth by exp(result[f]).
 
     ``poses`` camera-to-world (N, 4, 4); ``K`` intrinsics at the depth resolution (N, 3, 3);
@@ -99,12 +104,19 @@ def frame_log_scale_corrections(poses, K, depth, good, frame_window, gates=GATES
     from scipy.sparse import coo_matrix, identity
     from scipy.sparse.linalg import spsolve
     from scipy.spatial import cKDTree
+
     poses = np.asarray(poses, np.float64)
     n = len(poses)
     code = np.unique(np.asarray(frame_window), return_inverse=True)[1].reshape(-1)
     sig = np.zeros(n)
-    info = dict(frames=n, windows=int(code.max() + 1) if n else 0, member_points=0, rounds=[],
-                correction_abs_median=0.0, correction_abs_max=0.0)
+    info = dict(
+        frames=n,
+        windows=int(code.max() + 1) if n else 0,
+        member_points=0,
+        rounds=[],
+        correction_abs_median=0.0,
+        correction_abs_max=0.0,
+    )
     rel, normal, first = member_points(poses, K, depth, good)
     info["member_points"] = int(len(rel))
     frame = np.repeat(np.arange(n, dtype=np.int32), np.diff(first))
@@ -116,25 +128,38 @@ def frame_log_scale_corrections(poses, K, depth, good, frame_window, gates=GATES
     if len(sources) < 2:
         return sig, info
     centers = poses[:, :3, 3]
-    reach = np.array([np.sqrt((rel[first[f]:first[f + 1]].astype(np.float64) ** 2).sum(1).max()) if first[f + 1] > first[f] else 0.0
-                      for f in range(n)])
+    reach = np.array(
+        [
+            np.sqrt((rel[first[f] : first[f + 1]].astype(np.float64) ** 2).sum(1).max())
+            if first[f + 1] > first[f]
+            else 0.0
+            for f in range(n)
+        ]
+    )
     pairs = np.flatnonzero(code[:-1] == code[1:])
-    k = 1.0 / sigma_temporal ** 2
-    smooth = coo_matrix((np.r_[np.full(2 * len(pairs), k), np.full(2 * len(pairs), -k)],
-                         (np.r_[pairs, pairs + 1, pairs, pairs + 1], np.r_[pairs, pairs + 1, pairs + 1, pairs])), shape=(n, n)).tocsr()
-    prior = identity(n, format="csr") / sigma_prior ** 2
+    k = 1.0 / sigma_temporal**2
+    smooth = coo_matrix(
+        (
+            np.r_[np.full(2 * len(pairs), k), np.full(2 * len(pairs), -k)],
+            (np.r_[pairs, pairs + 1, pairs, pairs + 1], np.r_[pairs, pairs + 1, pairs + 1, pairs]),
+        ),
+        shape=(n, n),
+    ).tocsr()
+    prior = identity(n, format="csr") / sigma_prior**2
     points = np.empty_like(rel)
     for gate in gates:
-        for a in range(0, len(rel), 1 << 20):       # world points at the current corrections, in chunks
-            f = frame[a:a + (1 << 20)]
-            points[a:a + (1 << 20)] = centers[f] + np.exp(sig[f])[:, None] * rel[a:a + (1 << 20)]
+        for a in range(0, len(rel), 1 << 20):  # world points at the current corrections, in chunks
+            f = frame[a : a + (1 << 20)]
+            points[a : a + (1 << 20)] = centers[f] + np.exp(sig[f])[:, None] * rel[a : a + (1 << 20)]
         far = reach * np.exp(sig) + MARGIN_M
         I, J, AI, AJ, RR = [], [], [], [], []
         for w, src in sources.items():
             p = points[src].astype(np.float64)
             lo, hi = p.min(0), p.max(0)
             # Frames of other windows that can reach the box; then their points inside it.
-            near = np.flatnonzero((code != w) & np.all((centers >= lo - far[:, None]) & (centers <= hi + far[:, None]), axis=1))
+            near = np.flatnonzero(
+                (code != w) & np.all((centers >= lo - far[:, None]) & (centers <= hi + far[:, None]), axis=1)
+            )
             other = _rows(first, near)
             other = other[np.all((points[other] >= lo - MARGIN_M) & (points[other] <= hi + MARGIN_M), axis=1)]
             if len(other) < MIN_POINTS:
@@ -148,7 +173,8 @@ def frame_log_scale_corrections(poses, K, depth, good, frame_window, gates=GATES
             ok = np.sum(normal[src[hit]] * nt, axis=1) > NORMAL_DOT
             hit, nearest, nt = hit[ok], nearest[ok], nt[ok]
             fi, fj = frame[src[hit]], frame[other[nearest]]
-            I.append(fi); J.append(fj)
+            I.append(fi)
+            J.append(fj)
             RR.append(np.sum(nt * (p[hit] - q[nearest]), axis=1))
             AI.append(np.sum(nt * (p[hit] - centers[fi]), axis=1))
             AJ.append(np.sum(nt * (q[nearest] - centers[fj]), axis=1))
@@ -156,10 +182,24 @@ def frame_log_scale_corrections(poses, K, depth, good, frame_window, gates=GATES
         if not matches:
             break
         I, J, AI, AJ, RR = (np.concatenate(a) for a in (I, J, AI, AJ, RR))
-        wt = np.minimum(1.0, HUBER_M / np.maximum(np.abs(RR), 1e-9)) / (SIGMA_RESIDUAL_M ** 2 * CORRELATION)
-        A = coo_matrix((np.r_[wt * AI * AI, wt * AJ * AJ, -wt * AI * AJ, -wt * AI * AJ],
-                        (np.r_[I, J, I, J], np.r_[I, J, J, I])), shape=(n, n)).tocsr() + prior + smooth
-        b = np.bincount(J, wt * AJ * RR, minlength=n) - np.bincount(I, wt * AI * RR, minlength=n) - prior @ sig - smooth @ sig
+        wt = np.minimum(1.0, HUBER_M / np.maximum(np.abs(RR), 1e-9)) / (SIGMA_RESIDUAL_M**2 * CORRELATION)
+        A = (
+            coo_matrix(
+                (
+                    np.r_[wt * AI * AI, wt * AJ * AJ, -wt * AI * AJ, -wt * AI * AJ],
+                    (np.r_[I, J, I, J], np.r_[I, J, J, I]),
+                ),
+                shape=(n, n),
+            ).tocsr()
+            + prior
+            + smooth
+        )
+        b = (
+            np.bincount(J, wt * AJ * RR, minlength=n)
+            - np.bincount(I, wt * AI * RR, minlength=n)
+            - prior @ sig
+            - smooth @ sig
+        )
         sig = sig + np.clip(spsolve(A.tocsc(), b), -MAX_STEP, MAX_STEP)
         info["rounds"].append(dict(gate_m=float(gate), matches=matches, residual_median_m=float(np.median(np.abs(RR)))))
     info["correction_abs_median"] = float(np.median(np.abs(sig)))

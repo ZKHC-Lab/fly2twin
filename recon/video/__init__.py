@@ -1,1 +1,1 @@
-"""Video input and reference-compatible phone reconstruction."""
+"""Video frame extraction and input manifest preparation."""

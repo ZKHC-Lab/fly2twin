@@ -14,10 +14,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-import hashlib
 import json
-import math
 import os
 from pathlib import Path
 import re
@@ -29,13 +26,9 @@ from types import SimpleNamespace
 from typing import Any, Callable
 from urllib.parse import unquote, unquote_to_bytes, urlsplit
 
-from .capture import CaptureConfig, CaptureError, validate_capture_goal
-from .depth_metrics import compute_first_frame_depth_metrics
+from .capture import CaptureConfig
 from .frame_pool import FramePool, FramePoolConfig, FramePoolError
 from .formal_result import (
-    FORMAL_RECORD_SCHEMA,
-    FORMAL_RECORD_SCHEMA_VERSION,
-    FormalResultError,
     publish_formal_record,
     verify_result_manifest,
 )
@@ -44,7 +37,8 @@ from .odom_local import (
     COORDINATE_ODOM_LOCAL_APPROX,
 )
 from .snapshot_validator import validate_snapshot
-from .g4.backend_process import BACKEND_G4, G4BackendProcess
+from .g4.backend_process import BACKEND_G4, G4BackendProcess  # noqa: F401  BACKEND_G4 re-exported
+from .continuous_align import G4WindowAligner
 
 from .action_types import (
     ACTION_SUCCEEDED,
@@ -52,18 +46,60 @@ from .action_types import (
     CaptureActionOutcome,
     ReconstructActionOutcome,
 )
+from ._common import is_relative_to as _is_relative_to
 
-# 会话状态
-SESSION_IDLE = "IDLE"
-SESSION_RUNNING = "RUNNING"
-SESSION_PAUSED = "PAUSED"
-SESSION_DISK_PAUSED = "DISK_PAUSED"
-SESSION_FATAL_OOM = "FATAL_OOM"
-SESSION_MEMORY_PAUSED = "MEMORY_PAUSED"
-SESSION_STOPPING = "STOPPING"
-SESSION_STOPPED = "STOPPED"
-# STOP with queued windows: capture has stopped, the queue is still being reconstructed.
-SESSION_DRAINING = "DRAINING"
+# Configuration and the state/record types live in their own modules.
+from .continuous_session_config import (  # noqa: F401  re-exported: continuous_session keeps every old name
+    ContinuousConfig,
+    ContinuousConfigError,
+    EffectiveConfig,
+    _finite,
+    QUEUE_LOSSLESS,
+    RECONSTRUCTION_MODE_PER_WINDOW,
+    RECONSTRUCTION_MODES,
+    _valid_sha256,
+    _validate_capture_runtime,
+    _validate_inference_resolution,
+    _validate_overlap_frames,
+    _validate_window_frames,
+    _validate_worker_timeout,
+)
+from .continuous_session_types import (  # noqa: F401  re-exported: continuous_session keeps every old name
+    ContinuousCaptureClient,
+    JOB_CANCELLED,
+    JOB_FAILED,
+    JOB_PENDING,
+    JOB_RUNNING,
+    JOB_SUCCEEDED,
+    _JOB_TERMINAL,
+    JobStatus,
+    ReconstructionBackend,
+    SESSION_DISK_PAUSED,
+    SESSION_DRAINING,
+    SESSION_FATAL_OOM,
+    SESSION_IDLE,
+    SESSION_MEMORY_PAUSED,
+    SESSION_PAUSED,
+    SESSION_RUNNING,
+    SESSION_STOPPED,
+    SESSION_STOPPING,
+    SessionStatus,
+    WINDOW_CANCELLED,
+    WINDOW_CAPTURING,
+    WINDOW_FAILED,
+    WINDOW_PENDING,
+    WINDOW_RUNNING,
+    WINDOW_SUCCEEDED,
+    WindowRecord,
+)
+from .continuous_formal import FORMAL_PUBLISHED, FORMAL_SKIPPED, publish_window
+from .continuous_job import (
+    COLLECT_ERROR,
+    STATUS_DEADLINE_WITH_OWNER_RETAINED,
+    STOP_CANCELLED_WITH_OWNER_RETAINED,
+    wait_collect_job,
+)
+
 # After the queue drains, how long STOP waits for G4 to publish the complete map.
 _DRAIN_G4_WAIT_SEC = 600.0
 
@@ -82,576 +118,74 @@ _MEMORY_GUARD_PATTERN = re.compile(
     r"worker stopped: resource_guard|\b(?:LOW_MEM_AVAILABLE|HIGH_SWAP_USED|HIGH_SWAP_GROWTH)\b"
 )
 
-# 窗口状态
-WINDOW_CAPTURING = "CAPTURING"
-WINDOW_PENDING = "PENDING"
-WINDOW_RUNNING = "RUNNING"
-WINDOW_SUCCEEDED = "SUCCEEDED"
-WINDOW_FAILED = "FAILED"
-WINDOW_CANCELLED = "CANCELLED"
-
-QUEUE_LOSSLESS = "lossless_fifo"
 _DISK_REDLINE_ERROR = "disk redline reached; new capture paused"
-
-RECONSTRUCTION_MODE_PER_WINDOW = "per_window"
-RECONSTRUCTION_MODES = (RECONSTRUCTION_MODE_PER_WINDOW,)
 
 # 一个窗口送去重建的帧里，没有关联上位姿（pose_valid 为假）的帧所占比例的上限；
 # 严格大于时该窗口判失败、不提交重建。维护者 2026-11-23 决定：办公室那次飞行
 # （118 窗、每窗 40 帧）里最差的两个窗口恰好缺 8 帧即 20%，没有窗口超过。
 MAX_MISSING_POSE_FRACTION = 0.2
 
-JOB_PENDING = "PENDING"
-JOB_RUNNING = "RUNNING"
-JOB_SUCCEEDED = "SUCCEEDED"
-JOB_FAILED = "FAILED"
-JOB_CANCELLED = "CANCELLED"
-_JOB_TERMINAL = frozenset((JOB_SUCCEEDED, JOB_FAILED, JOB_CANCELLED))
-
 _SNAPSHOT_DIR_RE = re.compile(
     r"cs-s?[0-9a-f]{16}-w[0-9]+-[0-9a-f]{16}\Z"
 )
 _SCENE_ID_PREFIX_RE = re.compile(r"cs-s[0-9a-f]{16}-w[0-9]+\Z")
-# 正式化期间检测到 stop_all 的专用返回值：消费路径必须按 CANCELLED 处理。
-_FORMAL_SKIPPED_STOPPING = "formal record publication skipped: session is stopping"
-_MAX_SNAPSHOT_MANIFEST_BYTES = 16 * 1024 * 1024
-_NO_SENSOR_DEPTH_REASONS = frozenset(
-    (
-        "sensor depth saving is disabled",
-        "snapshot has no first-frame sensor depth",
-    )
-)
 
 
-class ContinuousConfigError(ValueError):
-    """连续调度器配置非法。"""
+class _JobControl:
+    """The scheduler side of :func:`wait_collect_job`: each method takes the session lock
+    for the same short update the scheduler used to make inline."""
 
+    def __init__(self, session: "ContinuousSession") -> None:
+        self._session = session
 
-@dataclass(frozen=True)
-class ContinuousConfig:
-    """连续 session 调度器的显式配置（不含运行时热调值）。"""
+    def stopping(self) -> bool:
+        with self._session._lock:
+            return self._session._stopping
 
-    roles: tuple[CameraRole, ...]
-    reconstruct_action: str
-    journal_root: str
-    result_root: str
-    service_name: str
-    diagnostics_topic: str
-    diagnostics_period_sec: float
-    min_free_disk_gb: float
-    action_connect_timeout_sec: float
-    capture_wait_margin_sec: float
-    reconstruct_wait_timeout_sec: float
-    stop_timeout_sec: float
-    reconstruct_frame_group_size: int
-    initial_sample_fps: float
-    initial_window_frames: int
-    initial_queue_mode: str
-    initial_queue_capacity: int
-    initial_max_retries: int
-    initial_keep_snapshot_on_success: bool
-    initial_overlap_frames: int = 0
-    # 窗口放置方式：只有 frame_pose（每帧用外部定位位姿，VGGT 只提供深度与尺度）。
-    g4_placement: str = "frame_pose"
-    # frame_pose 下位姿取在 RGB 时间 + 偏移（毫秒）。
-    pose_time_offset_ms: float = 0.0
-    pose_time_offset_stage: str = "backend"
-    frame_pose_fusion: bool = False
-    # frame_pose 窗口尺度：跨窗口重叠帧深度比的每行权重；0 = 只用轨迹先验与相邻共享帧。
-    g4_cross_window_weight: float = 0.0
-    # frame_pose：每帧一个深度尺度（窗内与跨窗口帧对联合求解）；与 g4_cross_window_weight 二选一。
-    g4_frame_scales: bool = False
-    # 源图像分辨率下的标定内参 {width, height, fx, fy, cx, cy}；为空时用快照 CameraInfo。
-    camera_intrinsics: dict | None = None
-    # 0 = inherit reconstruct profile (do not override the worker command)
-    initial_inference_resolution: int = 0
-    # 0.0 = inherit reconstruct profile worker timeout
-    initial_worker_timeout_sec: float = 0.0
-    # 重建模式：只有 per_window（逐窗增量）。只在 start_session 时冻结。
-    initial_reconstruction_mode: str = RECONSTRUCTION_MODE_PER_WINDOW
-    # 正式结果真实性门禁期望值。production 节点必须从 reconstruct profile
-    # 注入（expected_reconstruction），core 允许为空以支撑注入假门禁的
-    # 非正式单元测试；真实门禁在期望缺失时必然拒绝成功终态。
-    expected_checkpoint_sha256: str = ""
-    expected_checkpoint_path: str = ""
-    expected_result_root: str = ""
-    expected_algorithm_revision: str = ""
-    expected_ros_revision: str = ""
-    worker_python: str = ""
-    cuda_visible_devices: str = ""
-    alignment_backend: str = BACKEND_G4
-    reconstruction_backend: str = "omega"
+    def cancel_failed(self, message: str) -> None:
+        with self._session._lock:
+            self._session._last_error = message
 
-    def __post_init__(self) -> None:
-        try:
-            self.preflight()
-        except ContinuousConfigError:
-            raise
-        except Exception as error:
-            raise ContinuousConfigError(
-                f"continuous config preflight failed: {type(error).__name__}: {error}"
-            ) from error
+    def cancel_requested(self, job_id: str) -> None:
+        with self._session._lock:
+            self._session._update_stop_audit_backend_locked(job_id, cancel_requested=True)
 
-    def preflight(self) -> None:
-        from .backend_spec import validate_independent_request
-        validate_independent_request(self.reconstruction_backend, self.initial_window_frames,
-                                     self.initial_inference_resolution)
-        if self.alignment_backend != BACKEND_G4:
-            raise ContinuousConfigError(
-                f"alignment_backend must be {BACKEND_G4!r}, got {self.alignment_backend!r}"
+    def watchdog_fired(self, job_id: str, message: str) -> None:
+        with self._session._lock:
+            self._session._update_stop_audit_backend_locked(job_id, cancel_requested=True)
+            self._session._last_error = message
+
+    def status_deadline(self, error: str) -> None:
+        session = self._session
+        with session._lock:
+            session._stopping = True
+            session._state = SESSION_STOPPING
+            session._last_error = error
+            session._wake_capture.set()
+            session._wake_consume.set()
+
+    def terminal(self, job_id: str, status: JobStatus) -> bool:
+        with self._session._lock:
+            self._session._update_stop_audit_backend_locked(
+                job_id, terminal_state=status.state, terminal_message=status.message
             )
-        if self.reconstruction_backend != "omega":
-            raise ContinuousConfigError("G4 requires the Omega reconstruction backend")
-        if (self.initial_overlap_frames < 5 or self.initial_window_frames <= self.initial_overlap_frames
-                or self.initial_inference_resolution <= 0 or self.initial_inference_resolution % 16
-                or self.initial_queue_mode != QUEUE_LOSSLESS
-                or not self.initial_keep_snapshot_on_success):
-            raise ContinuousConfigError("G4 requires >=5 shared frames, a larger total window, a 16-multiple resolution "
-                                        "(384/448/512), lossless_fifo and retained snapshots")
-        for role in self.roles:
-            if role.capture_config.odometry_association != "interpolate":
-                raise ContinuousConfigError("G4 requires RGB-time interpolated localization")
-        if not isinstance(self.roles, tuple) or not self.roles:
-            raise ContinuousConfigError("roles must be a nonempty tuple")
-        seen = set()
-        for role in self.roles:
-            if not isinstance(role, CameraRole):
-                raise ContinuousConfigError("roles entries must be CameraRole")
-            if role.role in seen:
-                raise ContinuousConfigError(f"duplicate camera role: {role.role}")
-            seen.add(role.role)
-        if not isinstance(self.reconstruct_action, str) or not self.reconstruct_action:
-            raise ContinuousConfigError("reconstruct_action must be nonempty")
-        for name in ("service_name", "diagnostics_topic"):
-            value = getattr(self, name)
-            if not isinstance(value, str) or not value or " " in value:
-                raise ContinuousConfigError(f"{name} must be a nonempty ROS name")
-        if (
-            isinstance(self.diagnostics_period_sec, bool)
-            or not isinstance(self.diagnostics_period_sec, (int, float))
-            or not _finite(self.diagnostics_period_sec)
-            or self.diagnostics_period_sec <= 0
-        ):
-            raise ContinuousConfigError(
-                "diagnostics_period_sec must be positive and finite"
+            return status.state == JOB_FAILED and "cleanup_failed" in str(status.message).lower()
+
+    def collect_failed(self, job_id: str, message: str) -> None:
+        session = self._session
+        with session._lock:
+            session._last_error = message
+            if session._stop_audit is not None:
+                session._stop_audit["backend_collect_error"] = session._last_error
+
+    def collected(self, job_id: str, outcome) -> None:
+        session = self._session
+        with session._lock:
+            session._active_job_id = None
+            session._last_worker_wall_time_sec = (
+                float(outcome.wall_time_sec) if _finite(outcome.wall_time_sec) else None
             )
-        result_root = Path(self.result_root)
-        if not result_root.is_absolute() or not result_root.is_dir():
-            raise ContinuousConfigError("result_root must be an existing directory")
-        if (
-            isinstance(self.reconstruct_frame_group_size, bool)
-            or not isinstance(self.reconstruct_frame_group_size, int)
-            or self.reconstruct_frame_group_size <= 0
-        ):
-            raise ContinuousConfigError(
-                "reconstruct_frame_group_size must be a positive integer"
-            )
-        journal = Path(self.journal_root)
-        if not journal.is_absolute() or not journal.is_dir():
-            raise ContinuousConfigError("journal_root must be an existing directory")
-        if journal != journal.resolve(strict=True) or journal.is_symlink():
-            raise ContinuousConfigError("journal_root must be canonical and real")
-        for name in (
-            "min_free_disk_gb",
-            "action_connect_timeout_sec",
-            "capture_wait_margin_sec",
-            "reconstruct_wait_timeout_sec",
-            "stop_timeout_sec",
-        ):
-            value = getattr(self, name)
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not _finite(value)
-                or float(value) <= 0
-            ):
-                raise ContinuousConfigError(f"{name} must be positive and finite")
-        if (
-            isinstance(self.initial_sample_fps, bool)
-            or not isinstance(self.initial_sample_fps, (int, float))
-            or not _finite(self.initial_sample_fps)
-            or self.initial_sample_fps <= 0
-        ):
-            raise ContinuousConfigError("initial_sample_fps must be positive and finite")
-        _validate_window_frames(
-            self.initial_window_frames, self.reconstruct_frame_group_size
-        )
-        _validate_overlap_frames(
-            self.initial_overlap_frames, self.initial_window_frames
-        )
-        if type(self.frame_pose_fusion) is not bool:
-            raise ContinuousConfigError("frame_pose_fusion must be a bool")
-        if self.pose_time_offset_stage not in ("capture", "backend"):
-            raise ContinuousConfigError("pose_time_offset_stage must be capture or backend")
-        if self.g4_placement != "frame_pose":
-            raise ContinuousConfigError(
-                f"g4_placement must be 'frame_pose', got {self.g4_placement!r} (graph placement was removed)"
-            )
-        if (
-            isinstance(self.pose_time_offset_ms, bool)
-            or not isinstance(self.pose_time_offset_ms, (int, float))
-            or not math.isfinite(self.pose_time_offset_ms)
-            or abs(self.pose_time_offset_ms) > 1000
-        ):
-            raise ContinuousConfigError("pose_time_offset_ms must be finite and within +-1000")
-        if (
-            isinstance(self.g4_cross_window_weight, bool)
-            or not isinstance(self.g4_cross_window_weight, (int, float))
-            or not math.isfinite(self.g4_cross_window_weight)
-            or self.g4_cross_window_weight < 0
-        ):
-            raise ContinuousConfigError("g4_cross_window_weight must be finite and nonnegative")
-        if self.g4_cross_window_weight > 0 and self.pose_time_offset_stage != "capture":
-            raise ContinuousConfigError(
-                "g4_cross_window_weight needs pose_time_offset_stage=capture"
-            )
-        if type(self.g4_frame_scales) is not bool:
-            raise ContinuousConfigError("g4_frame_scales must be a bool")
-        if self.g4_frame_scales and (
-            self.pose_time_offset_stage != "capture" or self.g4_cross_window_weight > 0
-        ):
-            raise ContinuousConfigError(
-                "g4_frame_scales needs pose_time_offset_stage=capture and g4_cross_window_weight=0"
-            )
-        if self.camera_intrinsics is not None:
-            keys = {"width", "height", "fx", "fy", "cx", "cy"}
-            intrinsics = self.camera_intrinsics
-            if not isinstance(intrinsics, dict) or set(intrinsics) != keys or any(
-                isinstance(intrinsics[k], bool) or not isinstance(intrinsics[k], (int, float))
-                or not math.isfinite(intrinsics[k]) for k in keys
-            ) or min(intrinsics["fx"], intrinsics["fy"], intrinsics["width"], intrinsics["height"]) <= 0:
-                raise ContinuousConfigError(
-                    "camera_intrinsics needs finite width, height, fx, fy, cx, cy with positive size and focal length"
-                )
-        if (
-            isinstance(self.initial_queue_capacity, bool)
-            or not isinstance(self.initial_queue_capacity, int)
-            or self.initial_queue_capacity <= 0
-        ):
-            raise ContinuousConfigError("initial_queue_capacity must be a positive integer")
-        if (
-            isinstance(self.initial_max_retries, bool)
-            or not isinstance(self.initial_max_retries, int)
-            or self.initial_max_retries < 0
-        ):
-            raise ContinuousConfigError("initial_max_retries must be a nonnegative integer")
-        if type(self.initial_keep_snapshot_on_success) is not bool:
-            raise ContinuousConfigError(
-                "initial_keep_snapshot_on_success must be a bool"
-            )
-        _validate_inference_resolution(
-            self.initial_inference_resolution, "initial_inference_resolution"
-        )
-        _validate_worker_timeout(
-            self.initial_worker_timeout_sec, "initial_worker_timeout_sec"
-        )
-        if self.initial_reconstruction_mode not in RECONSTRUCTION_MODES:
-            raise ContinuousConfigError(
-                "initial_reconstruction_mode must be one of "
-                f"{RECONSTRUCTION_MODES!r}"
-            )
-        for role in self.roles:
-            _validate_capture_runtime(
-                EffectiveConfig(
-                    sample_fps=float(self.initial_sample_fps),
-                    window_frames=int(self.initial_window_frames),
-                    queue_mode=self.initial_queue_mode,
-                    queue_capacity=int(self.initial_queue_capacity),
-                    max_retries=int(self.initial_max_retries),
-                    keep_snapshot_on_success=self.initial_keep_snapshot_on_success,
-                    save_sensor_depth=role.capture_config.save_sensor_depth,
-                    inference_resolution=int(self.initial_inference_resolution),
-                    worker_timeout_sec=float(self.initial_worker_timeout_sec),
-                    overlap_frames=int(self.initial_overlap_frames),
-                ),
-                role,
-                self.capture_wait_margin_sec,
-            )
-        for name in ("expected_checkpoint_sha256",):
-            value = getattr(self, name)
-            if value and (not isinstance(value, str) or not _valid_sha256(value)):
-                raise ContinuousConfigError(
-                    f"{name} must be empty or a lowercase SHA-256 digest"
-                )
-        for name in (
-            "expected_checkpoint_path",
-            "expected_result_root",
-            "expected_algorithm_revision",
-            "expected_ros_revision",
-            "worker_python",
-        ):
-            value = getattr(self, name)
-            if not isinstance(value, str):
-                raise ContinuousConfigError(f"{name} must be a string")
-            if value and any(ord(char) < 32 for char in value):
-                raise ContinuousConfigError(f"{name} contains control characters")
-        if self.expected_checkpoint_path and not Path(self.expected_checkpoint_path).is_absolute():
-            raise ContinuousConfigError(
-                "expected_checkpoint_path must be absolute"
-            )
-        if self.expected_result_root and not Path(self.expected_result_root).is_absolute():
-            raise ContinuousConfigError("expected_result_root must be absolute")
-        if not isinstance(self.cuda_visible_devices, str):
-            raise ContinuousConfigError("cuda_visible_devices must be a string")
-
-    def role_by_name(self, role: str) -> CameraRole | None:
-        for candidate in self.roles:
-            if candidate.role == role:
-                return candidate
-        return None
-
-
-def _validate_inference_resolution(value: Any, label: str) -> None:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ContinuousConfigError(f"{label} must be an integer")
-    if value == 0:
-        return
-    if value < 32 or value > 4096:
-        raise ContinuousConfigError(
-            f"{label} must be 0 (inherit) or in [32, 4096]"
-        )
-
-
-def _validate_worker_timeout(value: Any, label: str) -> None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ContinuousConfigError(f"{label} must be a finite number")
-    converted = float(value)
-    if not _finite(converted) or converted < 0:
-        raise ContinuousConfigError(f"{label} must be 0.0 or positive finite")
-
-
-def _validate_window_frames(window_frames: Any, frame_group_size: int) -> None:
-    if (
-        isinstance(window_frames, bool)
-        or not isinstance(window_frames, int)
-        or window_frames <= 0
-    ):
-        raise ContinuousConfigError("window_frames must be a positive integer")
-    if window_frames > frame_group_size:
-        raise ContinuousConfigError(
-            f"window_frames={window_frames} exceeds reconstruct "
-            f"frame_group_size={frame_group_size}; all captured frames must "
-            "enter one inference"
-        )
-
-
-def _validate_overlap_frames(overlap_frames: Any, window_frames: int) -> None:
-    if (
-        isinstance(overlap_frames, bool)
-        or not isinstance(overlap_frames, int)
-        or overlap_frames < 0
-        or overlap_frames >= window_frames
-    ):
-        raise ContinuousConfigError(
-            "overlap_frames must be an integer in [0, window_frames)"
-        )
-
-
-
-@dataclass(frozen=True)
-class EffectiveConfig:
-    """一个窗口封存时冻结的实际生效配置。"""
-
-    sample_fps: float
-    window_frames: int
-    queue_mode: str
-    queue_capacity: int
-    max_retries: int
-    keep_snapshot_on_success: bool
-    save_sensor_depth: bool
-    inference_resolution: int
-    worker_timeout_sec: float
-    overlap_frames: int = 0
-
-    def digest(self) -> str:
-        payload = json.dumps(
-            self.as_dict(),
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "sample_fps": float(self.sample_fps),
-            "window_frames": int(self.window_frames),
-            "queue_mode": self.queue_mode,
-            "queue_capacity": int(self.queue_capacity),
-            "max_retries": int(self.max_retries),
-            "keep_snapshot_on_success": bool(self.keep_snapshot_on_success),
-            "save_sensor_depth": bool(self.save_sensor_depth),
-            "inference_resolution": int(self.inference_resolution),
-            "worker_timeout_sec": float(self.worker_timeout_sec),
-            "overlap_frames": int(self.overlap_frames),
-        }
-
-
-def _validate_capture_runtime(
-    candidate: EffectiveConfig,
-    role: CameraRole,
-    capture_wait_margin_sec: float,
-) -> None:
-    """Apply the selected Capture profile's existing goal boundary."""
-    # Motion keyframes can space written frames up to keyframe_max_interval_sec apart.
-    max_duration = (
-        float(candidate.window_frames)
-        * role.capture_config.max_frame_interval_sec(float(candidate.sample_fps))
-        + float(capture_wait_margin_sec)
-    )
-    goal = SimpleNamespace(
-        scene_id="cs-s0000000000000000-w0",
-        sample_fps=candidate.sample_fps,
-        max_frames=candidate.window_frames,
-        max_duration=SimpleNamespace(to_sec=lambda: max_duration),
-        set_save_sensor_depth=True,
-        save_sensor_depth=candidate.save_sensor_depth,
-    )
-    try:
-        validate_capture_goal(goal, role.capture_config)
-    except CaptureError as error:
-        raise ContinuousConfigError(
-            f"runtime params violate capture profile for role {role.role!r}: {error}"
-        ) from error
-
-
-@dataclass(frozen=True)
-class JobStatus:
-    job_id: str
-    state: str
-    message: str = ""
-
-
-class ReconstructionBackend:
-    """P0-3 重建后端最小契约；V1 只有 LocalCudaBackend。"""
-
-    def submit(
-        self,
-        snapshot_uri: str,
-        manifest_sha256: str,
-        window_id: str,
-        inference_resolution: int = 0,
-        worker_timeout_sec: float = 0.0,
-    ) -> str:
-        raise NotImplementedError
-
-    def status(self, job_id: str) -> JobStatus:
-        raise NotImplementedError
-
-    def cancel(self, job_id: str) -> None:
-        raise NotImplementedError
-
-    def collect_result(self, job_id: str) -> ReconstructActionOutcome:
-        raise NotImplementedError
-
-
-class ContinuousCaptureClient:
-    """连续采集客户端（Action + CaptureControl pause/resume）。"""
-
-    def wait_for_server(self, timeout_sec: float) -> bool:
-        raise NotImplementedError
-
-    def send_goal(
-        self,
-        scene_id: str,
-        sample_fps: float,
-        max_frames: int,
-        max_duration_sec: float,
-        feedback_cb,
-        save_sensor_depth: bool | None = None,
-        set_save_sensor_depth: bool = False,
-    ) -> None:
-        raise NotImplementedError
-
-    def wait_for_result(self, timeout_sec: float) -> bool:
-        raise NotImplementedError
-
-    def cancel_goal(self) -> None:
-        raise NotImplementedError
-
-    def outcome(self) -> CaptureActionOutcome:
-        raise NotImplementedError
-
-    def pause(self) -> bool:
-        raise NotImplementedError
-
-    def resume(self) -> bool:
-        raise NotImplementedError
-
-
-@dataclass
-class WindowRecord:
-    """一个窗口在调度器内的元数据；图像内容永远只存在于磁盘。"""
-
-    window_index: int
-    scene_id: str
-    role: CameraRole
-    effective: EffectiveConfig
-    state: str = WINDOW_CAPTURING
-    snapshot_uri: str = ""
-    manifest_sha256: str = ""
-    capture_attempts: int = 0
-    reconstruct_attempts: int = 0
-    snapshot_bytes: int = 0
-    captured_frames: int = 0
-    capture_goal_frames: int = 0
-    new_frame_count: int = 0
-    overlap_frame_count: int = 0
-    # 送去重建的帧（含复用的共享帧）里没有位姿的帧数；窗口判定用它。
-    missing_pose_frames: int = 0
-    # 其中本窗新采的帧。会话累计只加这一部分，共享帧不重复计数。
-    new_missing_pose_frames: int = 0
-    window_frame_ids: list[int] = field(default_factory=list)
-    model_frame_ids: list[int] = field(default_factory=list)
-    worker_result_manifest_uri: str = ""
-    worker_result_manifest_sha256: str = ""
-    queued_at_monotonic: float | None = None
-    finished_monotonic: float | None = None
-    error: str = ""
-    source_stale: bool = False
-    capture_cancel_pending: bool = False
-    # True also means no Capture goal has been dispatched yet.
-    capture_action_terminal: bool = True
-    alignment: dict | None = None
-    formal_result_uri: str = ""
-    formal_provenance_sha256: str = ""
-    capture_generation: int = 0
-    captured_frame_ids: list[int] = field(default_factory=list)
-    done: threading.Event = field(default_factory=threading.Event)
-    # 人工恢复历史：资源门拒绝后由操作者显式重试的次数与每次的拒绝原因。
-    manual_retries: int = 0
-    guard_failures: list[str] = field(default_factory=list)
-
-    @property
-    def attempts(self) -> int:
-        """历史兼容：capture 与 reconstruct 阶段尝试次数之和。"""
-        return self.capture_attempts + self.reconstruct_attempts
-
-
-@dataclass(frozen=True)
-class SessionStatus:
-    """GET_STATUS 的机器可读快照。"""
-
-    state: str
-    session_id: str
-    role: str
-    window_index: int
-    captured_frames: int
-    capture_target_frames: int
-    pending_windows: int
-    running_window: int
-    succeeded_windows: int
-    failed_windows: int
-    dropped_windows: int
-    effective: EffectiveConfig
-    last_error: str
-    min_free_disk_gb: float
-    fifo_bytes: int = 0
-    fifo_oldest_wait_sec: float | None = None
-    disk_free_gb: float = 0.0
-    last_alignment_state: str = COORDINATE_MODEL_LOCAL_UNALIGNED
-    formal_windows: int = 0
-    reconstruction_mode: str = RECONSTRUCTION_MODE_PER_WINDOW
-    alignment_backend: str = BACKEND_G4
+            session._update_stop_audit_backend_locked(job_id, terminal_collected=True)
 
 
 class ContinuousSession:
@@ -710,8 +244,10 @@ class ContinuousSession:
         self._session_id = ""
         self._next_window = 0
         self._windows: list[WindowRecord] = []
-        self._g4_process = None
-        self._g4_start_error = ""
+        # Window alignment: the session-owned G4 map backend process (continuous_align).
+        self._aligner = G4WindowAligner(
+            lambda *args, **kwargs: G4BackendProcess(*args, **kwargs)
+        )
         self._fifo: list[WindowRecord] = []  # deque-like; only PENDING entries
         self._running_window: WindowRecord | None = None
         self._succeeded = 0
@@ -813,7 +349,7 @@ class ContinuousSession:
             self._session_id = "s" + secrets.token_hex(8)
             self._next_window = 0
             self._windows = []
-            self._g4_start_error = ""
+            self._aligner.reset()
             self._fifo = []
             self._running_window = None
             self._succeeded = 0
@@ -877,11 +413,13 @@ class ContinuousSession:
         线程同时消费同一个 FIFO。会话已在排空（STOP 之后）时只重启消费线程：
         重试窗照样会被消费，不需要也不能再开新采集。
         """
-        self._capture_done.clear()
         self._consume_done.clear()
         consume_thread = self._make_thread("continuous-consume", self._consume_loop)
         self._consume_thread = consume_thread
         if restart_capture:
+            # Only a new capture thread un-finishes capture; while draining it stays done,
+            # which is what lets the drain watcher stop the session once the queue empties.
+            self._capture_done.clear()
             capture_thread = self._make_thread("continuous-capture", self._capture_loop)
             self._capture_thread = capture_thread
             capture_thread.start()
@@ -1318,7 +856,7 @@ class ContinuousSession:
                 }
             self._wake_capture.set()
             self._wake_consume.set()
-            g4_process, self._g4_process = self._g4_process, None
+            g4_process = self._aligner.detach()
         if g4_process is not None:
             g4_process.close()
         if capture_client is not None:
@@ -1471,6 +1009,10 @@ class ContinuousSession:
             with self._lock:
                 if collected and self._active_job_id == active_job_id:
                     self._active_job_id = None
+                if collected:
+                    self._update_stop_audit_backend_locked(
+                        active_job_id, terminal_collected=True
+                    )
                 if not collected:
                     self._state = SESSION_STOPPING
                     self._stopping = True
@@ -2468,119 +2010,25 @@ class ContinuousSession:
                 self._active_job_id = job_id
                 self._active_job_cancel_requested = False
                 self._update_stop_audit_backend_locked(job_id)
-        deadline = self._monotonic() + self._config.reconstruct_wait_timeout_sec
-        watchdog_fired = False
-        status_failure = ""
-        while True:
+        result = wait_collect_job(
+            backend, job_id,
+            window_label=f"window {record.window_index}",
+            wait_timeout_sec=self._config.reconstruct_wait_timeout_sec,
+            monotonic=self._monotonic,
+            sleep=time.sleep,
+            control=_JobControl(self),
+        )
+        if result.kind == STOP_CANCELLED_WITH_OWNER_RETAINED:
             with self._lock:
-                stopping = self._stopping
-            try:
-                status = backend.status(job_id)
-            except BaseException as error:
-                if not status_failure:
-                    status_failure = (
-                        f"backend status failed: {type(error).__name__}: {error}"
-                    )
-                # actionlib cancellation is asynchronous. Keep ownership and
-                # polling until the lower action reports a terminal state;
-                # collecting here would pop a still-live client.
-                try:
-                    backend.cancel(job_id)
-                except BaseException as cancel_error:
-                    with self._lock:
-                        self._last_error = (
-                            f"window {record.window_index} backend cancel failed "
-                            "after status error: "
-                            f"{type(cancel_error).__name__}: {cancel_error}"
-                        )
-                else:
-                    with self._lock:
-                        self._update_stop_audit_backend_locked(
-                            job_id, cancel_requested=True
-                        )
-                now = self._monotonic()
-                if stopping:
-                    with self._lock:
-                        self._window_terminal(
-                            record, WINDOW_CANCELLED, "stop_all"
-                        )
-                    return
-                if now >= deadline:
-                    # The worker may still exist, so retain active-job
-                    # ownership for stop_all to prove terminal+collect.  The
-                    # scheduler must nevertheless fail closed instead of
-                    # leaving an immortal consumer and a false RUNNING state.
-                    error = (
-                        f"{status_failure}; status unavailable through "
-                        "reconstruction deadline"
-                    )
-                    with self._lock:
-                        self._stopping = True
-                        self._state = SESSION_STOPPING
-                        self._last_error = error
-                        self._wake_capture.set()
-                        self._wake_consume.set()
-                    self._handle_reconstruct_failure(record, error)
-                    return
-                time.sleep(min(0.2, max(0.0, deadline - now)))
-                continue
-            if status.state in _JOB_TERMINAL:
-                break
-            if stopping:
-                try:
-                    backend.cancel(job_id)
-                except BaseException as error:
-                    with self._lock:
-                        self._last_error = (
-                            f"window {record.window_index} backend cancel failed "
-                            f"during stop: {type(error).__name__}: {error}"
-                        )
-                else:
-                    with self._lock:
-                        self._update_stop_audit_backend_locked(
-                            job_id, cancel_requested=True
-                        )
-            if not stopping and not watchdog_fired and self._monotonic() >= deadline:
-                watchdog_fired = True
-                try:
-                    backend.cancel(job_id)
-                except BaseException as error:
-                    with self._lock:
-                        self._last_error = (
-                            f"window {record.window_index} backend cancel failed "
-                            f"during watchdog: {type(error).__name__}: {error}"
-                        )
-                else:
-                    with self._lock:
-                        self._update_stop_audit_backend_locked(
-                            job_id, cancel_requested=True
-                        )
-                        self._last_error = (
-                            f"window {record.window_index} reconstruction watchdog fired; "
-                            "waiting for lower action terminal state"
-                        )
-            time.sleep(0.2)
-        with self._lock:
-            self._update_stop_audit_backend_locked(
-                job_id,
-                terminal_state=status.state,
-                terminal_message=status.message,
-            )
-            cleanup_failure = (
-                status.state == JOB_FAILED
-                and "cleanup_failed" in str(status.message).lower()
-            )
-        try:
-            outcome = backend.collect_result(job_id)
-        except BaseException as error:
-            with self._lock:
-                self._last_error = (
-                    f"window {record.window_index} backend collect_result "
-                    f"failed for job {job_id}: "
-                    f"{type(error).__name__}: {error}"
-                )
-                if self._stop_audit is not None:
-                    self._stop_audit["backend_collect_error"] = self._last_error
+                self._window_terminal(record, WINDOW_CANCELLED, "stop_all")
+            return
+        if result.kind == STATUS_DEADLINE_WITH_OWNER_RETAINED:
+            self._handle_reconstruct_failure(record, result.error)
+            return
+        status, cleanup_failure, status_failure = (
+            result.status, result.cleanup_failure, result.status_failure
+        )
+        if result.kind == COLLECT_ERROR:
             # Best-effort cancel/collect keeps the backend slot from staying
             # owned by an uncollectable job; _active_job_id is only cleared
             # after collect succeeds, so stop_all can observe the retained job.
@@ -2594,21 +2042,9 @@ class ContinuousSession:
                 if self._stopping or self._fatal_oom:
                     self._window_terminal(record, WINDOW_CANCELLED, "stop_all")
                     return
-            self._handle_reconstruct_failure(
-                record,
-                f"backend collect_result failed: {type(error).__name__}: {error}",
-            )
+            self._handle_reconstruct_failure(record, result.error)
             return
-        with self._lock:
-            self._active_job_id = None
-            self._last_worker_wall_time_sec = (
-                float(outcome.wall_time_sec)
-                if _finite(outcome.wall_time_sec)
-                else None
-            )
-            self._update_stop_audit_backend_locked(
-                job_id, terminal_collected=True
-            )
+        outcome = result.outcome
         if cleanup_failure:
             self._handle_reconstruct_failure(
                 record, f"backend process cleanup failed: {status.message}"
@@ -2650,46 +2086,35 @@ class ContinuousSession:
         record.worker_result_manifest_sha256 = outcome.result_manifest_sha256
         record.model_frame_ids = self._window_model_frame_ids(record, outcome)
         alignment = self._align_window()
-        formal_error = self._formalize_window(record, outcome, alignment)
-        if formal_error == _FORMAL_SKIPPED_STOPPING:
+        formal = publish_window(
+            record, outcome, alignment,
+            config=self._config,
+            records_root=self._formal_records_root(),
+            reconstruction_mode=self._reconstruction_mode,
+            result_gate=self._result_gate,
+            result_publisher=self._result_publisher,
+            write_journal=self._write_journal,
+            session_state=self._formal_session_state,
+        )
+        if formal.status == FORMAL_SKIPPED:
             with self._lock:
                 self._window_terminal(record, WINDOW_CANCELLED, "stop_all")
             return
-        if formal_error is not None:
-            self._handle_reconstruct_failure(record, formal_error)
+        if formal.status != FORMAL_PUBLISHED:
+            self._handle_reconstruct_failure(record, formal.reason)
             return
+        record.formal_result_uri = formal.result_uri
+        record.formal_provenance_sha256 = formal.provenance_sha256
         # Only committed, verified inputs can enter G4. The process scans
         # complete records and coalesces arrivals while a solve is running.
-        # A map backend that cannot start, or that died, does not stop capture: the
-        # recorded windows can be placed again after landing. It must be loud instead
-        # (diagnostics ERROR, journal), because the window itself still succeeds.
         with self._lock:
             if not self._stopping:
-                try:
-                    if self._g4_process is not None and self._g4_process.process.poll() is not None:
-                        exited = self._g4_process.status()
-                        self._write_journal({
-                            "event": "g4_backend_exited",
-                            "session_id": self._session_id,
-                            "window_index": record.window_index,
-                            "exit_code": exited.get("exit_code"),
-                            "error": exited.get("error", ""),
-                        })
-                        self._g4_process.close()
-                        self._g4_process = None
-                    if self._g4_process is None:
-                        self._g4_process = G4BackendProcess(self._formal_records_root(), self._session_id,
-                                                            profile=self._backend_profile())
-                        self._g4_start_error = ""
-                except Exception as error:
-                    self._g4_start_error = f"G4 background start failed: {type(error).__name__}: {error}"
-                    self._last_error = self._g4_start_error
-                    self._write_journal({
-                        "event": "g4_backend_start_failed",
-                        "session_id": self._session_id,
-                        "window_index": record.window_index,
-                        "error": self._g4_start_error,
-                    })
+                start_error = self._aligner.on_window_published(
+                    self._formal_records_root(), self._session_id, record.window_index,
+                    self._backend_profile, self._write_journal,
+                )
+                if start_error:
+                    self._last_error = start_error
         with self._lock:
             record.alignment = alignment
             self._last_alignment_state = (
@@ -2729,31 +2154,20 @@ class ContinuousSession:
             )
 
     def _g4_status_locked(self) -> dict[str, Any]:
-        """Map backend status for diagnostics; a failed start reports as an error, not as "waiting"."""
-        if self._g4_process is not None:
-            return self._g4_process.status()
-        if self._g4_start_error:
-            return {"state": "error", "error": self._g4_start_error}
-        return {}
+        """Map backend status for diagnostics (see G4WindowAligner.status)."""
+        return self._aligner.status()
+
+    @property
+    def _g4_process(self):
+        """The running G4 process, if any (owned by the aligner)."""
+        return self._aligner.process
+
+    @_g4_process.setter
+    def _g4_process(self, process) -> None:
+        self._aligner.process = process
 
     def _align_window(self) -> dict[str, Any]:
-        """G4 places windows in the background; each window waits for a map revision."""
-        return {
-            "coordinate_state": COORDINATE_MODEL_LOCAL_UNALIGNED,
-            "map_id": "",
-            "scale": None,
-            "rotation": None,
-            "translation": None,
-            "residual_rms": None,
-            "correspondence_count": 0,
-            "reference_frame_id": "",
-            "unreliable": True,
-            "reason": "waiting_for_G4_map_revision",
-            "method": BACKEND_G4,
-            "pending": True,
-            "quality_passed": False,
-            "geometry_accepted": False,
-        }
+        return self._aligner.align()
 
     def _window_model_frame_ids(self, record: WindowRecord, outcome) -> list[int]:
         if not record.window_frame_ids:
@@ -2768,311 +2182,17 @@ class ContinuousSession:
     def _formal_records_root(self) -> Path:
         return Path(self._config.result_root) / "sessions"
 
-    def _ensure_formal_session_dir(self, session_id: str) -> Path:
-        records_root = self._formal_records_root()
-        records_root.mkdir(parents=True, exist_ok=True)
-        session_dir = records_root / session_id
-        try:
-            session_dir.mkdir()
-        except FileExistsError as error:
-            if not session_dir.is_dir() or session_dir.is_symlink():
-                raise FormalResultError(
-                    f"formal session dir exists but is unsafe: {session_dir}"
-                ) from error
-        return session_dir
-
-    def _depth_metrics_window(
-        self, record: WindowRecord, outcome
-    ) -> tuple[dict | None, str | None]:
-        """计算首帧传感器深度对照指标。
-
-        返回 ``(depth_metrics, error_reason)``：
-        - 计算成功：``(metrics, None)``；
-        - 深度开关关闭或快照没有首帧传感器深度：``(None, None)``；
-        - 深度开关打开但计算失败：``({"status": "unavailable", ...}, reason)``，
-          让正式记录仍落盘 depth_metrics.json 并暴露失败原因。
-        """
-        if not bool(record.effective.save_sensor_depth):
-            return None, None
-        try:
-            snapshot = validate_snapshot(
-                record.snapshot_uri,
-                record.manifest_sha256,
-                (record.role.capture_config.snapshot_root,),
-                record.role.capture_config.snapshot_limits,
-            )
-        except BaseException as error:
-            reason = f"snapshot validation failed for depth metrics: {type(error).__name__}: {error}"
-            return {"status": "unavailable", "reason": reason}, reason
-        predictions_path = self._predictions_path(outcome)
-        if predictions_path is None:
-            reason = "result manifest uri has no local predictions.npz"
-            return {"status": "unavailable", "reason": reason}, reason
-        metrics, compute_reason = compute_first_frame_depth_metrics(
-            snapshot, predictions_path
-        )
-        if metrics is not None:
-            return metrics, None
-        if compute_reason in _NO_SENSOR_DEPTH_REASONS:
-            return None, None
-        reason = compute_reason or "depth metrics unavailable"
-        return {"status": "unavailable", "reason": reason}, reason
-
-    @staticmethod
-    def _read_snapshot_manifest_bytes(snapshot) -> bytes:
-        """Read the validated snapshot manifest bytes from its canonical root."""
-        root = getattr(snapshot, "canonical_root", None)
-        if root is None:
-            raise FormalResultError(
-                "validated snapshot does not expose a canonical root"
-            )
-        path = Path(root) / "files_sha256.csv"
-        try:
-            info = os.lstat(str(path))
-        except OSError as error:
-            raise FormalResultError(
-                "snapshot files_sha256.csv cannot be inspected"
-            ) from error
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-            raise FormalResultError(
-                "snapshot files_sha256.csv is not a trusted regular file"
-            )
-        if info.st_size > _MAX_SNAPSHOT_MANIFEST_BYTES:
-            raise FormalResultError(
-                "snapshot files_sha256.csv exceeds size bound"
-            )
-        try:
-            with open(str(path), "rb") as stream:
-                data = stream.read(_MAX_SNAPSHOT_MANIFEST_BYTES + 1)
-        except OSError as error:
-            raise FormalResultError(
-                "snapshot files_sha256.csv cannot be read"
-            ) from error
-        if len(data) > _MAX_SNAPSHOT_MANIFEST_BYTES:
-            raise FormalResultError(
-                "snapshot files_sha256.csv exceeds size bound"
-            )
-        return data
-
-    def _formalize_window(
-        self,
-        record: WindowRecord,
-        outcome: ReconstructActionOutcome,
-        alignment: dict[str, Any],
-    ) -> str | None:
-        """执行真实性门禁并把通过门禁的窗口发布为正式记录。
-
-        返回 None 表示窗口可以标记 SUCCEEDED；否则返回稳定失败原因。
-        """
-        expected_identity = {
-            "scene_id": record.scene_id,
-            "snapshot_manifest_sha256": record.manifest_sha256,
-            "captured_frames": record.captured_frames,
-            "camera_role": record.role.role,
-            "camera_topic": record.role.capture_config.image_topic,
-            "camera_frame_id": record.role.capture_config.camera_frame_id,
-        }
-        expected_authenticity = {
-            "checkpoint_sha256": self._config.expected_checkpoint_sha256,
-            "checkpoint_path": self._config.expected_checkpoint_path,
-            "result_root": self._config.expected_result_root,
-            "algorithm_revision": self._config.expected_algorithm_revision,
-            "ros_revision": self._config.expected_ros_revision,
-        }
-        try:
-            gate = self._result_gate(
-                outcome.result_manifest_uri,
-                outcome.result_manifest_sha256,
-                expected_identity=expected_identity,
-                expected_authenticity=expected_authenticity,
-            )
-        except BaseException as error:
-            reason = f"result gate raised: {type(error).__name__}: {error}"
-            self._write_journal(
-                {
-                    "event": "window_result_gate_failed",
-                    "session_id": self._session_id,
-                    "window_index": record.window_index,
-                    "scene_id": record.scene_id,
-                    "reason": reason,
-                }
-            )
-            return f"formal result gate failed: {reason}"
-        if not bool(getattr(gate, "ok", False)):
-            reason = str(getattr(gate, "reason", "unknown"))
-            self._write_journal(
-                {
-                    "event": "window_result_gate_failed",
-                    "session_id": self._session_id,
-                    "window_index": record.window_index,
-                    "scene_id": record.scene_id,
-                    "reason": reason,
-                }
-            )
-            return f"formal result gate failed: {reason}"
-        payload = getattr(gate, "payload", None)
-        manifest_bytes = getattr(gate, "manifest_bytes", b"")
-        if not isinstance(payload, dict) or not isinstance(manifest_bytes, bytes):
-            reason = "formal result gate returned an invalid payload"
-            self._write_journal(
-                {
-                    "event": "window_result_gate_failed",
-                    "session_id": self._session_id,
-                    "window_index": record.window_index,
-                    "scene_id": record.scene_id,
-                    "reason": reason,
-                }
-            )
-            return f"formal result gate failed: {reason}"
-        if not manifest_bytes:
-            reason = "formal result gate returned empty manifest bytes"
-            self._write_journal(
-                {
-                    "event": "window_result_gate_failed",
-                    "session_id": self._session_id,
-                    "window_index": record.window_index,
-                    "scene_id": record.scene_id,
-                    "reason": reason,
-                }
-            )
-            return f"formal result gate failed: {reason}"
+    def _formal_session_state(self) -> tuple[str, list, bool]:
+        """Session id, a copy of the config timeline and the stop flag, read under the lock."""
         with self._lock:
-            if self._stopping:
-                return _FORMAL_SKIPPED_STOPPING
-        try:
-            snapshot = validate_snapshot(
-                record.snapshot_uri,
-                record.manifest_sha256,
-                (record.role.capture_config.snapshot_root,),
-                record.role.capture_config.snapshot_limits,
-            )
-            snapshot_manifest_bytes = self._read_snapshot_manifest_bytes(snapshot)
-        except BaseException as error:
-            return (
-                "window snapshot validation failed: "
-                f"{type(error).__name__}: {error}"
-            )
-        snapshot_manifest_sha256 = hashlib.sha256(snapshot_manifest_bytes).hexdigest()
-        if snapshot_manifest_sha256 != record.manifest_sha256:
-            return (
-                "window snapshot manifest digest mismatch after validation: "
-                f"expected {record.manifest_sha256}, got {snapshot_manifest_sha256}"
-            )
-        depth_metrics, depth_metrics_error = self._depth_metrics_window(
-            record, outcome
-        )
-        with self._lock:
-            session_id = self._session_id
-            timeline = [dict(item) for item in self._config_timeline]
-            stopping = self._stopping
-        if stopping:
-            return _FORMAL_SKIPPED_STOPPING
-        checkpoint = payload.get("checkpoint") or {}
-        stage_timing = payload.get("stage_timing") or {}
-        worker_exit = payload.get("worker_exit") or {}
-        provenance = {
-            "schema": FORMAL_RECORD_SCHEMA,
-            "schema_version": FORMAL_RECORD_SCHEMA_VERSION,
-            "session_id": session_id,
-            "window_index": int(record.window_index),
-            "scene_id": record.scene_id,
-            "result_manifest_uri": outcome.result_manifest_uri,
-            "result_manifest_sha256": outcome.result_manifest_sha256,
-            "snapshot_manifest_uri": record.snapshot_uri,
-            "snapshot_manifest_sha256": snapshot_manifest_sha256,
-            "captured_frames": int(record.captured_frames),
-            "new_frame_count": int(
-                getattr(record, "new_frame_count", record.captured_frames)
-            ),
-            "overlap_frame_count": int(
-                getattr(record, "overlap_frame_count", 0)
-            ),
-            "window_frame_ids": list(getattr(record, "window_frame_ids", ())),
-            "captured_frame_ids": list(getattr(record, "captured_frame_ids", ())),
-            "capture_generation": getattr(record, "capture_generation", 0),
-            "model_frame_ids": list(getattr(record, "model_frame_ids", ())),
-            "camera_role": record.role.role,
-            "camera_topic": record.role.capture_config.image_topic,
-            "camera_frame_id": record.role.capture_config.camera_frame_id,
-            "camera_name": record.role.capture_config.camera_name,
-            "config_digest": record.effective.digest(),
-            "effective_config": record.effective.as_dict(),
-            "config_timeline": timeline,
-            "checkpoint": {
-                "path": checkpoint.get("path", ""),
-                "sha256": expected_authenticity["checkpoint_sha256"],
-            },
-            "algorithm_revision": expected_authenticity["algorithm_revision"],
-            "ros_revision": expected_authenticity["ros_revision"],
-            "cuda_environment": {
-                "worker_python": self._config.worker_python,
-                "cuda_visible_devices": self._config.cuda_visible_devices,
-            },
-            "worker": {
-                "wall_time_sec": stage_timing.get("worker_wall_time_sec"),
-                "exit_returncode": worker_exit.get("returncode"),
-            },
-            "gate": {
-                "result_manifest_digest_verified": True,
-                "identity_verified": True,
-                "authenticity_verified": True,
-                "schema_verified": True,
-            },
-            # pool_* 与 confidence_summary 属于正式记录格式，per_window 下恒为 None；
-            # 保留这些键，正式记录的格式和字节都不变。
-            "reconstruction_mode": self._reconstruction_mode,
-            "pool_revision": None,
-            "pool_epoch": None,
-            "pool_size": None,
-            "pool_selected_indices": None,
-            "confidence_summary": None,
-            "alignment": alignment,
-            "depth_metrics": depth_metrics,
-            "depth_metrics_error": depth_metrics_error,
-        }
-        try:
-            self._ensure_formal_session_dir(session_id)
-            final_path, provenance_sha256 = self._result_publisher(
-                self._formal_records_root(),
-                session_id,
-                record.window_index,
-                manifest_bytes,
-                provenance,
-                snapshot_manifest_bytes,
-            )
-        except BaseException as error:
-            return (
-                "formal record publication failed: "
-                f"{type(error).__name__}: {error}"
-            )
-        if not _valid_sha256(provenance_sha256):
-            return "formal record publication returned an invalid provenance sha256"
-        record.formal_result_uri = str(final_path)
-        record.formal_provenance_sha256 = provenance_sha256
-        return None
-
-    @staticmethod
-    def _predictions_path(outcome) -> Path | None:
-        try:
-            if not outcome.result_manifest_uri.startswith("file://"):
-                return None
-            path = Path(
-                unquote_to_bytes(
-                    outcome.result_manifest_uri[len("file://"):]
-                ).decode("utf-8", "strict")
-            )
-            return path.parent / "predictions.npz"
-        except BaseException:
-            return None
+            return (self._session_id, [dict(item) for item in self._config_timeline], self._stopping)
 
     @staticmethod
     def _selected_frame_indices(outcome) -> tuple[int, ...] | None:
         """从 result.json 读取每个模型帧对应的 snapshot 帧序号。
 
-        Omega 在 frame_count > frame_group_size 时会均匀抽帧，模型帧序号
-        不再等于 snapshot 帧序号；此时模型帧必须按 result.json 的
-        ``selected_frames[].index`` 对应回窗口帧。读取失败或
-        结构不符时返回 None，按模型帧序号即快照帧序号处理。
+        按 result.json 的 ``selected_frames[].index`` 对应回窗口帧。
+        读取失败或结构不符时返回 None，按模型帧序号即快照帧序号处理。
         """
         try:
             if not outcome.result_manifest_uri.startswith("file://"):
@@ -3341,36 +2461,6 @@ class ContinuousSession:
                 stream.write(line)
         except OSError:
             pass  # journal 是审计辅助，绝不影响主状态机
-
-
-def _finite(value: Any) -> bool:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return False
-    try:
-        return float(value) == float(value) and float(value) not in (
-            float("inf"),
-            float("-inf"),
-        )
-    except (TypeError, ValueError, OverflowError):
-        return False
-
-
-def _valid_sha256(value: Any) -> bool:
-    if not isinstance(value, str) or len(value) != 64:
-        return False
-    try:
-        int(value, 16)
-    except (TypeError, ValueError):
-        return False
-    return True
-
-
-def _is_relative_to(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-        return True
-    except ValueError:
-        return False
 
 
 def _capture_identity_error(

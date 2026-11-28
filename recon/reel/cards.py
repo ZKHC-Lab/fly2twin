@@ -8,22 +8,27 @@ Styles:
   endcard : project name, tagline, GitHub, footer (default 开源) — on the shared dark background
 Usage from code: cards.title('边飞边建', path) etc.
 """
+
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 
 W, H = 1920, 1080
+
+
 def font(weight, size, style=None):
     """Find the SC face via fontconfig, or use an explicit font file/index."""
     import shutil
     import subprocess
+
     style = style or {}
     path, index = style.get('font'), style.get('font_index', 0)
     if not path:
         if not shutil.which('fc-match'):
             raise RuntimeError('Noto Sans CJK SC not found: install fontconfig and Noto CJK, or supply font/font_index')
-        result = subprocess.check_output(['fc-match', '-f', '%{family}\n%{file}\n%{index}',
-                                          'Noto Sans CJK SC:style=' + weight], text=True).splitlines()
+        result = subprocess.check_output(
+            ['fc-match', '-f', '%{family}\n%{file}\n%{index}', 'Noto Sans CJK SC:style=' + weight], text=True
+        ).splitlines()
         if len(result) < 3 or 'Noto Sans CJK SC' not in result[0]:
             raise RuntimeError('Noto Sans CJK SC not found: install Noto CJK or supply font/font_index')
         path, index = result[1], int(result[2])
@@ -59,6 +64,7 @@ def title(text, out, sub=None, top=False, style=None):
 def headline(text, out, style=None):
     """Centred main title over picture (opening), on a soft dark band for bright scenes."""
     from PIL import ImageFilter
+
     band = Image.new('L', (W, H), 0)
     ImageDraw.Draw(band).rectangle([0, H / 2 - 110, W, H / 2 + 70], fill=110)
     band = band.filter(ImageFilter.GaussianBlur(60))
@@ -79,8 +85,9 @@ def label(items, out, style=None):
     for text, x, y, anchor in items:
         w = d.textlength(text, font=f)
         x0 = x if anchor == 'la' else x - w if anchor == 'ra' else x - w / 2
-        d.rounded_rectangle([x0 - 18, y - 8, x0 + w + 18, y + 50], 10,
-                            fill=tuple((style or {}).get('background', [0, 0, 0])) + (120,))
+        d.rounded_rectangle(
+            [x0 - 18, y - 8, x0 + w + 18, y + 50], 10, fill=tuple((style or {}).get('background', [0, 0, 0])) + (120,)
+        )
         d.text((x0, y), text, font=f, fill=(255, 255, 255, 255))
     im.save(out)
 
@@ -101,10 +108,12 @@ def endcard(name, tagline, url, out, logo=None, style=None, footer='开源'):
         lg.thumbnail((360, 140))
         im.alpha_composite(lg, ((W - lg.width) // 2, 180))
         y = 360
-    for text, f, fill, dy in ((name, font('Bold', 96, style), (255, 255, 255, 255), 150),
-                              (tagline, font('Regular', 40, style), (215, 222, 230, 255), 110),
-                              (url, font('Regular', 32, style), tuple((style or {}).get('accent', [64, 200, 190])) + (255,), 70),
-                              (footer, font('Medium', 34, style), (255, 255, 255, 255), 0)):
+    for text, f, fill, dy in (
+        (name, font('Bold', 96, style), (255, 255, 255, 255), 150),
+        (tagline, font('Regular', 40, style), (215, 222, 230, 255), 110),
+        (url, font('Regular', 32, style), tuple((style or {}).get('accent', [64, 200, 190])) + (255,), 70),
+        (footer, font('Medium', 34, style), (255, 255, 255, 255), 0),
+    ):
         w = d.textlength(text, font=f)
         d.text(((W - w) / 2, y), text, font=f, fill=fill)
         y += dy

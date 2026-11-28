@@ -26,7 +26,7 @@ Original code of this repository is released by ZKHC under the Apache-2.0 [licen
 
 ## Algorithm extraction
 
-Numerical functions originate in the private project's experiment scripts listed in [the extraction report](recon/docs/EXTRACTION_REPORT.md). Those sources are provenance, not runtime dependencies. The new code removes historical imports, global dataset paths, source-string patching, automatic downloads and import-time CUDA/cache environment changes.
+Numerical functions originate in the private project's experiment scripts. Those sources are provenance, not runtime dependencies. The new code removes historical imports, global dataset paths, source-string patching, automatic downloads and import-time CUDA/cache environment changes.
 
 The evaluation camera parameterization is a new implementation of the continuous 6D rotation representation (Zhou et al., CVPR 2019) with right-composed local translation, matching the mathematical interface of gsplat's example camera optimizer. No gsplat example source is copied. The Gaussian initialization/render/training algorithms were extracted from the project's own earlier drone reconstruction pipeline; upstream algorithm and dependency attribution is retained here.
 

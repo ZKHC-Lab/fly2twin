@@ -1,13 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """First-visible capture-camera indices for cloud growth."""
+
 import numpy as np
 import torch
 from .coverage import low_K, render_depth, LOW_W, LOW_H
 
+
 def birth_times(sc, pts_norm):
     K = np.stack([low_K(k, sc.width, sc.height) for k in sc.train_K])
-    unit = sc.meta.get('world_from_normalized', {}).get('meters_per_unit', 1.)
-    depth, alpha = render_depth(sc.torch_splats(), sc.train_c2w, K, near_plane=.01 * unit)
+    unit = sc.meta.get('world_from_normalized', {}).get('meters_per_unit', 1.0)
+    depth, alpha = render_depth(sc.torch_splats(), sc.train_c2w, K, near_plane=0.01 * unit)
     depth[alpha < 0.5] = float('inf')
     depth = depth.cuda()
     w2c = torch.linalg.inv(torch.from_numpy(sc.train_c2w.astype(np.float32)).cuda())
@@ -26,7 +28,6 @@ def birth_times(sc, pts_norm):
     return birth.cpu().numpy()
 
 
-
 def run(scene, out, **kwargs):
     from pathlib import Path
     from types import SimpleNamespace
@@ -36,7 +37,8 @@ def run(scene, out, **kwargs):
     from . import path as P, render as R
     from .grade import grade
     from .common import dump
-    a = SimpleNamespace(**kwargs, out=Path(out), head_weight=.75)
+
+    a = SimpleNamespace(**kwargs, out=Path(out), head_weight=0.75)
     if not 0 <= a.start_frac <= 1 or a.grow_s <= 0 or a.dissolve_s < 0 or a.point_size <= 0:
         raise ValueError('Require start_frac in [0,1], grow_s/point_size > 0 and dissolve_s >= 0')
     sc = load_scene(scene)
@@ -48,6 +50,7 @@ def run(scene, out, **kwargs):
     # Points the strict low-res visibility test never assigns (thin/occluded geometry): born with the
     # nearest training camera centre, so the finished cloud is complete.
     from scipy.spatial import cKDTree
+
     unborn = birth == n_cam
     if unborn.any():
         birth[unborn] = cKDTree(sc.train_c2w[:, :3, 3]).query(pts_norm[unborn])[1]
@@ -68,10 +71,10 @@ def run(scene, out, **kwargs):
     trail_cams = gaussian_filter1d(cams, a.trail_smooth, axis=0, mode='nearest') if a.trail_smooth > 0 else cams
     bg = np.array(a.background, np.float32)
     timeline = []
-    for f in (a.frames if a.frames is not None else range(nfr)):
+    for f in a.frames if a.frames is not None else range(nfr):
         t = f / fps
         g = min(1.0, t / a.grow_s)
-        g_s = g * g * (3 - 2 * g) * 0.15 + g * 0.85            # slight ease at the start
+        g_s = g * g * (3 - 2 * g) * 0.15 + g * 0.85  # slight ease at the start
         ci = int(round((a.start_frac + (1 - a.start_frac) * g_s) * (n_cam - 1)))
         head = head_s[ci]
         target = centre if a.stable else a.head_weight * head + (1 - a.head_weight) * centre
@@ -82,14 +85,16 @@ def run(scene, out, **kwargs):
         # Points born up to ci; newest ones fade in over ~20 cameras.
         age = (ci - birth_t).float()
         vis = torch.clamp((age + 1) / 20.0, 0, 1)
-        splats['opacities'] = torch.where(birth_t <= ci, base_op + torch.log(vis.clamp_min(1e-4)), torch.full_like(base_op, -20.0))
+        splats['opacities'] = torch.where(
+            birth_t <= ci, base_op + torch.log(vis.clamp_min(1e-4)), torch.full_like(base_op, -20.0)
+        )
         rgb = R.draw(splats, pose, K, w, h, degree=0, bg=bg.tolist())
         img = (np.clip(rgb, 0, 1) * 255).round().astype(np.uint8)
         img = grade(img, a.grade_params)
         # Light trail: capture path up to ci, projected; additive glow, fades out during the dissolve.
         trail_alpha = 1.0 if t <= a.grow_s else max(0.0, 1 - (t - a.grow_s) / 1.2)
         if trail_alpha > 0 and ci > 1:
-            P3 = trail_cams[:ci + 1]
+            P3 = trail_cams[: ci + 1]
             w2c = np.linalg.inv(pose.astype(np.float64))
             cam = P3 @ w2c[:3, :3].T + w2c[:3, 3]
             ok = cam[:, 2] > 0.05
@@ -98,7 +103,9 @@ def run(scene, out, **kwargs):
             pts2 = uv[ok].astype(np.int32)
             col = np.array([255, 196, 92], np.float32)  # warm light in RGB
             if len(pts2) > 1:
-                cv2.polylines(layer, [pts2.reshape(-1, 1, 2)], False, (col * 0.55).tolist(), max(1, w // 480), cv2.LINE_AA)
+                cv2.polylines(
+                    layer, [pts2.reshape(-1, 1, 2)], False, (col * 0.55).tolist(), max(1, w // 480), cv2.LINE_AA
+                )
                 glow = cv2.GaussianBlur(layer, (0, 0), w / 320)
                 layer = layer + glow * 1.6
                 hx, hy = pts2[-1]

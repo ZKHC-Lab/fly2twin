@@ -14,6 +14,8 @@ def export_session(records_root, session_id, destination, capture_profile, max_p
     import yaml
     from drone3d_reconstruction_core.continuous_web import _formal_records_for
     from drone3d_reconstruction_core.g4.backend_process import output_root
+    from drone3d_reconstruction_core.storage_retention import write_export_marker
+    from drone3d_reconstruction_core._common import sha256_file
     if not 4 <= max_points <= 1000000:
         raise ValueError('Delivery fusion max_points must be 4..1000000')
     destination = Path(destination)
@@ -26,6 +28,15 @@ def export_session(records_root, session_id, destination, capture_profile, max_p
         raise ValueError('Delivery requires the pose time offset to be applied at capture')
     capture = yaml.safe_load(Path(capture_profile).read_text())
     records = _formal_records_for(session_id, Path(records_root))
+    # The formal windows this package is built from; automatic retention compares them with
+    # the session's records before deleting anything (a later window was never delivered).
+    exported_windows = {int(r['window_index']): sha256_file(Path(records_root)/session_id/('window-%04d' % int(r['window_index']))/'provenance.json')
+                        for r in records}
+    _refuse_destination_inside_source(destination, records_root, session_id, root, records)
+    # Every directory this export creates, deepest first; their entries in their parents must
+    # reach the disk too, or a power cut can lose the whole package after the source is deleted.
+    created = [destination] + [p for p in destination.absolute().parents if not p.exists()]
+    created = [p for p in created if not p.exists()]
     destination.mkdir(parents=True)
     # manifest is the completion marker; failures never publish a valid package.
     xyz, rgb, fusion, rows, windows = fuse_session(records, destination/'cache', max_points, revisit=revisit)
@@ -93,10 +104,57 @@ def export_session(records_root, session_id, destination, capture_profile, max_p
         hashes={str(p.relative_to(destination)):digest(p) for p in files})
     # Published last and in one step: a package with manifest.json is whole, one without it is not.
     # Deleting the source session after export relies on this (ONBOARD_V1.md, section 3).
+    # Everything listed in the manifest is on disk before the manifest exists, so a published
+    # manifest still means a complete package after a power cut.
+    _fsync_tree(destination)
     temporary = destination/'manifest.json.tmp'
     dump(temporary, manifest)
+    _fsync_path(temporary)
     os.replace(temporary, destination/'manifest.json')
+    _fsync_path(destination)
+    for directory in created:
+        _fsync_path(Path(directory).absolute().parent)
+    # Lets automatic retention delete this session's source data once the package exists.
+    write_export_marker(Path(records_root).parent, session_id, destination, exported_windows)
     return manifest
+
+
+def _refuse_destination_inside_source(destination, records_root, session_id, backend_root, records):
+    """A delivery written into the session's own data would be deleted with it by retention."""
+    from drone3d_reconstruction_core.g4.input_adapter import local_path
+    source = [Path(records_root)/session_id, Path(backend_root),
+              Path(records_root).parent.parent/'frame_pool'/session_id]
+    for record in records:
+        for key, parent in (('snapshot_manifest_uri', False), ('result_manifest_uri', True)):
+            if record.get(key):
+                path = local_path(record[key])
+                source.append(path.parent if parent else path)
+    target = destination.resolve()
+    for directory in source:
+        directory = directory.resolve()
+        if target == directory or directory in target.parents:
+            raise ValueError(f'Refusing to write the delivery into the session\'s own data: {directory}')
+    # Nor into storage that retention empties session by session: it could go with another session.
+    for directory in (Path(records_root), Path(backend_root).parent, Path(records_root).parent.parent/'frame_pool'):
+        directory = directory.resolve()
+        if target == directory or directory in target.parents:
+            raise ValueError(f'Refusing to write the delivery into reclaimable session storage: {directory}')
+
+
+def _fsync_path(path):
+    fd = os.open(str(path), os.O_RDONLY | (os.O_DIRECTORY if Path(path).is_dir() else 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _fsync_tree(root):
+    """fsync every file, then every directory bottom-up, so the whole tree is durable."""
+    for directory, _dirs, files in os.walk(root, topdown=False):
+        for name in files:
+            _fsync_path(Path(directory)/name)
+        _fsync_path(directory)
 
 
 def main():

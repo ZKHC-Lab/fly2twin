@@ -25,3 +25,10 @@ exclude = ["recon_core.tests", "recon_core.tests.*"]
 namespaces = false
 [tool.pytest.ini_options]
 pythonpath = ["."]
+[tool.ruff]
+line-length = 120
+# recon_core also runs on the onboard Python 3.8.
+target-version = "py38"
+extend-exclude = ["third_party"]
+[tool.ruff.format]
+quote-style = "preserve"

@@ -42,6 +42,7 @@ from drone3d_reconstruction_msgs.msg import (
     ReconstructSegmentResult,
 )
 
+from .action_terminal import TerminalCall, converge_terminal, is_terminal, query_goal_status
 from .controller import BusyError, JobController, JobFinished
 from .warm_worker_pool import WarmWorkerUnavailableError
 from .preparation import (
@@ -552,14 +553,7 @@ class ReconstructActionServer:
             status = goal_handle.get_goal_status().status
         except BaseException:
             status = None
-        if status in (
-            GoalStatus.PREEMPTED,
-            GoalStatus.SUCCEEDED,
-            GoalStatus.ABORTED,
-            GoalStatus.REJECTED,
-            GoalStatus.RECALLED,
-            GoalStatus.LOST,
-        ):
+        if is_terminal(status):
             return True
 
         if status == GoalStatus.RECALLING:
@@ -1555,51 +1549,33 @@ class ReconstructActionServer:
         result: ReconstructSegmentResult,
         text: str,
     ) -> bool:
-        """Clean staging, then make at most one primary and one fallback call."""
+        """Clean staging, then hand the call to the shared executor (at most one fallback)."""
         method, result, text = self._cleanup_before_terminal_callback(
             record, method, result, text
         )
+
+        def fallback(primary, status, error):
+            method, result = self._terminal_fallback(record, error, primary.result, status)
+            return TerminalCall(method, result, result.message)
+
+        observer = None
         if self._terminal_observer is not None:
-            try:
-                self._terminal_observer(method, result, text)
-            except BaseException as observer_error:
-                rospy.logerr(
-                    "terminal observer failed: %s",
-                    type(observer_error).__name__,
-                )
-        terminal_error = None
-        try:
-            getattr(record.handle, f"set_{method}")(result, text)
-        except BaseException as error:
-            terminal_error = error
+            def observer(call):
+                self._terminal_observer(call.method, call.result, call.text)
 
-        status, status_error = _query_goal_status(record.handle)
-        if status is not None and _status_is_terminal(status):
-            self._release_terminal(record)
-            return True
-
-        fallback_method, fallback_result = self._terminal_fallback(
-            record, terminal_error or status_error, result, status
+        outcome = converge_terminal(
+            record.handle,
+            TerminalCall(method, result, text),
+            invoke=lambda handle, call: getattr(handle, f"set_{call.method}")(
+                call.result, call.text
+            ),
+            fallback=fallback,
+            observer=observer,
+            log_context=f"reconstruct goal {record.key[0]}",
         )
-        fallback_error = None
-        try:
-            getattr(record.handle, f"set_{fallback_method}")(
-                fallback_result, fallback_result.message
-            )
-        except BaseException as error:
-            fallback_error = error
-
-        fallback_status, fallback_status_error = _query_goal_status(record.handle)
-        if fallback_status is not None and _status_is_terminal(fallback_status):
+        if outcome.converged:
             self._release_terminal(record)
-            return True
-        final_error = fallback_error or fallback_status_error or terminal_error
-        rospy.logerr(
-            "Action terminal transition failed for goal %s: %s",
-            record.key[0],
-            type(final_error).__name__ if final_error else "nonterminal status",
-        )
-        return False
+        return outcome.converged
 
     def _cleanup_before_terminal_callback(
         self,
@@ -1642,7 +1618,7 @@ class ReconstructActionServer:
                     record.staging_cleaned = True
             return method, result, text
 
-        status, _ = _query_goal_status(record.handle)
+        status, _ = query_goal_status(record.handle)
         with self._lock:
             mutable = (
                 self._active is record
@@ -1758,26 +1734,6 @@ def _matching_buffered_finished(record: _GoalRecord) -> JobFinished | None:
     return finished
 
 
-def _query_goal_status(goal_handle: Any) -> tuple[int | None, BaseException | None]:
-    """查询目标状态；异常时返回 (None, error)。"""
-    try:
-        return goal_handle.get_goal_status().status, None
-    except BaseException as error:
-        return None, error
-
-
-def _status_is_terminal(status: int) -> bool:
-    """判断状态是否为 actionlib 终态。"""
-    return status in (
-        GoalStatus.PREEMPTED,
-        GoalStatus.SUCCEEDED,
-        GoalStatus.ABORTED,
-        GoalStatus.REJECTED,
-        GoalStatus.RECALLED,
-        GoalStatus.LOST,
-    )
-
-
 def _legal_failure_method(status: int | None, accepted: bool) -> str:
     """按目标当前状态与接受情况选择合法的失败终态方法。"""
     if status == GoalStatus.RECALLING:
@@ -1799,10 +1755,10 @@ def _result_elapsed_sec(result: ReconstructSegmentResult) -> float:
 
 def _is_terminal(goal_handle: Any) -> bool:
     """判断目标句柄当前是否已处于 actionlib 终态。"""
-    status, error = _query_goal_status(goal_handle)
+    status, error = query_goal_status(goal_handle)
     if error is not None:
         raise error
-    return _status_is_terminal(status)
+    return is_terminal(status)
 
 
 def _make_daemon_thread(target, args) -> threading.Thread:
